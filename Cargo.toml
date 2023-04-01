@@ -1,0 +1,21 @@
+[package]
+name = "fluster"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[workspace]
+members = ["flutter-embedder"]
+
+[dependencies]
+color-eyre = "0.6"
+flutter-embedder = { path = "flutter-embedder" }
+gl = "0.14"
+khronos-egl = { version = "4.1", features = ["static", "no-pkg-config"] }
+raw-window-handle = "0.5"
+winit = "0.28"
+
+[build-dependencies]
+dunce = "1.0"
+vcpkg = "0.2"
