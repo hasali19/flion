@@ -29,6 +29,7 @@ struct Gl {
     egl: EglInstance,
     display: egl::Display,
     context: egl::Context,
+    resource_context: egl::Context,
     surface: egl::Surface,
 }
 
@@ -84,6 +85,8 @@ fn main() -> Result<()> {
 
     let context_attribs = [egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE];
     let context = egl.create_context(display, configs[0], None, &context_attribs)?;
+    let resource_context =
+        egl.create_context(display, configs[0], Some(context), &context_attribs)?;
 
     let surface = unsafe { egl.create_window_surface(display, configs[0], hwnd, None)? };
 
@@ -93,6 +96,7 @@ fn main() -> Result<()> {
         egl,
         display,
         context,
+        resource_context,
         surface,
     }));
 
@@ -106,6 +110,7 @@ fn main() -> Result<()> {
                     open_gl: FlutterOpenGLRendererConfig {
                         struct_size: mem::size_of::<FlutterOpenGLRendererConfig>(),
                         make_current: Some(gl_make_current),
+                        make_resource_current: Some(gl_make_resource_current),
                         clear_current: Some(gl_clear_current),
                         present: Some(gl_present),
                         fbo_callback: Some(gl_fbo_callback),
@@ -237,6 +242,14 @@ unsafe extern "C" fn gl_make_current(user_data: *mut c_void) -> bool {
             Some(gl.surface),
             Some(gl.context),
         )
+        .unwrap();
+    true
+}
+
+unsafe extern "C" fn gl_make_resource_current(user_data: *mut c_void) -> bool {
+    let gl = user_data.cast::<Gl>().as_mut().unwrap();
+    gl.egl
+        .make_current(gl.display, None, None, Some(gl.resource_context))
         .unwrap();
     true
 }
