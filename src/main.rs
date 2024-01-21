@@ -3,6 +3,7 @@ use std::sync::{Condvar, Mutex};
 use std::{mem, ptr};
 
 use color_eyre::Result;
+use egl::ClientBuffer;
 use flutter_embedder::{
     FlutterEngine, FlutterEngineResult_kSuccess, FlutterEngineRun,
     FlutterEngineSendWindowMetricsEvent, FlutterOpenGLRendererConfig, FlutterProjectArgs,
@@ -13,10 +14,16 @@ use khronos_egl as egl;
 use windows::core::{ComInterface, Interface};
 use windows::w;
 use windows::Foundation::Numerics::Vector2;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Foundation::Size;
+use windows::Graphics::DirectX::{DirectXAlphaMode, DirectXPixelFormat};
+use windows::Graphics::SizeInt32;
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::WinRT::Composition::ICompositorDesktopInterop;
+use windows::Win32::System::WinRT::Composition::{
+    ICompositionDrawingSurfaceInterop, ICompositorDesktopInterop, ICompositorInterop,
+};
 use windows::Win32::System::WinRT::{
     CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_ASTA, DQTYPE_THREAD_CURRENT,
 };
@@ -27,7 +34,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_DESTROY, WM_ERASEBKGND, WM_NCCALCSIZE, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP,
     WS_OVERLAPPEDWINDOW,
 };
-use windows::UI::Composition::{Compositor, SpriteVisual};
+use windows::UI::Composition::{CompositionDrawingSurface, Compositor};
 
 macro_rules! cstr {
     ($v:literal) => {
@@ -48,11 +55,10 @@ struct Gl {
     display: egl::Display,
     context: egl::Context,
     resource_context: egl::Context,
-    surface: egl::Surface,
+    composition_surface: CompositionDrawingSurface,
     config: egl::Config,
     resize_condvar: Condvar,
     resize_state: Mutex<ResizeState>,
-    root_visual: SpriteVisual,
 }
 
 const EGL_PLATFORM_ANGLE_ANGLE: egl::Enum = 0x3202;
@@ -85,6 +91,27 @@ extern "C" {
     ) -> *mut c_void;
 
     fn eglReleaseDeviceANGLE(device: *mut c_void);
+
+    fn eglPostSubBufferNV(
+        display: *mut c_void,
+        surface: *mut c_void,
+        x: egl::Int,
+        y: egl::Int,
+        width: egl::Int,
+        height: egl::Int,
+    ) -> egl::Boolean;
+
+    fn eglQueryDisplayAttribEXT(
+        display: *mut c_void,
+        attribute: egl::Int,
+        value: *mut egl::Attrib,
+    ) -> egl::Boolean;
+
+    fn eglQueryDeviceAttribEXT(
+        device: *mut c_void,
+        attribute: egl::Int,
+        value: *mut egl::Attrib,
+    ) -> egl::Boolean;
 }
 
 extern "C" fn debug_callback(
@@ -176,6 +203,43 @@ fn main() -> Result<()> {
 
     egl.initialize(display)?;
 
+    let device = unsafe {
+        let mut egl_device = 0;
+        assert!(
+            eglQueryDisplayAttribEXT(
+                display.as_ptr(),
+                0x322C, /* EGL_DEVICE_EXT */
+                &mut egl_device,
+            ) == egl::TRUE
+        );
+        let mut angle_device = 0;
+        assert!(
+            eglQueryDeviceAttribEXT(
+                egl_device as _,
+                0x33A1, /* EGL_D3D11_DEVICE_ANGLE */
+                &mut angle_device
+            ) == egl::TRUE
+        );
+        ID3D11Device::from_raw(angle_device as _)
+    };
+
+    let composition_device = unsafe {
+        compositor
+            .cast::<ICompositorInterop>()?
+            .CreateGraphicsDevice(&device)?
+    };
+
+    let composition_surface = composition_device.CreateDrawingSurface(
+        Size {
+            Width: width as f32,
+            Height: height as f32,
+        },
+        DirectXPixelFormat::B8G8R8A8UIntNormalized,
+        DirectXAlphaMode::Ignore,
+    )?;
+
+    root.SetBrush(&compositor.CreateSurfaceBrushWithSurface(&composition_surface)?)?;
+
     let mut configs = Vec::with_capacity(1);
     let config_attribs = [
         egl::RED_SIZE,
@@ -200,24 +264,7 @@ fn main() -> Result<()> {
     let resource_context =
         egl.create_context(display, configs[0], Some(context), &context_attribs)?;
 
-    let surface = unsafe {
-        egl.create_window_surface(
-            display,
-            configs[0],
-            root.as_raw(),
-            Some(&[
-                0x3201,
-                egl::TRUE as _,
-                egl::WIDTH,
-                width,
-                egl::HEIGHT,
-                height,
-                egl::NONE,
-            ]),
-        )?
-    };
-
-    egl.make_current(display, Some(surface), Some(surface), Some(context))?;
+    egl.make_current(display, None, None, Some(context))?;
 
     gl::Flush::load_with(|name| egl.get_proc_address(name).unwrap() as _);
 
@@ -227,14 +274,18 @@ fn main() -> Result<()> {
         display,
         context,
         resource_context,
-        surface,
+        composition_surface,
         config: configs[0],
         resize_condvar: Condvar::new(),
         resize_state: Mutex::new(ResizeState::Done),
-        root_visual: root,
     }));
 
+    gl.egl.make_current(display, None, None, None)?;
+
     let engine = unsafe { create_engine(gl, width, height) };
+
+    assert!(gl.egl.get_current_context().is_none());
+    assert!(gl.egl.get_current_display().is_none());
 
     unsafe {
         SetWindowLongPtrW(
@@ -357,12 +408,7 @@ unsafe fn create_engine(gl: &mut Gl, width: i32, height: i32) -> FlutterEngine {
 unsafe extern "C" fn gl_make_current(user_data: *mut c_void) -> bool {
     let gl = user_data.cast::<Gl>().as_mut().unwrap();
     gl.egl
-        .make_current(
-            gl.display,
-            Some(gl.surface),
-            Some(gl.surface),
-            Some(gl.context),
-        )
+        .make_current(gl.display, None, None, Some(gl.context))
         .unwrap();
     true
 }
@@ -389,7 +435,17 @@ unsafe extern "C" fn gl_present(user_data: *mut c_void) -> bool {
         ResizeState::Started(_, _) => panic!("present called before fbo_callback during resize"),
         ResizeState::FrameGenerated => {
             gl::Flush();
-            gl.egl.swap_buffers(gl.display, gl.surface).unwrap();
+            let surface = gl.egl.get_current_surface(egl::DRAW).unwrap();
+            gl.egl.swap_buffers(gl.display, surface).unwrap();
+            let composition_surface_interop = gl
+                .composition_surface
+                .cast::<ICompositionDrawingSurfaceInterop>()
+                .unwrap();
+            composition_surface_interop.EndDraw().unwrap();
+            gl.egl
+                .make_current(gl.display, None, None, Some(gl.context))
+                .unwrap();
+            gl.egl.destroy_surface(gl.display, surface).unwrap();
             DwmFlush().unwrap();
             *resize_state = ResizeState::Done;
             drop(resize_state);
@@ -397,7 +453,17 @@ unsafe extern "C" fn gl_present(user_data: *mut c_void) -> bool {
         }
         ResizeState::Done => {
             gl::Flush();
-            gl.egl.swap_buffers(gl.display, gl.surface).unwrap();
+            let surface = gl.egl.get_current_surface(egl::DRAW).unwrap();
+            gl.egl.swap_buffers(gl.display, surface).unwrap();
+            let composition_surface_interop = gl
+                .composition_surface
+                .cast::<ICompositionDrawingSurfaceInterop>()
+                .unwrap();
+            composition_surface_interop.EndDraw().unwrap();
+            gl.egl
+                .make_current(gl.display, None, None, Some(gl.context))
+                .unwrap();
+            gl.egl.destroy_surface(gl.display, surface).unwrap();
         }
     }
 
@@ -409,41 +475,41 @@ unsafe extern "C" fn gl_fbo_callback(user_data: *mut c_void) -> u32 {
     let mut resize_state = gl.resize_state.lock().unwrap();
 
     if let ResizeState::Started(width, height) = *resize_state {
-        gl.egl.destroy_surface(gl.display, gl.surface).unwrap();
-        gl.egl
-            .make_current(gl.display, None, None, Some(gl.context))
+        gl.composition_surface
+            .Resize(SizeInt32 {
+                Width: width as i32,
+                Height: height as i32,
+            })
             .unwrap();
-
-        gl.surface = unsafe {
-            gl.egl
-                .create_window_surface(
-                    gl.display,
-                    gl.config,
-                    gl.root_visual.as_raw(),
-                    Some(&[
-                        0x3201,
-                        egl::TRUE as _,
-                        egl::WIDTH,
-                        width as i32,
-                        egl::HEIGHT,
-                        height as i32,
-                        egl::NONE,
-                    ]),
-                )
-                .unwrap()
-        };
-
-        gl.egl
-            .make_current(
-                gl.display,
-                Some(gl.surface),
-                Some(gl.surface),
-                Some(gl.context),
-            )
-            .unwrap();
-
         *resize_state = ResizeState::FrameGenerated;
     }
+
+    let composition_surface_interop = gl
+        .composition_surface
+        .cast::<ICompositionDrawingSurfaceInterop>()
+        .unwrap();
+
+    let mut update_offset = POINT::default();
+    let texture: ID3D11Texture2D = composition_surface_interop
+        .BeginDraw(None, &mut update_offset)
+        .unwrap();
+
+    let client_buffer = unsafe { ClientBuffer::from_ptr(texture.as_raw()) };
+
+    let surface = gl
+        .egl
+        .create_pbuffer_from_client_buffer(
+            gl.display,
+            0x33A3,
+            client_buffer,
+            gl.config,
+            &[0x3490, update_offset.x, 0x3491, update_offset.y, egl::NONE],
+        )
+        .unwrap();
+
+    gl.egl
+        .make_current(gl.display, Some(surface), Some(surface), Some(gl.context))
+        .unwrap();
 
     0
 }
