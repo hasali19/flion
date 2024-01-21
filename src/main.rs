@@ -3,7 +3,6 @@ use std::sync::{Condvar, Mutex};
 use std::{mem, ptr};
 
 use color_eyre::Result;
-use egl::ClientBuffer;
 use flutter_embedder::{
     FlutterEngine, FlutterEngineResult_kSuccess, FlutterEngineRun,
     FlutterEngineSendWindowMetricsEvent, FlutterOpenGLRendererConfig, FlutterProjectArgs,
@@ -11,27 +10,16 @@ use flutter_embedder::{
     FLUTTER_ENGINE_VERSION,
 };
 use khronos_egl as egl;
-use windows::core::ComInterface;
+use windows::core::{ComInterface, Interface};
 use windows::w;
-use windows::Foundation::Numerics::Matrix3x2;
+use windows::Foundation::Numerics::Vector2;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
-use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Texture2D, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION,
-};
-use windows::Win32::Graphics::DirectComposition::{
-    DCompositionCreateDevice, IDCompositionDevice, IDCompositionVisual,
-};
 use windows::Win32::Graphics::Dwm::DwmFlush;
-use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN,
-    DXGI_SAMPLE_DESC,
-};
-use windows::Win32::Graphics::Dxgi::{
-    IDXGIDevice2, IDXGIFactory2, IDXGISwapChain1, DXGI_SWAP_CHAIN_DESC1,
-    DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT,
-};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::WinRT::Composition::ICompositorDesktopInterop;
+use windows::Win32::System::WinRT::{
+    CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_ASTA, DQTYPE_THREAD_CURRENT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW,
     GetWindowLongPtrW, LoadCursorW, PostQuitMessage, RegisterClassW, SetWindowLongPtrW, ShowWindow,
@@ -39,6 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_DESTROY, WM_ERASEBKGND, WM_NCCALCSIZE, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP,
     WS_OVERLAPPEDWINDOW,
 };
+use windows::UI::Composition::{Compositor, SpriteVisual};
 
 macro_rules! cstr {
     ($v:literal) => {
@@ -50,7 +39,7 @@ type EglInstance = egl::Instance<egl::Static>;
 
 enum ResizeState {
     Started(u32, u32),
-    FrameGenerated(u32),
+    FrameGenerated,
     Done,
 }
 
@@ -60,13 +49,10 @@ struct Gl {
     context: egl::Context,
     resource_context: egl::Context,
     surface: egl::Surface,
-    // debug: ID3D11Debug,
-    swapchain: IDXGISwapChain1,
     config: egl::Config,
     resize_condvar: Condvar,
     resize_state: Mutex<ResizeState>,
-    composition_device: IDCompositionDevice,
-    root_visual: IDCompositionVisual,
+    root_visual: SpriteVisual,
 }
 
 const EGL_PLATFORM_ANGLE_ANGLE: egl::Enum = 0x3202;
@@ -78,6 +64,7 @@ struct WindowData {
     gl: *mut Gl,
 }
 
+#[allow(unused)]
 extern "C" {
     fn eglDebugMessageControlKHR(
         callback: extern "C" fn(
@@ -101,11 +88,11 @@ extern "C" {
 }
 
 extern "C" fn debug_callback(
-    error: egl::Enum,
-    command: *const c_char,
-    message_type: egl::Int,
-    thread_label: *const c_void,
-    object_label: *const c_void,
+    _error: egl::Enum,
+    _command: *const c_char,
+    _message_type: egl::Int,
+    _thread_label: *const c_void,
+    _object_label: *const c_void,
     message: *const c_char,
 ) {
     let message = unsafe { CStr::from_ptr(message) };
@@ -153,92 +140,33 @@ fn main() -> Result<()> {
 
     println!("{width} {height}");
 
-    let (device, context) = unsafe {
-        let mut device = None;
-        let mut context = None;
-
-        D3D11CreateDevice(
-            None,
-            D3D_DRIVER_TYPE_HARDWARE,
-            None,
-            D3D11_CREATE_DEVICE_FLAG::default(),
-            None,
-            D3D11_SDK_VERSION,
-            Some(&mut device),
-            None,
-            Some(&mut context),
-        )?;
-
-        (device.unwrap(), context.unwrap())
+    let _dispatcher_queue_controller = unsafe {
+        CreateDispatcherQueueController(DispatcherQueueOptions {
+            dwSize: mem::size_of::<DispatcherQueueOptions>() as u32,
+            threadType: DQTYPE_THREAD_CURRENT,
+            apartmentType: DQTAT_COM_ASTA,
+        })?
     };
 
-    let dxgi_factory = unsafe {
-        device
-            .cast::<IDXGIDevice2>()?
-            .GetAdapter()?
-            .GetParent::<IDXGIFactory2>()?
+    let compositor = Compositor::new()?;
+    let composition_target = unsafe {
+        compositor
+            .cast::<ICompositorDesktopInterop>()?
+            .CreateDesktopWindowTarget(window, false)?
     };
 
-    let swapchain_desc = DXGI_SWAP_CHAIN_DESC1 {
-        BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-        BufferCount: 2,
-        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-        SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        Width: width as u32,
-        Height: height as u32,
-        AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
-        ..Default::default()
-    };
-
-    let swapchain =
-        unsafe { dxgi_factory.CreateSwapChainForComposition(&device, &swapchain_desc, None)? };
-
-    // let swapchain_composition_surface = unsafe {
-    //     compositor
-    //         .cast::<ICompositorInterop>()?
-    //         .CreateCompositionSurfaceForSwapChain(&swapchain)?
-    // };
-
-    let dcomp: IDCompositionDevice = unsafe { DCompositionCreateDevice(None)? };
-    let target = unsafe { dcomp.CreateTargetForHwnd(window, true)? };
-    let root = unsafe { dcomp.CreateVisual()? };
-    unsafe {
-        root.SetOffsetY2(height as f32).unwrap();
-        root.SetTransform2(&Matrix3x2 {
-            M11: 1.0,
-            M21: 0.0,
-            M31: 0.0,
-            M12: 0.0,
-            M22: -1.0,
-            M32: 0.0,
-        })
-        .unwrap();
-
-        target.SetRoot(&root)?;
-        root.SetContent(&swapchain)?;
-        dcomp.Commit()?;
-    }
-
-    // let brush = compositor.CreateSurfaceBrushWithSurface(&swapchain_composition_surface)?;
-    // root.SetBrush(&brush)?;
-
-    let swapchain_back_buffer = unsafe { swapchain.GetBuffer::<ID3D11Texture2D>(0)? };
+    let root = compositor.CreateSpriteVisual()?;
+    root.SetRelativeSizeAdjustment(Vector2 { X: 1.0, Y: 1.0 })?;
+    composition_target.SetRoot(&root)?;
 
     let egl = EglInstance::new(egl::Static);
 
     let attribs = [egl::NONE as egl::Attrib];
     unsafe { eglDebugMessageControlKHR(debug_callback, attribs.as_ptr()) };
 
-    let angle_device =
-        unsafe { eglCreateDeviceANGLE(0x33A1, mem::transmute_copy(&device), ptr::null()) };
-
     let display = egl.get_platform_display(
-        0x313f,
-        angle_device,
+        EGL_PLATFORM_ANGLE_ANGLE,
+        egl::DEFAULT_DISPLAY,
         &[
             EGL_PLATFORM_ANGLE_TYPE_ANGLE,
             EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE,
@@ -272,34 +200,37 @@ fn main() -> Result<()> {
     let resource_context =
         egl.create_context(display, configs[0], Some(context), &context_attribs)?;
 
-    let client_buffer =
-        unsafe { ClientBuffer::from_ptr(mem::transmute_copy(&swapchain_back_buffer)) };
-
-    let surface = egl.create_pbuffer_from_client_buffer(
-        display,
-        0x33A3,
-        client_buffer,
-        configs[0],
-        &[egl::NONE],
-    )?;
-
-    drop(swapchain_back_buffer);
+    let surface = unsafe {
+        egl.create_window_surface(
+            display,
+            configs[0],
+            root.as_raw(),
+            Some(&[
+                0x3201,
+                egl::TRUE as _,
+                egl::WIDTH,
+                width,
+                egl::HEIGHT,
+                height,
+                egl::NONE,
+            ]),
+        )?
+    };
 
     egl.make_current(display, Some(surface), Some(surface), Some(context))?;
 
     gl::Flush::load_with(|name| egl.get_proc_address(name).unwrap() as _);
 
     let gl = Box::leak(Box::new(Gl {
+        // device,
         egl,
         display,
         context,
         resource_context,
         surface,
-        swapchain,
         config: configs[0],
         resize_condvar: Condvar::new(),
         resize_state: Mutex::new(ResizeState::Done),
-        composition_device: dcomp,
         root_visual: root,
     }));
 
@@ -455,32 +386,18 @@ unsafe extern "C" fn gl_present(user_data: *mut c_void) -> bool {
     let mut resize_state = gl.resize_state.lock().unwrap();
 
     match *resize_state {
-        ResizeState::Started(_, _) => return false,
-        ResizeState::FrameGenerated(height) => {
-            gl.root_visual.SetOffsetY2(height as f32).unwrap();
-            gl.root_visual
-                .SetTransform2(&Matrix3x2 {
-                    M11: 1.0,
-                    M21: 0.0,
-                    M31: 0.0,
-                    M12: 0.0,
-                    M22: -1.0,
-                    M32: 0.0,
-                })
-                .unwrap();
-            gl.composition_device.Commit().unwrap();
+        ResizeState::Started(_, _) => panic!("present called before fbo_callback during resize"),
+        ResizeState::FrameGenerated => {
             gl::Flush();
             gl.egl.swap_buffers(gl.display, gl.surface).unwrap();
-            gl.swapchain.Present(0, 0).unwrap();
+            DwmFlush().unwrap();
             *resize_state = ResizeState::Done;
             drop(resize_state);
             gl.resize_condvar.notify_all();
-            DwmFlush().unwrap();
         }
         ResizeState::Done => {
             gl::Flush();
             gl.egl.swap_buffers(gl.display, gl.surface).unwrap();
-            gl.swapchain.Present(0, 0).unwrap();
         }
     }
 
@@ -497,25 +414,24 @@ unsafe extern "C" fn gl_fbo_callback(user_data: *mut c_void) -> u32 {
             .make_current(gl.display, None, None, Some(gl.context))
             .unwrap();
 
-        gl.swapchain
-            .ResizeBuffers(2, width, height, DXGI_FORMAT_UNKNOWN, 0)
-            .unwrap();
-
-        let swapchain_back_buffer = gl.swapchain.GetBuffer::<ID3D11Texture2D>(0).unwrap();
-
-        let client_buffer =
-            unsafe { ClientBuffer::from_ptr(mem::transmute_copy(&swapchain_back_buffer)) };
-
-        gl.surface = gl
-            .egl
-            .create_pbuffer_from_client_buffer(
-                gl.display,
-                0x33A3,
-                client_buffer,
-                gl.config,
-                &[egl::NONE],
-            )
-            .unwrap();
+        gl.surface = unsafe {
+            gl.egl
+                .create_window_surface(
+                    gl.display,
+                    gl.config,
+                    gl.root_visual.as_raw(),
+                    Some(&[
+                        0x3201,
+                        egl::TRUE as _,
+                        egl::WIDTH,
+                        width as i32,
+                        egl::HEIGHT,
+                        height as i32,
+                        egl::NONE,
+                    ]),
+                )
+                .unwrap()
+        };
 
         gl.egl
             .make_current(
@@ -526,7 +442,7 @@ unsafe extern "C" fn gl_fbo_callback(user_data: *mut c_void) -> u32 {
             )
             .unwrap();
 
-        *resize_state = ResizeState::FrameGenerated(height);
+        *resize_state = ResizeState::FrameGenerated;
     }
 
     0
