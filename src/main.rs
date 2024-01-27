@@ -235,7 +235,7 @@ fn main() -> Result<()> {
             Height: height as f32,
         },
         DirectXPixelFormat::B8G8R8A8UIntNormalized,
-        DirectXAlphaMode::Ignore,
+        DirectXAlphaMode::Premultiplied,
     )?;
 
     root.SetBrush(&compositor.CreateSurfaceBrushWithSurface(&composition_surface)?)?;
