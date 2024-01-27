@@ -1,16 +1,24 @@
+#![feature(lint_reasons)]
+
+mod render_thread;
+mod task_runner;
+
 use std::ffi::{c_char, c_void, CStr};
-use std::sync::{Condvar, Mutex};
+use std::sync::{mpsc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 use std::{mem, ptr};
 
 use color_eyre::Result;
 use egl::ClientBuffer;
 use flutter_embedder::{
-    FlutterEngine, FlutterEngineGetCurrentTime, FlutterEngineResult_kSuccess, FlutterEngineRun,
+    FlutterCustomTaskRunners, FlutterEngine, FlutterEngineGetCurrentTime,
+    FlutterEngineResult_kSuccess, FlutterEngineRun, FlutterEngineRunTask,
     FlutterEngineSendPointerEvent, FlutterEngineSendWindowMetricsEvent,
     FlutterOpenGLRendererConfig, FlutterPointerEvent, FlutterPointerPhase_kAdd,
     FlutterPointerPhase_kDown, FlutterPointerPhase_kHover, FlutterPointerPhase_kRemove,
     FlutterPointerPhase_kUp, FlutterProjectArgs, FlutterRendererConfig,
-    FlutterRendererType_kOpenGL, FlutterWindowMetricsEvent, FLUTTER_ENGINE_VERSION,
+    FlutterRendererType_kOpenGL, FlutterTask, FlutterTaskRunnerDescription,
+    FlutterWindowMetricsEvent, FLUTTER_ENGINE_VERSION,
 };
 use khronos_egl as egl;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -38,9 +46,12 @@ use windows::UI::Composition::Core::CompositorController;
 use windows::UI::Composition::{CompositionDrawingSurface, SpriteVisual};
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Event, WindowEvent};
-use winit::event_loop::EventLoop;
+use winit::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use winit::platform::windows::WindowBuilderExtWindows;
 use winit::window::{Theme, WindowBuilder};
+
+use crate::render_thread::{RenderEvent, RenderTask};
+use crate::task_runner::TaskRunner;
 
 macro_rules! cstr {
     ($v:literal) => {
@@ -137,6 +148,11 @@ extern "C" fn debug_callback(
     eprintln!("{message}");
 }
 
+#[derive(Debug)]
+enum PlatformEvent {
+    PostFlutterTask(u64, FlutterTask),
+}
+
 fn main() -> Result<()> {
     color_eyre::install()?;
 
@@ -145,7 +161,7 @@ fn main() -> Result<()> {
         .with_thread_names(true)
         .init();
 
-    let event_loop = EventLoop::new()?;
+    let event_loop = EventLoopBuilder::<PlatformEvent>::with_user_event().build()?;
     let window = WindowBuilder::new()
         .with_inner_size(LogicalSize::new(800, 600))
         .with_no_redirection_bitmap(true)
@@ -306,9 +322,7 @@ fn main() -> Result<()> {
         resize_state: Mutex::new(ResizeState::Done),
     }));
 
-    gl.egl.make_current(display, None, None, None)?;
-
-    let engine = unsafe { create_engine(gl) };
+    let engine = unsafe { create_engine(gl, event_loop.create_proxy()) };
 
     unsafe {
         FlutterEngineSendWindowMetricsEvent(
@@ -323,6 +337,8 @@ fn main() -> Result<()> {
         )
     };
 
+    gl.egl.make_current(display, None, None, None)?;
+
     assert!(gl.egl.get_current_context().is_none());
     assert!(gl.egl.get_current_display().is_none());
 
@@ -335,10 +351,16 @@ fn main() -> Result<()> {
     unsafe { SetWindowSubclass(hwnd, Some(wnd_proc), 696969, window_data as *mut _ as _) };
 
     let mut cursor_pos = PhysicalPosition::new(0.0, 0.0);
+    let mut tasks = vec![];
 
     event_loop.run(move |event, target| {
-        if let Event::WindowEvent { event, .. } = event {
-            match event {
+        match event {
+            Event::UserEvent(event) => match event {
+                PlatformEvent::PostFlutterTask(target_time_nanos, task) => {
+                    tasks.push((target_time_nanos, task));
+                }
+            },
+            Event::WindowEvent { event, .. } => match event {
                 WindowEvent::CloseRequested => {
                     target.exit();
                 }
@@ -409,7 +431,33 @@ fn main() -> Result<()> {
                     );
                 },
                 _ => {}
+            },
+            _ => (),
+        }
+
+        let now = unsafe { FlutterEngineGetCurrentTime() };
+        let mut next_task_target_time = None;
+
+        tasks.retain(|(target_time_nanos, task)| {
+            if now >= *target_time_nanos {
+                unsafe { FlutterEngineRunTask(engine, task) };
+                return false;
             }
+
+            let delta = Duration::from_nanos(now - target_time_nanos);
+            let target_time = Instant::now() + delta;
+
+            next_task_target_time = Some(if let Some(next) = next_task_target_time {
+                std::cmp::min(next, target_time)
+            } else {
+                target_time
+            });
+
+            true
+        });
+
+        if let Some(next) = next_task_target_time {
+            target.set_control_flow(ControlFlow::WaitUntil(next));
         }
     })?;
 
@@ -465,33 +513,97 @@ unsafe extern "system" fn wnd_proc(
     LRESULT(0)
 }
 
-unsafe fn create_engine(gl: &mut Gl) -> FlutterEngine {
+unsafe fn create_engine(gl: &mut Gl, event_loop: EventLoopProxy<PlatformEvent>) -> FlutterEngine {
     let mut engine = ptr::null_mut();
+
+    fn create_task_runner<F: Fn(u64, FlutterTask)>(
+        id: usize,
+        runner: &'static TaskRunner<F>,
+    ) -> FlutterTaskRunnerDescription {
+        unsafe extern "C" fn runs_tasks_on_current_thread<F>(task_runner: *mut c_void) -> bool {
+            task_runner
+                .cast::<TaskRunner<F>>()
+                .as_mut()
+                .unwrap()
+                .runs_tasks_on_current_thread()
+        }
+
+        unsafe extern "C" fn post_task_callback<F: Fn(u64, FlutterTask)>(
+            task: FlutterTask,
+            target_time_nanos: u64,
+            user_data: *mut c_void,
+        ) {
+            user_data
+                .cast::<TaskRunner<F>>()
+                .as_mut()
+                .unwrap()
+                .post_task(task, target_time_nanos)
+        }
+
+        FlutterTaskRunnerDescription {
+            struct_size: mem::size_of::<FlutterTaskRunnerDescription>(),
+            identifier: id,
+            user_data: runner as *const TaskRunner<F> as *mut c_void,
+            runs_task_on_current_thread_callback: Some(runs_tasks_on_current_thread::<F>),
+            post_task_callback: Some(post_task_callback::<F>),
+        }
+    }
+
+    let (render_tx, render_rx) = mpsc::channel();
+
+    let renderer_config = FlutterRendererConfig {
+        type_: FlutterRendererType_kOpenGL,
+        __bindgen_anon_1: flutter_embedder::FlutterRendererConfig__bindgen_ty_1 {
+            open_gl: FlutterOpenGLRendererConfig {
+                struct_size: mem::size_of::<FlutterOpenGLRendererConfig>(),
+                make_current: Some(gl_make_current),
+                make_resource_current: Some(gl_make_resource_current),
+                clear_current: Some(gl_clear_current),
+                present: Some(gl_present),
+                fbo_callback: Some(gl_fbo_callback),
+                fbo_reset_after_present: true,
+                gl_proc_resolver: Some(gl_get_proc_address),
+                ..Default::default()
+            },
+        },
+    };
+
+    let platform_task_runner = create_task_runner(
+        1,
+        Box::leak(Box::new(TaskRunner::new(move |t, task| {
+            event_loop
+                .send_event(PlatformEvent::PostFlutterTask(t, task))
+                .unwrap()
+        }))),
+    );
+
+    let render_task_runner = create_task_runner(
+        2,
+        Box::leak(Box::new(TaskRunner::new(move |t, task| {
+            render_tx
+                .send(RenderEvent::PostTask(RenderTask(t, task)))
+                .unwrap();
+        }))),
+    );
+
+    let project_args = FlutterProjectArgs {
+        struct_size: mem::size_of::<FlutterProjectArgs>(),
+        assets_path: cstr!("example/build/flutter_assets"),
+        icu_data_path: cstr!("icudtl.dat"),
+        custom_task_runners: &FlutterCustomTaskRunners {
+            struct_size: mem::size_of::<FlutterCustomTaskRunners>(),
+            platform_task_runner: &platform_task_runner,
+            render_task_runner: &render_task_runner,
+            thread_priority_setter: Some(task_runner::set_thread_priority),
+        },
+        ..Default::default()
+    };
+
     unsafe {
         let result = FlutterEngineRun(
             FLUTTER_ENGINE_VERSION as usize,
-            &FlutterRendererConfig {
-                type_: FlutterRendererType_kOpenGL,
-                __bindgen_anon_1: flutter_embedder::FlutterRendererConfig__bindgen_ty_1 {
-                    open_gl: FlutterOpenGLRendererConfig {
-                        struct_size: mem::size_of::<FlutterOpenGLRendererConfig>(),
-                        make_current: Some(gl_make_current),
-                        make_resource_current: Some(gl_make_resource_current),
-                        clear_current: Some(gl_clear_current),
-                        present: Some(gl_present),
-                        fbo_callback: Some(gl_fbo_callback),
-                        fbo_reset_after_present: true,
-                        gl_proc_resolver: Some(gl_get_proc_address),
-                        ..Default::default()
-                    },
-                },
-            },
-            &FlutterProjectArgs {
-                struct_size: mem::size_of::<FlutterProjectArgs>(),
-                assets_path: cstr!("example/build/flutter_assets"),
-                icu_data_path: cstr!("icudtl.dat"),
-                ..Default::default()
-            },
+            &renderer_config,
+            &project_args,
             gl as *mut Gl as *mut c_void,
             &mut engine,
         );
@@ -500,6 +612,9 @@ unsafe fn create_engine(gl: &mut Gl) -> FlutterEngine {
             panic!("could not run the flutter engine");
         }
     }
+
+    render_thread::start(engine, render_rx);
+
     engine
 }
 
