@@ -5,14 +5,16 @@ use std::{mem, ptr};
 use color_eyre::Result;
 use egl::ClientBuffer;
 use flutter_embedder::{
-    FlutterEngine, FlutterEngineResult_kSuccess, FlutterEngineRun,
-    FlutterEngineSendWindowMetricsEvent, FlutterOpenGLRendererConfig, FlutterProjectArgs,
-    FlutterRendererConfig, FlutterRendererType_kOpenGL, FlutterWindowMetricsEvent,
-    FLUTTER_ENGINE_VERSION,
+    FlutterEngine, FlutterEngineGetCurrentTime, FlutterEngineResult_kSuccess, FlutterEngineRun,
+    FlutterEngineSendPointerEvent, FlutterEngineSendWindowMetricsEvent,
+    FlutterOpenGLRendererConfig, FlutterPointerEvent, FlutterPointerPhase_kAdd,
+    FlutterPointerPhase_kDown, FlutterPointerPhase_kHover, FlutterPointerPhase_kRemove,
+    FlutterPointerPhase_kUp, FlutterProjectArgs, FlutterRendererConfig,
+    FlutterRendererType_kOpenGL, FlutterWindowMetricsEvent, FLUTTER_ENGINE_VERSION,
 };
 use khronos_egl as egl;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::core::{ComInterface, Interface};
-use windows::w;
 use windows::Foundation::Numerics::{Matrix4x4, Vector2, Vector3};
 use windows::Foundation::Size;
 use windows::Graphics::DirectX::{DirectXAlphaMode, DirectXPixelFormat};
@@ -20,22 +22,21 @@ use windows::Graphics::SizeInt32;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 use windows::Win32::Graphics::Dwm::DwmFlush;
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::WinRT::Composition::{
     ICompositionDrawingSurfaceInterop, ICompositorDesktopInterop, ICompositorInterop,
 };
 use windows::Win32::System::WinRT::{
     CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_ASTA, DQTYPE_THREAD_CURRENT,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW,
-    GetWindowLongPtrW, LoadCursorW, PostQuitMessage, RegisterClassW, SetWindowLongPtrW, ShowWindow,
-    TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW, MSG, SW_SHOWNORMAL,
-    WM_DESTROY, WM_ERASEBKGND, WM_NCCALCSIZE, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP,
-    WS_OVERLAPPEDWINDOW,
-};
+use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, WM_ERASEBKGND, WM_NCCALCSIZE};
 use windows::UI::Composition::Core::CompositorController;
 use windows::UI::Composition::{CompositionDrawingSurface, SpriteVisual};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::event::{ElementState, Event, WindowEvent};
+use winit::event_loop::EventLoop;
+use winit::platform::windows::WindowBuilderExtWindows;
+use winit::window::WindowBuilder;
 
 macro_rules! cstr {
     ($v:literal) => {
@@ -72,6 +73,7 @@ const EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE: egl::Attrib = 0x3208;
 struct WindowData {
     engine: FlutterEngine,
     gl: *mut Gl,
+    scale_factor: f64,
 }
 
 #[allow(unused)]
@@ -134,40 +136,18 @@ extern "C" fn debug_callback(
 fn main() -> Result<()> {
     color_eyre::install()?;
 
-    let window = unsafe {
-        let window_class = WNDCLASSW {
-            hCursor: LoadCursorW(None, IDC_ARROW).unwrap(),
-            lpszClassName: w!("window_class"),
-            style: CS_HREDRAW | CS_VREDRAW,
-            hInstance: GetModuleHandleW(None).unwrap(),
-            lpfnWndProc: Some(wnd_proc),
-            ..Default::default()
-        };
+    let event_loop = EventLoop::new()?;
+    let window = WindowBuilder::new()
+        .with_inner_size(LogicalSize::new(800, 600))
+        .with_no_redirection_bitmap(true)
+        .build(&event_loop)?;
 
-        RegisterClassW(&window_class);
-
-        CreateWindowExW(
-            WS_EX_NOREDIRECTIONBITMAP,
-            w!("window_class"),
-            w!("Flutter Window"),
-            WS_OVERLAPPEDWINDOW,
-            300,
-            300,
-            800,
-            600,
-            None,
-            None,
-            GetModuleHandleW(None).unwrap(),
-            None,
-        )
+    let hwnd = match window.window_handle()?.as_raw() {
+        RawWindowHandle::Win32(handle) => HWND(handle.hwnd.get()),
+        _ => unreachable!(),
     };
 
-    let (width, height) = unsafe {
-        ShowWindow(window, SW_SHOWNORMAL);
-        let mut rect = RECT::default();
-        GetClientRect(window, &mut rect).unwrap();
-        (rect.right - rect.left, rect.bottom - rect.top)
-    };
+    let PhysicalSize { width, height } = window.inner_size();
 
     println!("{width} {height}");
 
@@ -184,7 +164,7 @@ fn main() -> Result<()> {
         compositor_controller
             .Compositor()?
             .cast::<ICompositorDesktopInterop>()?
-            .CreateDesktopWindowTarget(window, false)?
+            .CreateDesktopWindowTarget(hwnd, false)?
     };
 
     let root = compositor_controller.Compositor()?.CreateSpriteVisual()?;
@@ -309,26 +289,110 @@ fn main() -> Result<()> {
 
     gl.egl.make_current(display, None, None, None)?;
 
-    let engine = unsafe { create_engine(gl, width, height) };
+    let engine = unsafe { create_engine(gl) };
+
+    unsafe {
+        FlutterEngineSendWindowMetricsEvent(
+            engine,
+            &FlutterWindowMetricsEvent {
+                struct_size: mem::size_of::<FlutterWindowMetricsEvent>(),
+                width: width as usize,
+                height: height as usize,
+                pixel_ratio: window.scale_factor(),
+                ..Default::default()
+            },
+        )
+    };
 
     assert!(gl.egl.get_current_context().is_none());
     assert!(gl.egl.get_current_display().is_none());
 
-    unsafe {
-        SetWindowLongPtrW(
-            window,
-            GWLP_USERDATA,
-            Box::leak(Box::new(WindowData { engine, gl })) as *mut _ as _,
-        );
-    }
+    let window_data = Box::leak(Box::new(WindowData {
+        engine,
+        gl,
+        scale_factor: window.scale_factor(),
+    }));
 
-    unsafe {
-        let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+    unsafe { SetWindowSubclass(hwnd, Some(wnd_proc), 696969, window_data as *mut _ as _) };
+
+    let mut cursor_pos = PhysicalPosition::new(0.0, 0.0);
+
+    event_loop.run(move |event, target| {
+        if let Event::WindowEvent { event, .. } = event {
+            match event {
+                WindowEvent::CloseRequested => {
+                    target.exit();
+                }
+                WindowEvent::ScaleFactorChanged {
+                    scale_factor,
+                    inner_size_writer: _,
+                } => {
+                    window_data.scale_factor = scale_factor;
+                }
+                WindowEvent::CursorMoved { position, .. } => unsafe {
+                    cursor_pos = position;
+                    FlutterEngineSendPointerEvent(
+                        engine,
+                        &FlutterPointerEvent {
+                            struct_size: mem::size_of::<FlutterPointerEvent>(),
+                            phase: FlutterPointerPhase_kHover,
+                            x: position.x,
+                            y: position.y,
+                            timestamp: FlutterEngineGetCurrentTime() as usize,
+                            ..Default::default()
+                        },
+                        1,
+                    );
+                },
+                WindowEvent::CursorEntered { .. } => unsafe {
+                    FlutterEngineSendPointerEvent(
+                        engine,
+                        &FlutterPointerEvent {
+                            struct_size: mem::size_of::<FlutterPointerEvent>(),
+                            phase: FlutterPointerPhase_kAdd,
+                            x: cursor_pos.x,
+                            y: cursor_pos.y,
+                            timestamp: FlutterEngineGetCurrentTime() as usize,
+                            ..Default::default()
+                        },
+                        1,
+                    );
+                },
+                WindowEvent::CursorLeft { .. } => unsafe {
+                    FlutterEngineSendPointerEvent(
+                        engine,
+                        &FlutterPointerEvent {
+                            struct_size: mem::size_of::<FlutterPointerEvent>(),
+                            phase: FlutterPointerPhase_kRemove,
+                            x: cursor_pos.x,
+                            y: cursor_pos.y,
+                            timestamp: FlutterEngineGetCurrentTime() as usize,
+                            ..Default::default()
+                        },
+                        1,
+                    );
+                },
+                WindowEvent::MouseInput { state, .. } => unsafe {
+                    FlutterEngineSendPointerEvent(
+                        engine,
+                        &FlutterPointerEvent {
+                            struct_size: mem::size_of::<FlutterPointerEvent>(),
+                            phase: match state {
+                                ElementState::Pressed => FlutterPointerPhase_kDown,
+                                ElementState::Released => FlutterPointerPhase_kUp,
+                            },
+                            x: cursor_pos.x,
+                            y: cursor_pos.y,
+                            timestamp: FlutterEngineGetCurrentTime() as usize,
+                            ..Default::default()
+                        },
+                        1,
+                    );
+                },
+                _ => {}
+            }
         }
-    }
+    })?;
 
     Ok(())
 }
@@ -338,9 +402,11 @@ unsafe extern "system" fn wnd_proc(
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
+    _uidsubclass: usize,
+    dwrefdata: usize,
 ) -> LRESULT {
+    let data = dwrefdata as *mut WindowData;
     match msg {
-        WM_DESTROY => PostQuitMessage(0),
         WM_ERASEBKGND => {
             return LRESULT(1);
         }
@@ -350,7 +416,6 @@ unsafe extern "system" fn wnd_proc(
             let rect = lparam.0 as *const RECT;
             let rect = rect.as_ref().unwrap();
 
-            let data = GetWindowLongPtrW(window, GWLP_USERDATA) as *mut WindowData;
             if !data.is_null() && rect.right > rect.left && rect.bottom > rect.top {
                 let mut resize_state = (*(*data).gl).resize_state.lock().unwrap();
 
@@ -365,7 +430,7 @@ unsafe extern "system" fn wnd_proc(
                         struct_size: mem::size_of::<FlutterWindowMetricsEvent>(),
                         width: (rect.right - rect.left) as usize,
                         height: (rect.bottom - rect.top) as usize,
-                        pixel_ratio: 1.0,
+                        pixel_ratio: (*data).scale_factor,
                         ..Default::default()
                     },
                 );
@@ -378,13 +443,13 @@ unsafe extern "system" fn wnd_proc(
                     .unwrap();
             }
         }
-        _ => return DefWindowProcW(window, msg, wparam, lparam),
+        _ => return DefSubclassProc(window, msg, wparam, lparam),
     }
 
     LRESULT(0)
 }
 
-unsafe fn create_engine(gl: &mut Gl, width: i32, height: i32) -> FlutterEngine {
+unsafe fn create_engine(gl: &mut Gl) -> FlutterEngine {
     let mut engine = ptr::null_mut();
     unsafe {
         let result = FlutterEngineRun(
@@ -418,17 +483,6 @@ unsafe fn create_engine(gl: &mut Gl, width: i32, height: i32) -> FlutterEngine {
         if result != FlutterEngineResult_kSuccess || engine.is_null() {
             panic!("could not run the flutter engine");
         }
-
-        FlutterEngineSendWindowMetricsEvent(
-            engine,
-            &FlutterWindowMetricsEvent {
-                struct_size: mem::size_of::<FlutterWindowMetricsEvent>(),
-                width: width as usize,
-                height: height as usize,
-                pixel_ratio: 1.0,
-                ..Default::default()
-            },
-        );
     }
     engine
 }

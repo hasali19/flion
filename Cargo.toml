@@ -13,6 +13,8 @@ color-eyre = "0.6"
 flutter-embedder = { path = "flutter-embedder" }
 gl = "0.14"
 khronos-egl = { version = "4.1", features = ["static", "no-pkg-config"] }
+raw-window-handle = "0.6"
+winit = "0.29"
 
 [dependencies.windows]
 version = "0.48"
@@ -34,6 +36,7 @@ features = [
     "Win32_System_LibraryLoader",
     "Win32_System_WinRT",
     "Win32_System_WinRT_Composition",
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ]
 
