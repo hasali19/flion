@@ -14,6 +14,7 @@ use flutter_embedder::{
 };
 use khronos_egl as egl;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use tracing_subscriber::fmt::format::FmtSpan;
 use windows::core::{ComInterface, Interface};
 use windows::Foundation::Numerics::{Matrix4x4, Vector2, Vector3};
 use windows::Foundation::Size;
@@ -139,6 +140,11 @@ extern "C" fn debug_callback(
 fn main() -> Result<()> {
     color_eyre::install()?;
 
+    tracing_subscriber::fmt()
+        .with_span_events(FmtSpan::ENTER)
+        .with_thread_names(true)
+        .init();
+
     let event_loop = EventLoop::new()?;
     let window = WindowBuilder::new()
         .with_inner_size(LogicalSize::new(800, 600))
@@ -162,7 +168,7 @@ fn main() -> Result<()> {
 
     let PhysicalSize { width, height } = window.inner_size();
 
-    println!("{width} {height}");
+    tracing::info!(width, height);
 
     let _dispatcher_queue_controller = unsafe {
         CreateDispatcherQueueController(DispatcherQueueOptions {
@@ -497,6 +503,7 @@ unsafe fn create_engine(gl: &mut Gl) -> FlutterEngine {
     engine
 }
 
+#[tracing::instrument]
 unsafe extern "C" fn gl_make_current(user_data: *mut c_void) -> bool {
     let gl = user_data.cast::<Gl>().as_mut().unwrap();
 
@@ -511,6 +518,7 @@ unsafe extern "C" fn gl_make_current(user_data: *mut c_void) -> bool {
     res.is_ok()
 }
 
+#[tracing::instrument]
 unsafe extern "C" fn gl_make_resource_current(user_data: *mut c_void) -> bool {
     let gl = user_data.cast::<Gl>().as_mut().unwrap();
 
@@ -525,6 +533,7 @@ unsafe extern "C" fn gl_make_resource_current(user_data: *mut c_void) -> bool {
     res.is_ok()
 }
 
+#[tracing::instrument]
 unsafe extern "C" fn gl_clear_current(user_data: *mut c_void) -> bool {
     let gl = user_data.cast::<Gl>().as_mut().unwrap();
 
@@ -537,6 +546,7 @@ unsafe extern "C" fn gl_clear_current(user_data: *mut c_void) -> bool {
     res.is_ok()
 }
 
+#[tracing::instrument]
 unsafe extern "C" fn gl_present(user_data: *mut c_void) -> bool {
     let gl = user_data.cast::<Gl>().as_mut().unwrap();
     let mut resize_state = gl.resize_state.lock().unwrap();
@@ -584,6 +594,7 @@ unsafe fn present_frame(gl: &Gl, sync_dwm: bool) -> Result<()> {
     Ok(())
 }
 
+#[tracing::instrument]
 unsafe extern "C" fn gl_fbo_callback(user_data: *mut c_void) -> u32 {
     let gl = user_data.cast::<Gl>().as_mut().unwrap();
     let mut resize_state = gl.resize_state.lock().unwrap();
