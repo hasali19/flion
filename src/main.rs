@@ -226,15 +226,17 @@ fn main() -> Result<()> {
     let attribs = [egl::NONE as egl::Attrib];
     unsafe { eglDebugMessageControlKHR(debug_callback, attribs.as_ptr()) };
 
-    let display = egl.get_platform_display(
-        EGL_PLATFORM_ANGLE_ANGLE,
-        egl::DEFAULT_DISPLAY,
-        &[
-            EGL_PLATFORM_ANGLE_TYPE_ANGLE,
-            EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE,
-            egl::NONE as egl::Attrib,
-        ],
-    )?;
+    let display = unsafe {
+        egl.get_platform_display(
+            EGL_PLATFORM_ANGLE_ANGLE,
+            egl::DEFAULT_DISPLAY,
+            &[
+                EGL_PLATFORM_ANGLE_TYPE_ANGLE,
+                EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE,
+                egl::NONE as egl::Attrib,
+            ],
+        )
+    }?;
 
     egl.initialize(display)?;
 

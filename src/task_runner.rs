@@ -45,5 +45,8 @@ pub unsafe extern "C" fn set_thread_priority(thread_priority: i32) {
         }
         _ => THREAD_PRIORITY_NORMAL,
     };
-    SetThreadPriority(GetCurrentThread(), priority);
+
+    if let Err(e) = SetThreadPriority(GetCurrentThread(), priority) {
+        tracing::error!("failed to set thread priority: {e}");
+    }
 }
