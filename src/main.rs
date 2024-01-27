@@ -29,7 +29,7 @@ use windows::Win32::System::WinRT::{
     CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_ASTA, DQTYPE_THREAD_CURRENT,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
-use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, WM_ERASEBKGND, WM_NCCALCSIZE};
+use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, WM_NCCALCSIZE};
 use windows::UI::Composition::Core::CompositorController;
 use windows::UI::Composition::{CompositionDrawingSurface, SpriteVisual};
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
@@ -407,9 +407,6 @@ unsafe extern "system" fn wnd_proc(
 ) -> LRESULT {
     let data = dwrefdata as *mut WindowData;
     match msg {
-        WM_ERASEBKGND => {
-            return LRESULT(1);
-        }
         WM_NCCALCSIZE => {
             DefWindowProcW(window, msg, wparam, lparam);
 
