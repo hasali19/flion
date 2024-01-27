@@ -55,6 +55,7 @@ struct Gl {
     display: egl::Display,
     context: egl::Context,
     resource_context: egl::Context,
+    surface: Option<egl::Surface>,
     composition_surface: CompositionDrawingSurface,
     config: egl::Config,
     resize_condvar: Condvar,
@@ -269,11 +270,11 @@ fn main() -> Result<()> {
     gl::Flush::load_with(|name| egl.get_proc_address(name).unwrap() as _);
 
     let gl = Box::leak(Box::new(Gl {
-        // device,
         egl,
         display,
         context,
         resource_context,
+        surface: None,
         composition_surface,
         config: configs[0],
         resize_condvar: Condvar::new(),
@@ -372,6 +373,7 @@ unsafe fn create_engine(gl: &mut Gl, width: i32, height: i32) -> FlutterEngine {
                         clear_current: Some(gl_clear_current),
                         present: Some(gl_present),
                         fbo_callback: Some(gl_fbo_callback),
+                        fbo_reset_after_present: true,
                         gl_proc_resolver: Some(gl_get_proc_address),
                         ..Default::default()
                     },
@@ -408,7 +410,7 @@ unsafe fn create_engine(gl: &mut Gl, width: i32, height: i32) -> FlutterEngine {
 unsafe extern "C" fn gl_make_current(user_data: *mut c_void) -> bool {
     let gl = user_data.cast::<Gl>().as_mut().unwrap();
     gl.egl
-        .make_current(gl.display, None, None, Some(gl.context))
+        .make_current(gl.display, gl.surface, gl.surface, Some(gl.context))
         .unwrap();
     true
 }
@@ -431,39 +433,43 @@ unsafe extern "C" fn gl_present(user_data: *mut c_void) -> bool {
     let gl = user_data.cast::<Gl>().as_mut().unwrap();
     let mut resize_state = gl.resize_state.lock().unwrap();
 
+    if gl.surface.is_none() {
+        panic!("BeginDraw() has not been called for composition surface");
+    }
+
     match *resize_state {
-        ResizeState::Started(_, _) => panic!("present called before fbo_callback during resize"),
+        ResizeState::Started(_, _) => return false,
         ResizeState::FrameGenerated => {
             gl::Flush();
+
             let surface = gl.egl.get_current_surface(egl::DRAW).unwrap();
-            gl.egl.swap_buffers(gl.display, surface).unwrap();
             let composition_surface_interop = gl
                 .composition_surface
                 .cast::<ICompositionDrawingSurfaceInterop>()
                 .unwrap();
             composition_surface_interop.EndDraw().unwrap();
-            gl.egl
-                .make_current(gl.display, None, None, Some(gl.context))
-                .unwrap();
+
             gl.egl.destroy_surface(gl.display, surface).unwrap();
+            gl.surface = None;
+
             DwmFlush().unwrap();
+
             *resize_state = ResizeState::Done;
-            drop(resize_state);
+
             gl.resize_condvar.notify_all();
         }
         ResizeState::Done => {
             gl::Flush();
+
             let surface = gl.egl.get_current_surface(egl::DRAW).unwrap();
-            gl.egl.swap_buffers(gl.display, surface).unwrap();
             let composition_surface_interop = gl
                 .composition_surface
                 .cast::<ICompositionDrawingSurfaceInterop>()
                 .unwrap();
             composition_surface_interop.EndDraw().unwrap();
-            gl.egl
-                .make_current(gl.display, None, None, Some(gl.context))
-                .unwrap();
+
             gl.egl.destroy_surface(gl.display, surface).unwrap();
+            gl.surface = None;
         }
     }
 
@@ -474,6 +480,17 @@ unsafe extern "C" fn gl_fbo_callback(user_data: *mut c_void) -> u32 {
     let gl = user_data.cast::<Gl>().as_mut().unwrap();
     let mut resize_state = gl.resize_state.lock().unwrap();
 
+    let composition_surface_interop = gl
+        .composition_surface
+        .cast::<ICompositionDrawingSurfaceInterop>()
+        .unwrap();
+
+    if let Some(surface) = gl.surface {
+        composition_surface_interop.EndDraw().unwrap();
+        gl.egl.destroy_surface(gl.display, surface).unwrap();
+        gl.surface = None;
+    }
+
     if let ResizeState::Started(width, height) = *resize_state {
         gl.composition_surface
             .Resize(SizeInt32 {
@@ -483,11 +500,6 @@ unsafe extern "C" fn gl_fbo_callback(user_data: *mut c_void) -> u32 {
             .unwrap();
         *resize_state = ResizeState::FrameGenerated;
     }
-
-    let composition_surface_interop = gl
-        .composition_surface
-        .cast::<ICompositionDrawingSurfaceInterop>()
-        .unwrap();
 
     let mut update_offset = POINT::default();
     let texture: ID3D11Texture2D = composition_surface_interop
@@ -507,8 +519,10 @@ unsafe extern "C" fn gl_fbo_callback(user_data: *mut c_void) -> u32 {
         )
         .unwrap();
 
+    gl.surface = Some(surface);
+
     gl.egl
-        .make_current(gl.display, Some(surface), Some(surface), Some(gl.context))
+        .make_current(gl.display, gl.surface, gl.surface, Some(gl.context))
         .unwrap();
 
     0
