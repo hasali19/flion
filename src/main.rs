@@ -486,75 +486,89 @@ unsafe fn create_engine(gl: &mut Gl) -> FlutterEngine {
 
 unsafe extern "C" fn gl_make_current(user_data: *mut c_void) -> bool {
     let gl = user_data.cast::<Gl>().as_mut().unwrap();
-    gl.egl
-        .make_current(gl.display, gl.surface, gl.surface, Some(gl.context))
-        .unwrap();
-    true
+
+    let res = gl
+        .egl
+        .make_current(gl.display, None, None, Some(gl.context));
+
+    if let Err(e) = res {
+        eprintln!("failed to make context current: {e}");
+    }
+
+    res.is_ok()
 }
 
 unsafe extern "C" fn gl_make_resource_current(user_data: *mut c_void) -> bool {
     let gl = user_data.cast::<Gl>().as_mut().unwrap();
-    gl.egl
-        .make_current(gl.display, None, None, Some(gl.resource_context))
-        .unwrap();
-    true
+
+    let res = gl
+        .egl
+        .make_current(gl.display, None, None, Some(gl.resource_context));
+
+    if let Err(e) = res {
+        eprintln!("failed to make resource context current: {e}");
+    }
+
+    res.is_ok()
 }
 
 unsafe extern "C" fn gl_clear_current(user_data: *mut c_void) -> bool {
     let gl = user_data.cast::<Gl>().as_mut().unwrap();
-    gl.egl.make_current(gl.display, None, None, None).unwrap();
-    true
+
+    let res = gl.egl.make_current(gl.display, None, None, None);
+
+    if let Err(e) = res {
+        eprintln!("failed to clear context: {e}");
+    }
+
+    res.is_ok()
 }
 
 unsafe extern "C" fn gl_present(user_data: *mut c_void) -> bool {
     let gl = user_data.cast::<Gl>().as_mut().unwrap();
     let mut resize_state = gl.resize_state.lock().unwrap();
 
-    if gl.surface.is_none() {
-        panic!("BeginDraw() has not been called for composition surface");
-    }
-
     match *resize_state {
         ResizeState::Started(_, _) => return false,
         ResizeState::FrameGenerated => {
-            gl::Flush();
-
-            let surface = gl.egl.get_current_surface(egl::DRAW).unwrap();
-            let composition_surface_interop = gl
-                .composition_surface
-                .cast::<ICompositionDrawingSurfaceInterop>()
-                .unwrap();
-            composition_surface_interop.EndDraw().unwrap();
-
-            gl.egl.destroy_surface(gl.display, surface).unwrap();
-            gl.surface = None;
-
-            DwmFlush().unwrap();
-
-            gl.compositor_controller.Commit().unwrap();
-
+            present_frame(gl, true).unwrap();
             *resize_state = ResizeState::Done;
-
             gl.resize_condvar.notify_all();
         }
         ResizeState::Done => {
-            gl::Flush();
-
-            let surface = gl.egl.get_current_surface(egl::DRAW).unwrap();
-            let composition_surface_interop = gl
-                .composition_surface
-                .cast::<ICompositionDrawingSurfaceInterop>()
-                .unwrap();
-            composition_surface_interop.EndDraw().unwrap();
-
-            gl.compositor_controller.Commit().unwrap();
-
-            gl.egl.destroy_surface(gl.display, surface).unwrap();
-            gl.surface = None;
+            present_frame(gl, false).unwrap();
         }
     }
 
+            gl.surface = None;
+
     true
+}
+
+unsafe fn present_frame(gl: &Gl, sync_dwm: bool) -> Result<()> {
+    let Some(egl_surface) = gl.surface else {
+        panic!("BeginDraw() has not been called for composition surface");
+    };
+
+    gl::Flush();
+
+    gl.egl.destroy_surface(gl.display, egl_surface)?;
+    gl.egl
+        .make_current(gl.display, None, None, Some(gl.context))?;
+
+    let composition_surface_interop = gl
+        .composition_surface
+        .cast::<ICompositionDrawingSurfaceInterop>()?;
+
+    composition_surface_interop.EndDraw()?;
+
+    if sync_dwm {
+        DwmFlush()?;
+    }
+
+    gl.compositor_controller.Commit()?;
+
+    Ok(())
 }
 
 unsafe extern "C" fn gl_fbo_callback(user_data: *mut c_void) -> u32 {
@@ -565,12 +579,6 @@ unsafe extern "C" fn gl_fbo_callback(user_data: *mut c_void) -> u32 {
         .composition_surface
         .cast::<ICompositionDrawingSurfaceInterop>()
         .unwrap();
-
-    if let Some(surface) = gl.surface {
-        composition_surface_interop.EndDraw().unwrap();
-        gl.egl.destroy_surface(gl.display, surface).unwrap();
-        gl.surface = None;
-    }
 
     if let ResizeState::Started(width, height) = *resize_state {
         gl.visual
