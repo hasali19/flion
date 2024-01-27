@@ -21,7 +21,10 @@ use windows::Graphics::DirectX::{DirectXAlphaMode, DirectXPixelFormat};
 use windows::Graphics::SizeInt32;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
-use windows::Win32::Graphics::Dwm::DwmFlush;
+use windows::Win32::Graphics::Dwm::{
+    DwmFlush, DwmSetWindowAttribute, DWMSBT_TABBEDWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
+    DWM_SYSTEMBACKDROP_TYPE,
+};
 use windows::Win32::System::WinRT::Composition::{
     ICompositionDrawingSurfaceInterop, ICompositorDesktopInterop, ICompositorInterop,
 };
@@ -36,7 +39,7 @@ use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Event, WindowEvent};
 use winit::event_loop::EventLoop;
 use winit::platform::windows::WindowBuilderExtWindows;
-use winit::window::WindowBuilder;
+use winit::window::{Theme, WindowBuilder};
 
 macro_rules! cstr {
     ($v:literal) => {
@@ -140,12 +143,22 @@ fn main() -> Result<()> {
     let window = WindowBuilder::new()
         .with_inner_size(LogicalSize::new(800, 600))
         .with_no_redirection_bitmap(true)
+        .with_theme(Some(Theme::Light))
         .build(&event_loop)?;
 
     let hwnd = match window.window_handle()?.as_raw() {
         RawWindowHandle::Win32(handle) => HWND(handle.hwnd.get()),
         _ => unreachable!(),
     };
+
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            &DWMSBT_TABBEDWINDOW as *const DWM_SYSTEMBACKDROP_TYPE as *const c_void,
+            mem::size_of::<DWM_SYSTEMBACKDROP_TYPE>() as u32,
+        )
+    }?;
 
     let PhysicalSize { width, height } = window.inner_size();
 
@@ -540,7 +553,7 @@ unsafe extern "C" fn gl_present(user_data: *mut c_void) -> bool {
         }
     }
 
-            gl.surface = None;
+    gl.surface = None;
 
     true
 }
