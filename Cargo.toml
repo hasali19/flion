@@ -21,6 +21,7 @@ features = [
     "Graphics_DirectX",
     "System",
     "UI_Composition",
+    "UI_Composition_Core",
     "UI_Composition_Desktop",
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",

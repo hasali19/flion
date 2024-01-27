@@ -34,7 +34,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_DESTROY, WM_ERASEBKGND, WM_NCCALCSIZE, WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP,
     WS_OVERLAPPEDWINDOW,
 };
-use windows::UI::Composition::{CompositionDrawingSurface, Compositor};
+use windows::UI::Composition::Core::CompositorController;
+use windows::UI::Composition::{CompositionDrawingSurface, SpriteVisual};
 
 macro_rules! cstr {
     ($v:literal) => {
@@ -56,8 +57,10 @@ struct Gl {
     context: egl::Context,
     resource_context: egl::Context,
     surface: Option<egl::Surface>,
-    composition_surface: CompositionDrawingSurface,
     config: egl::Config,
+    compositor_controller: CompositorController,
+    visual: SpriteVisual,
+    composition_surface: CompositionDrawingSurface,
     resize_condvar: Condvar,
     resize_state: Mutex<ResizeState>,
 }
@@ -176,15 +179,21 @@ fn main() -> Result<()> {
         })?
     };
 
-    let compositor = Compositor::new()?;
+    let compositor_controller = CompositorController::new()?;
     let composition_target = unsafe {
-        compositor
+        compositor_controller
+            .Compositor()?
             .cast::<ICompositorDesktopInterop>()?
             .CreateDesktopWindowTarget(window, false)?
     };
 
-    let root = compositor.CreateSpriteVisual()?;
-    root.SetRelativeSizeAdjustment(Vector2 { X: 1.0, Y: 1.0 })?;
+    let root = compositor_controller.Compositor()?.CreateSpriteVisual()?;
+
+    root.SetSize(Vector2 {
+        X: width as f32,
+        Y: height as f32,
+    })?;
+
     composition_target.SetRoot(&root)?;
 
     let egl = EglInstance::new(egl::Static);
@@ -225,7 +234,8 @@ fn main() -> Result<()> {
     };
 
     let composition_device = unsafe {
-        compositor
+        compositor_controller
+            .Compositor()?
             .cast::<ICompositorInterop>()?
             .CreateGraphicsDevice(&device)?
     };
@@ -239,7 +249,11 @@ fn main() -> Result<()> {
         DirectXAlphaMode::Premultiplied,
     )?;
 
-    root.SetBrush(&compositor.CreateSurfaceBrushWithSurface(&composition_surface)?)?;
+    root.SetBrush(
+        &compositor_controller
+            .Compositor()?
+            .CreateSurfaceBrushWithSurface(&composition_surface)?,
+    )?;
 
     let mut configs = Vec::with_capacity(1);
     let config_attribs = [
@@ -275,8 +289,10 @@ fn main() -> Result<()> {
         context,
         resource_context,
         surface: None,
-        composition_surface,
         config: configs[0],
+        compositor_controller,
+        visual: root,
+        composition_surface,
         resize_condvar: Condvar::new(),
         resize_state: Mutex::new(ResizeState::Done),
     }));
@@ -454,6 +470,8 @@ unsafe extern "C" fn gl_present(user_data: *mut c_void) -> bool {
 
             DwmFlush().unwrap();
 
+            gl.compositor_controller.Commit().unwrap();
+
             *resize_state = ResizeState::Done;
 
             gl.resize_condvar.notify_all();
@@ -467,6 +485,8 @@ unsafe extern "C" fn gl_present(user_data: *mut c_void) -> bool {
                 .cast::<ICompositionDrawingSurfaceInterop>()
                 .unwrap();
             composition_surface_interop.EndDraw().unwrap();
+
+            gl.compositor_controller.Commit().unwrap();
 
             gl.egl.destroy_surface(gl.display, surface).unwrap();
             gl.surface = None;
@@ -492,12 +512,20 @@ unsafe extern "C" fn gl_fbo_callback(user_data: *mut c_void) -> u32 {
     }
 
     if let ResizeState::Started(width, height) = *resize_state {
+        gl.visual
+            .SetSize(Vector2 {
+                X: width as f32,
+                Y: height as f32,
+            })
+            .unwrap();
+
         gl.composition_surface
             .Resize(SizeInt32 {
                 Width: width as i32,
                 Height: height as i32,
             })
             .unwrap();
+
         *resize_state = ResizeState::FrameGenerated;
     }
 
