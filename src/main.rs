@@ -13,7 +13,7 @@ use flutter_embedder::{
 use khronos_egl as egl;
 use windows::core::{ComInterface, Interface};
 use windows::w;
-use windows::Foundation::Numerics::Vector2;
+use windows::Foundation::Numerics::{Matrix4x4, Vector2, Vector3};
 use windows::Foundation::Size;
 use windows::Graphics::DirectX::{DirectXAlphaMode, DirectXPixelFormat};
 use windows::Graphics::SizeInt32;
@@ -193,6 +193,16 @@ fn main() -> Result<()> {
         X: width as f32,
         Y: height as f32,
     })?;
+
+    root.SetTransformMatrix(Matrix4x4 {
+        M11: 1.0,
+        M22: -1.0,
+        M33: 1.0,
+        M44: 1.0,
+        ..Default::default()
+    })?;
+
+    root.SetOffset(Vector3::new(0.0, height as f32, 0.0))?;
 
     composition_target.SetRoot(&root)?;
 
@@ -517,6 +527,10 @@ unsafe extern "C" fn gl_fbo_callback(user_data: *mut c_void) -> u32 {
                 X: width as f32,
                 Y: height as f32,
             })
+            .unwrap();
+
+        gl.visual
+            .SetOffset(Vector3::new(0.0, height as f32, 0.0))
             .unwrap();
 
         gl.composition_surface
