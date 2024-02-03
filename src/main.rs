@@ -1,5 +1,6 @@
-#![feature(lint_reasons)]
+#![feature(c_str_literals, lint_reasons)]
 
+mod compositor;
 mod render_thread;
 mod task_runner;
 
@@ -11,7 +12,7 @@ use std::{mem, ptr};
 use color_eyre::Result;
 use egl::ClientBuffer;
 use flutter_embedder::{
-    FlutterCustomTaskRunners, FlutterEngine, FlutterEngineGetCurrentTime,
+    FlutterCompositor, FlutterCustomTaskRunners, FlutterEngine, FlutterEngineGetCurrentTime,
     FlutterEngineResult_kSuccess, FlutterEngineRun, FlutterEngineRunTask,
     FlutterEngineSendPointerEvent, FlutterEngineSendWindowMetricsEvent,
     FlutterOpenGLRendererConfig, FlutterPointerEvent, FlutterPointerPhase_kAdd,
@@ -25,39 +26,28 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use tracing_subscriber::fmt::format::FmtSpan;
 use windows::core::{ComInterface, Interface};
 use windows::Foundation::Numerics::{Matrix4x4, Vector2, Vector3};
-use windows::Foundation::Size;
-use windows::Graphics::DirectX::{DirectXAlphaMode, DirectXPixelFormat};
-use windows::Graphics::SizeInt32;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::Win32::Graphics::Dwm::{
-    DwmFlush, DwmSetWindowAttribute, DWMSBT_TABBEDWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
-    DWM_SYSTEMBACKDROP_TYPE,
+    DwmSetWindowAttribute, DWMSBT_TABBEDWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWM_SYSTEMBACKDROP_TYPE,
 };
-use windows::Win32::System::WinRT::Composition::{
-    ICompositionDrawingSurfaceInterop, ICompositorDesktopInterop, ICompositorInterop,
-};
+use windows::Win32::System::WinRT::Composition::ICompositorDesktopInterop;
 use windows::Win32::System::WinRT::{
     CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_ASTA, DQTYPE_THREAD_CURRENT,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, WM_NCCALCSIZE};
+use windows::UI::Composition::ContainerVisual;
 use windows::UI::Composition::Core::CompositorController;
-use windows::UI::Composition::{CompositionDrawingSurface, SpriteVisual};
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use winit::platform::windows::WindowBuilderExtWindows;
 use winit::window::{Theme, WindowBuilder};
 
+use crate::compositor::Compositor;
 use crate::render_thread::{RenderEvent, RenderTask};
 use crate::task_runner::TaskRunner;
-
-macro_rules! cstr {
-    ($v:literal) => {
-        concat!($v, "\0").as_ptr() as *const std::ffi::c_char
-    };
-}
 
 type EglInstance = egl::Instance<egl::Static>;
 
@@ -72,11 +62,10 @@ struct Gl {
     display: egl::Display,
     context: egl::Context,
     resource_context: egl::Context,
-    surface: Option<egl::Surface>,
     config: egl::Config,
+    device: ID3D11Device,
     compositor_controller: CompositorController,
-    visual: SpriteVisual,
-    composition_surface: CompositionDrawingSurface,
+    root: ContainerVisual,
     resize_condvar: Condvar,
     resize_state: Mutex<ResizeState>,
 }
@@ -202,7 +191,9 @@ fn main() -> Result<()> {
             .CreateDesktopWindowTarget(hwnd, false)?
     };
 
-    let root = compositor_controller.Compositor()?.CreateSpriteVisual()?;
+    let root = compositor_controller
+        .Compositor()?
+        .CreateContainerVisual()?;
 
     root.SetSize(Vector2 {
         X: width as f32,
@@ -260,28 +251,6 @@ fn main() -> Result<()> {
         ID3D11Device::from_raw(angle_device as _)
     };
 
-    let composition_device = unsafe {
-        compositor_controller
-            .Compositor()?
-            .cast::<ICompositorInterop>()?
-            .CreateGraphicsDevice(&device)?
-    };
-
-    let composition_surface = composition_device.CreateDrawingSurface(
-        Size {
-            Width: width as f32,
-            Height: height as f32,
-        },
-        DirectXPixelFormat::B8G8R8A8UIntNormalized,
-        DirectXAlphaMode::Premultiplied,
-    )?;
-
-    root.SetBrush(
-        &compositor_controller
-            .Compositor()?
-            .CreateSurfaceBrushWithSurface(&composition_surface)?,
-    )?;
-
     let mut configs = Vec::with_capacity(1);
     let config_attribs = [
         egl::RED_SIZE,
@@ -308,18 +277,25 @@ fn main() -> Result<()> {
 
     egl.make_current(display, None, None, Some(context))?;
 
+    gl::GenTextures::load_with(|name| egl.get_proc_address(name).unwrap() as _);
+    gl::BindTexture::load_with(|name| egl.get_proc_address(name).unwrap() as _);
+    gl::BindFramebuffer::load_with(|name| egl.get_proc_address(name).unwrap() as _);
     gl::Flush::load_with(|name| egl.get_proc_address(name).unwrap() as _);
+    gl::GenFramebuffers::load_with(|name| egl.get_proc_address(name).unwrap() as _);
+    gl::TexParameteri::load_with(|name| egl.get_proc_address(name).unwrap() as _);
+    gl::FramebufferTexture2D::load_with(|name| egl.get_proc_address(name).unwrap() as _);
 
     let gl = Box::leak(Box::new(Gl {
         egl,
         display,
         context,
         resource_context,
-        surface: None,
+        // surface: None,
         config: configs[0],
+        device,
         compositor_controller,
-        visual: root,
-        composition_surface,
+        root,
+        // composition_surface,
         resize_condvar: Condvar::new(),
         resize_state: Mutex::new(ResizeState::Done),
     }));
@@ -516,8 +492,6 @@ unsafe extern "system" fn wnd_proc(
 }
 
 unsafe fn create_engine(gl: &mut Gl, event_loop: EventLoopProxy<PlatformEvent>) -> FlutterEngine {
-    let mut engine = ptr::null_mut();
-
     fn create_task_runner<F: Fn(u64, FlutterTask)>(
         id: usize,
         runner: &'static TaskRunner<F>,
@@ -590,17 +564,27 @@ unsafe fn create_engine(gl: &mut Gl, event_loop: EventLoopProxy<PlatformEvent>) 
 
     let project_args = FlutterProjectArgs {
         struct_size: mem::size_of::<FlutterProjectArgs>(),
-        assets_path: cstr!("example/build/flutter_assets"),
-        icu_data_path: cstr!("icudtl.dat"),
+        assets_path: c"example/build/flutter_assets".as_ptr(),
+        icu_data_path: c"icudtl.dat".as_ptr(),
         custom_task_runners: &FlutterCustomTaskRunners {
             struct_size: mem::size_of::<FlutterCustomTaskRunners>(),
             platform_task_runner: &platform_task_runner,
             render_task_runner: &render_task_runner,
             thread_priority_setter: Some(task_runner::set_thread_priority),
         },
+        compositor: &FlutterCompositor {
+            struct_size: mem::size_of::<FlutterCompositor>(),
+            create_backing_store_callback: Some(compositor::create_backing_store),
+            collect_backing_store_callback: Some(compositor::collect_backing_store),
+            present_layers_callback: Some(compositor::present_layers),
+            user_data: Box::leak(Box::new(Compositor::new(gl as *mut Gl))) as *mut Compositor
+                as *mut c_void,
+            avoid_backing_store_cache: false,
+        },
         ..Default::default()
     };
 
+    let mut engine = ptr::null_mut();
     unsafe {
         let result = FlutterEngineRun(
             FLUTTER_ENGINE_VERSION as usize,
@@ -665,107 +649,107 @@ unsafe extern "C" fn gl_clear_current(user_data: *mut c_void) -> bool {
 
 #[tracing::instrument]
 unsafe extern "C" fn gl_present(user_data: *mut c_void) -> bool {
-    let gl = user_data.cast::<Gl>().as_mut().unwrap();
-    let mut resize_state = gl.resize_state.lock().unwrap();
+    // let gl = user_data.cast::<Gl>().as_mut().unwrap();
+    // let mut resize_state = gl.resize_state.lock().unwrap();
 
-    match *resize_state {
-        ResizeState::Started(_, _) => return false,
-        ResizeState::FrameGenerated => {
-            present_frame(gl, true).unwrap();
-            *resize_state = ResizeState::Done;
-            gl.resize_condvar.notify_all();
-        }
-        ResizeState::Done => {
-            present_frame(gl, false).unwrap();
-        }
-    }
+    // match *resize_state {
+    //     ResizeState::Started(_, _) => return false,
+    //     ResizeState::FrameGenerated => {
+    //         present_frame(gl, true).unwrap();
+    //         *resize_state = ResizeState::Done;
+    //         gl.resize_condvar.notify_all();
+    //     }
+    //     ResizeState::Done => {
+    //         present_frame(gl, false).unwrap();
+    //     }
+    // }
 
-    gl.surface = None;
+    // gl.surface = None;
 
     true
 }
 
-unsafe fn present_frame(gl: &Gl, sync_dwm: bool) -> Result<()> {
-    let Some(egl_surface) = gl.surface else {
-        panic!("BeginDraw() has not been called for composition surface");
-    };
+// unsafe fn present_frame(gl: &Gl, sync_dwm: bool) -> Result<()> {
+//     let Some(egl_surface) = gl.surface else {
+//         panic!("BeginDraw() has not been called for composition surface");
+//     };
 
-    gl::Flush();
+//     gl::Flush();
 
-    gl.egl.destroy_surface(gl.display, egl_surface)?;
-    gl.egl
-        .make_current(gl.display, None, None, Some(gl.context))?;
+//     gl.egl.destroy_surface(gl.display, egl_surface)?;
+//     gl.egl
+//         .make_current(gl.display, None, None, Some(gl.context))?;
 
-    let composition_surface_interop = gl
-        .composition_surface
-        .cast::<ICompositionDrawingSurfaceInterop>()?;
+//     let composition_surface_interop = gl
+//         .composition_surface
+//         .cast::<ICompositionDrawingSurfaceInterop>()?;
 
-    composition_surface_interop.EndDraw()?;
+//     composition_surface_interop.EndDraw()?;
 
-    if sync_dwm {
-        DwmFlush()?;
-    }
+//     if sync_dwm {
+//         DwmFlush()?;
+//     }
 
-    gl.compositor_controller.Commit()?;
+//     gl.compositor_controller.Commit()?;
 
-    Ok(())
-}
+//     Ok(())
+// }
 
 #[tracing::instrument]
 unsafe extern "C" fn gl_fbo_callback(user_data: *mut c_void) -> u32 {
-    let gl = user_data.cast::<Gl>().as_mut().unwrap();
-    let mut resize_state = gl.resize_state.lock().unwrap();
+    // let gl = user_data.cast::<Gl>().as_mut().unwrap();
+    // let mut resize_state = gl.resize_state.lock().unwrap();
 
-    let composition_surface_interop = gl
-        .composition_surface
-        .cast::<ICompositionDrawingSurfaceInterop>()
-        .unwrap();
+    // let composition_surface_interop = gl
+    //     .composition_surface
+    //     .cast::<ICompositionDrawingSurfaceInterop>()
+    //     .unwrap();
 
-    if let ResizeState::Started(width, height) = *resize_state {
-        gl.visual
-            .SetSize(Vector2 {
-                X: width as f32,
-                Y: height as f32,
-            })
-            .unwrap();
+    // if let ResizeState::Started(width, height) = *resize_state {
+    //     gl.root
+    //         .SetSize(Vector2 {
+    //             X: width as f32,
+    //             Y: height as f32,
+    //         })
+    //         .unwrap();
 
-        gl.visual
-            .SetOffset(Vector3::new(0.0, height as f32, 0.0))
-            .unwrap();
+    //     gl.root
+    //         .SetOffset(Vector3::new(0.0, height as f32, 0.0))
+    //         .unwrap();
 
-        gl.composition_surface
-            .Resize(SizeInt32 {
-                Width: width as i32,
-                Height: height as i32,
-            })
-            .unwrap();
+    //     gl.composition_surface
+    //         .Resize(SizeInt32 {
+    //             Width: width as i32,
+    //             Height: height as i32,
+    //         })
+    //         .unwrap();
 
-        *resize_state = ResizeState::FrameGenerated;
-    }
+    //     *resize_state = ResizeState::FrameGenerated;
+    // }
 
-    let mut update_offset = POINT::default();
-    let texture: ID3D11Texture2D = composition_surface_interop
-        .BeginDraw(None, &mut update_offset)
-        .unwrap();
+    // let mut update_offset = POINT::default();
+    // let texture: ID3D11Texture2D = composition_surface_interop
+    //     .BeginDraw(None, &mut update_offset)
+    //     .unwrap();
 
-    let client_buffer = unsafe { ClientBuffer::from_ptr(texture.as_raw()) };
+    // let client_buffer = unsafe { ClientBuffer::from_ptr(texture.as_raw()) };
 
-    let surface = gl
-        .egl
-        .create_pbuffer_from_client_buffer(
-            gl.display,
-            0x33A3,
-            client_buffer,
-            gl.config,
-            &[0x3490, update_offset.x, 0x3491, update_offset.y, egl::NONE],
-        )
-        .unwrap();
+    // let surface = gl
+    //     .egl
+    //     .create_pbuffer_from_client_buffer(
+    //         gl.display,
+    //         0x33A3,
+    //         client_buffer,
+    //         gl.config,
+    //         &[0x3490, update_offset.x, 0x3491, update_offset.y, egl::NONE],
+    //     )
+    //     .unwrap();
 
-    gl.surface = Some(surface);
+    // gl.surface = Some(surface);
 
-    gl.egl
-        .make_current(gl.display, gl.surface, gl.surface, Some(gl.context))
-        .unwrap();
+    // gl.egl
+    //     .make_current(gl.display, gl.surface, gl.surface, Some(gl.context))
+    //     .unwrap();
 
     0
 }
