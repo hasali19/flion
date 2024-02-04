@@ -66,7 +66,7 @@ fn render_main(engine: FlutterEngine, task_receiver: mpsc::Receiver<RenderEvent>
                 return false;
             }
 
-            let delta = Duration::from_nanos(now - target_time_nanos);
+            let delta = Duration::from_nanos(target_time_nanos - now);
 
             next_wait_time = Some(if let Some(wait_time) = next_wait_time {
                 std::cmp::min(wait_time, delta)

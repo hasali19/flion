@@ -446,7 +446,7 @@ fn main() -> Result<()> {
                 return false;
             }
 
-            let delta = Duration::from_nanos(now - target_time_nanos);
+            let delta = Duration::from_nanos(target_time_nanos - now);
             let target_time = Instant::now() + delta;
 
             next_task_target_time = Some(if let Some(next) = next_task_target_time {
