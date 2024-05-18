@@ -21,7 +21,6 @@ use flutter_embedder::{
 };
 use khronos_egl as egl;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use tracing_subscriber::fmt::format::FmtSpan;
 use windows::core::{ComInterface, Interface};
 use windows::Foundation::Numerics::{Matrix4x4, Vector2, Vector3};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -49,8 +48,7 @@ use crate::task_runner::TaskRunner;
 type EglInstance = egl::Instance<egl::Static>;
 
 enum ResizeState {
-    Started(u32, u32),
-    FrameGenerated,
+    Started,
     Done,
 }
 
@@ -142,10 +140,14 @@ enum PlatformEvent {
 fn main() -> Result<()> {
     color_eyre::install()?;
 
-    tracing_subscriber::fmt()
-        .with_span_events(FmtSpan::ENTER)
-        .with_thread_names(true)
-        .init();
+    #[cfg(debug_assertions)]
+    {
+        use tracing_subscriber::fmt::format::FmtSpan;
+        tracing_subscriber::fmt()
+            .with_span_events(FmtSpan::ENTER)
+            .with_thread_names(true)
+            .init();
+    }
 
     let event_loop = EventLoopBuilder::<PlatformEvent>::with_user_event().build()?;
     let window = WindowBuilder::new()
@@ -274,13 +276,25 @@ fn main() -> Result<()> {
 
     egl.make_current(display, None, None, Some(context))?;
 
-    gl::GenTextures::load_with(|name| egl.get_proc_address(name).unwrap() as _);
-    gl::BindTexture::load_with(|name| egl.get_proc_address(name).unwrap() as _);
-    gl::BindFramebuffer::load_with(|name| egl.get_proc_address(name).unwrap() as _);
-    gl::Flush::load_with(|name| egl.get_proc_address(name).unwrap() as _);
-    gl::GenFramebuffers::load_with(|name| egl.get_proc_address(name).unwrap() as _);
-    gl::TexParameteri::load_with(|name| egl.get_proc_address(name).unwrap() as _);
-    gl::FramebufferTexture2D::load_with(|name| egl.get_proc_address(name).unwrap() as _);
+    macro_rules! gl_load {
+        ($($name:ident)*) => {
+            $(
+                gl::$name::load_with(|name| egl.get_proc_address(name).unwrap() as _);
+            )*
+        };
+    }
+
+    gl_load!(
+        GenTextures
+        BindTexture
+        BindFramebuffer
+        Flush
+        GenFramebuffers
+        TexParameteri
+        FramebufferTexture2D
+        DeleteTextures
+        DeleteFramebuffers
+    );
 
     let gl = Box::leak(Box::new(Gl {
         egl,
@@ -456,19 +470,30 @@ unsafe extern "system" fn wnd_proc(
             let rect = rect.as_ref().unwrap();
 
             if !data.is_null() && rect.right > rect.left && rect.bottom > rect.top {
-                let mut resize_state = (*(*data).gl).resize_state.lock().unwrap();
+                let gl = (*data).gl;
+                let mut resize_state = (*gl).resize_state.lock().unwrap();
 
-                *resize_state = ResizeState::Started(
-                    (rect.right - rect.left) as u32,
-                    (rect.bottom - rect.top) as u32,
-                );
+                let width = rect.right - rect.left;
+                let height = rect.bottom - rect.top;
+
+                *resize_state = ResizeState::Started;
+
+                (*gl)
+                    .root
+                    .SetSize(Vector2::new(width as f32, height as f32))
+                    .unwrap();
+
+                (*gl)
+                    .root
+                    .SetOffset(Vector3::new(0.0, height as f32, 0.0))
+                    .unwrap();
 
                 FlutterEngineSendWindowMetricsEvent(
                     (*data).engine,
                     &FlutterWindowMetricsEvent {
                         struct_size: mem::size_of::<FlutterWindowMetricsEvent>(),
-                        width: (rect.right - rect.left) as usize,
-                        height: (rect.bottom - rect.top) as usize,
+                        width: width as usize,
+                        height: height as usize,
                         pixel_ratio: (*data).scale_factor,
                         ..Default::default()
                     },
@@ -555,7 +580,7 @@ unsafe fn create_engine(gl: &mut Gl, event_loop: EventLoopProxy<PlatformEvent>) 
         custom_task_runners: &FlutterCustomTaskRunners {
             struct_size: mem::size_of::<FlutterCustomTaskRunners>(),
             platform_task_runner: &platform_task_runner,
-            render_task_runner: &platform_task_runner,
+            render_task_runner: ptr::null(),
             thread_priority_setter: Some(task_runner::set_thread_priority),
         },
         compositor: &FlutterCompositor {

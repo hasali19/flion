@@ -1,11 +1,13 @@
 use std::ffi::c_void;
+use std::ptr;
 
 use egl::ClientBuffer;
 use flutter_embedder::{
     FlutterBackingStore, FlutterBackingStoreConfig,
     FlutterBackingStoreType_kFlutterBackingStoreTypeOpenGL, FlutterBackingStore__bindgen_ty_1,
-    FlutterLayer, FlutterOpenGLBackingStore, FlutterOpenGLBackingStore__bindgen_ty_1,
-    FlutterOpenGLFramebuffer, FlutterOpenGLTargetType_kFlutterOpenGLTargetTypeFramebuffer,
+    FlutterLayer, FlutterLayerContentType_kFlutterLayerContentTypeBackingStore,
+    FlutterOpenGLBackingStore, FlutterOpenGLBackingStore__bindgen_ty_1, FlutterOpenGLFramebuffer,
+    FlutterOpenGLTargetType_kFlutterOpenGLTargetTypeFramebuffer,
 };
 use khronos_egl as egl;
 use windows::core::{ComInterface, Interface};
@@ -16,37 +18,53 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_FLAG,
     D3D11_RESOURCE_MISC_SHARED, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
+use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::System::WinRT::Composition::{
     ICompositionDrawingSurfaceInterop, ICompositorInterop,
 };
-use windows::UI::Composition::{CompositionDrawingSurface, SpriteVisual};
+use windows::UI::Composition::{
+    CompositionDrawingSurface, CompositionGraphicsDevice, SpriteVisual,
+};
 
-use crate::Gl;
+use crate::{Gl, ResizeState};
 
-const EGL_D3D_TEXTURE_2D_SHARE_HANDLE_ANGLE: egl::Enum = 0x3200;
 const EGL_D3D_TEXTURE_ANGLE: egl::Enum = 0x33a3;
 
 pub struct Compositor {
     gl: *mut Gl,
-    render_targets: Vec<RenderTarget>,
+    layers: Vec<*const FlutterLayer>,
+    composition_device: CompositionGraphicsDevice,
 }
 
 impl Compositor {
     pub fn new(gl: *mut Gl) -> Compositor {
+        let composition_device = unsafe {
+            (*gl)
+                .compositor_controller
+                .Compositor()
+                .unwrap()
+                .cast::<ICompositorInterop>()
+                .unwrap()
+                .CreateGraphicsDevice(&(*gl).device)
+                .unwrap()
+        };
+
         Compositor {
             gl,
-            render_targets: vec![],
+            layers: vec![],
+            composition_device,
         }
     }
 }
 
 struct RenderTarget {
-    width: f64,
-    height: f64,
     visual: SpriteVisual,
     composition_surface: CompositionDrawingSurface,
     texture: ID3D11Texture2D,
+    egl_surface: egl::Surface,
+    gl_framebuffer: u32,
+    gl_texture: u32,
 }
 
 #[tracing::instrument]
@@ -73,19 +91,8 @@ pub unsafe extern "C" fn create_backing_store(
         })
         .unwrap();
 
-    gl.root.Children().unwrap().InsertAtTop(&visual).unwrap();
-
-    let composition_device = unsafe {
-        gl.compositor_controller
-            .Compositor()
-            .unwrap()
-            .cast::<ICompositorInterop>()
-            .unwrap()
-            .CreateGraphicsDevice(&gl.device)
-            .unwrap()
-    };
-
-    let composition_surface = composition_device
+    let composition_surface = compositor
+        .composition_device
         .CreateDrawingSurface(
             Size {
                 Width: size.width as f32,
@@ -120,46 +127,28 @@ pub unsafe extern "C" fn create_backing_store(
         texture.unwrap()
     };
 
-    let render_target = RenderTarget {
-        width: size.width,
-        height: size.height,
-        visual,
-        composition_surface,
-        texture,
-    };
-
-    render_target
-        .visual
+    visual
         .SetBrush(
             &gl.compositor_controller
                 .Compositor()
                 .unwrap()
-                .CreateSurfaceBrushWithSurface(&render_target.composition_surface)
+                .CreateSurfaceBrushWithSurface(&composition_surface)
                 .unwrap(),
         )
         .unwrap();
-
-    let render_target = {
-        compositor.render_targets.push(render_target);
-        compositor.render_targets.last().unwrap_unchecked()
-    };
 
     let egl_surface = gl
         .egl
         .create_pbuffer_from_client_buffer(
             gl.display,
             EGL_D3D_TEXTURE_ANGLE,
-            ClientBuffer::from_ptr(render_target.texture.as_raw()),
+            ClientBuffer::from_ptr(texture.as_raw()),
             gl.config,
             &[
                 egl::WIDTH,
                 size.width as i32,
                 egl::HEIGHT,
                 size.height as i32,
-                // 0x3490,
-                // update_offset.x,
-                // 0x3491,
-                // update_offset.y,
                 egl::TEXTURE_FORMAT,
                 egl::TEXTURE_RGBA,
                 egl::TEXTURE_TARGET,
@@ -197,15 +186,25 @@ pub unsafe extern "C" fn create_backing_store(
         0,
     );
 
+    let render_target = Box::new(RenderTarget {
+        visual,
+        composition_surface,
+        texture,
+        egl_surface,
+        gl_framebuffer: framebuffer,
+        gl_texture,
+    });
+
     (*out).type_ = FlutterBackingStoreType_kFlutterBackingStoreTypeOpenGL;
+    (*out).user_data = Box::leak(render_target) as *mut _ as _;
     (*out).__bindgen_anon_1 = FlutterBackingStore__bindgen_ty_1 {
         open_gl: FlutterOpenGLBackingStore {
             type_: FlutterOpenGLTargetType_kFlutterOpenGLTargetTypeFramebuffer,
             __bindgen_anon_1: FlutterOpenGLBackingStore__bindgen_ty_1 {
                 framebuffer: FlutterOpenGLFramebuffer {
                     name: framebuffer,
-                    target: 0x93a1,
-                    user_data: (compositor.render_targets.len() - 1) as _,
+                    target: /* GL_BGRA8_EXT */ 0x93a1,
+                    user_data: ptr::null_mut(),
                     destruction_callback: Some(destroy_texture),
                 },
             },
@@ -223,6 +222,20 @@ pub unsafe extern "C" fn collect_backing_store(
     backing_store: *const FlutterBackingStore,
     user_data: *mut c_void,
 ) -> bool {
+    let compositor = user_data.cast::<Compositor>().as_mut().unwrap();
+    let backing_store = backing_store.as_ref().unwrap();
+    let render_target = Box::from_raw(backing_store.user_data.cast::<RenderTarget>());
+
+    gl::DeleteFramebuffers(1, &render_target.gl_framebuffer);
+    gl::DeleteTextures(1, &render_target.gl_texture);
+
+    (*compositor.gl)
+        .egl
+        .destroy_surface((*compositor.gl).display, render_target.egl_surface)
+        .unwrap();
+
+    drop(render_target);
+
     true
 }
 
@@ -234,16 +247,29 @@ pub unsafe extern "C" fn present_layers(
 ) -> bool {
     let compositor = user_data.cast::<Compositor>().as_mut().unwrap();
     let gl = compositor.gl.as_mut().unwrap();
-    let layers = std::slice::from_raw_parts_mut(layers, layers_count);
 
     gl::Flush();
 
-    for &mut layer in layers {
-        let backing_store = (*layer).__bindgen_anon_1.backing_store.as_ref().unwrap();
-        let render_target_index = backing_store.user_data as usize;
-        let render_target = &compositor.render_targets[render_target_index];
+    // Composition layers need to be updated if flutter layers are added or removed.
+    let mut should_update_composition_layers = compositor.layers.len() != layers_count;
 
-        let composition_surface_interop = render_target
+    for i in 0..layers_count {
+        let layer = *layers.add(i);
+
+        // Composition layers need to be updated if flutter layers have been reordered.
+        should_update_composition_layers =
+            should_update_composition_layers || compositor.layers[i] != layer;
+
+        // TODO: Support platform views
+        assert_eq!(
+            (*layer).type_,
+            FlutterLayerContentType_kFlutterLayerContentTypeBackingStore
+        );
+
+        let backing_store = (*layer).__bindgen_anon_1.backing_store;
+        let render_target = (*backing_store).user_data.cast::<RenderTarget>();
+
+        let composition_surface_interop = (*render_target)
             .composition_surface
             .cast::<ICompositionDrawingSurfaceInterop>()
             .unwrap();
@@ -261,16 +287,48 @@ pub unsafe extern "C" fn present_layers(
             update_offset.x as u32,
             update_offset.y as u32,
             0,
-            &render_target.texture,
+            &(*render_target).texture,
             0,
             None,
         );
 
-        context.Flush();
         composition_surface_interop.EndDraw().unwrap();
     }
 
-    gl.compositor_controller.Commit().unwrap();
+    // Flutter layers have changed. We need to re-insert all layer visuals into the root visual in
+    // the correct order.
+    if should_update_composition_layers {
+        let root = &(*compositor.gl).root;
+
+        root.Children().unwrap().RemoveAll().unwrap();
+        compositor.layers.clear();
+
+        for i in 0..layers_count {
+            let layer = *layers.add(i);
+            let backing_store = (*layer).__bindgen_anon_1.backing_store;
+            let render_target = (*backing_store).user_data.cast::<RenderTarget>();
+
+            root.Children()
+                .unwrap()
+                .InsertAtTop(&(*render_target).visual)
+                .unwrap();
+
+            compositor.layers.push(layer);
+        }
+    }
+
+    let commit_compositor = || gl.compositor_controller.Commit().unwrap();
+
+    let mut resize_state = gl.resize_state.lock().unwrap();
+    if let ResizeState::Started = *resize_state {
+        // Calling DwmFlush() seems to reduce glitches when resizing.
+        DwmFlush().unwrap();
+        commit_compositor();
+        *resize_state = ResizeState::Done;
+        compositor.gl.as_mut().unwrap().resize_condvar.notify_all();
+    } else {
+        commit_compositor();
+    }
 
     true
 }
