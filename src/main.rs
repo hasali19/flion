@@ -1,16 +1,14 @@
 #![feature(c_str_literals, lint_reasons)]
 
 mod compositor;
-mod render_thread;
 mod task_runner;
 
 use std::ffi::{c_char, c_void, CStr};
-use std::sync::{mpsc, Condvar, Mutex};
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 use std::{mem, ptr};
 
 use color_eyre::Result;
-use egl::ClientBuffer;
 use flutter_embedder::{
     FlutterCompositor, FlutterCustomTaskRunners, FlutterEngine, FlutterEngineGetCurrentTime,
     FlutterEngineResult_kSuccess, FlutterEngineRun, FlutterEngineRunTask,
@@ -46,7 +44,6 @@ use winit::platform::windows::WindowBuilderExtWindows;
 use winit::window::{Theme, WindowBuilder};
 
 use crate::compositor::Compositor;
-use crate::render_thread::{RenderEvent, RenderTask};
 use crate::task_runner::TaskRunner;
 
 type EglInstance = egl::Instance<egl::Static>;
@@ -525,8 +522,6 @@ unsafe fn create_engine(gl: &mut Gl, event_loop: EventLoopProxy<PlatformEvent>) 
         }
     }
 
-    let (render_tx, render_rx) = mpsc::channel();
-
     let renderer_config = FlutterRendererConfig {
         type_: FlutterRendererType_kOpenGL,
         __bindgen_anon_1: flutter_embedder::FlutterRendererConfig__bindgen_ty_1 {
@@ -553,15 +548,6 @@ unsafe fn create_engine(gl: &mut Gl, event_loop: EventLoopProxy<PlatformEvent>) 
         }))),
     );
 
-    let render_task_runner = create_task_runner(
-        2,
-        Box::leak(Box::new(TaskRunner::new(move |t, task| {
-            render_tx
-                .send(RenderEvent::PostTask(RenderTask(t, task)))
-                .unwrap();
-        }))),
-    );
-
     let project_args = FlutterProjectArgs {
         struct_size: mem::size_of::<FlutterProjectArgs>(),
         assets_path: c"example/build/flutter_assets".as_ptr(),
@@ -569,7 +555,7 @@ unsafe fn create_engine(gl: &mut Gl, event_loop: EventLoopProxy<PlatformEvent>) 
         custom_task_runners: &FlutterCustomTaskRunners {
             struct_size: mem::size_of::<FlutterCustomTaskRunners>(),
             platform_task_runner: &platform_task_runner,
-            render_task_runner: &render_task_runner,
+            render_task_runner: &platform_task_runner,
             thread_priority_setter: Some(task_runner::set_thread_priority),
         },
         compositor: &FlutterCompositor {
@@ -598,8 +584,6 @@ unsafe fn create_engine(gl: &mut Gl, event_loop: EventLoopProxy<PlatformEvent>) 
             panic!("could not run the flutter engine");
         }
     }
-
-    render_thread::start(engine, render_rx);
 
     engine
 }

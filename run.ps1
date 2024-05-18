@@ -6,7 +6,7 @@ New-Item -ItemType Directory -ErrorAction SilentlyContinue .\build
 New-Item -ItemType Directory -ErrorAction SilentlyContinue .\target
 New-Item -ItemType Directory -ErrorAction SilentlyContinue .\target\debug
 
-$flutter_engine_commit = "6e2ea58a5ccbefcfadc2d4b7b8045fc6c20ab812"
+$flutter_engine_commit = "b4bfd459865a8d636f26aca0d330ae297c006c3c"
 
 if (!(Test-Path ".\build\windows-x64-embedder.zip")) {
     Invoke-WebRequest "https://storage.googleapis.com/flutter_infra_release/flutter/$flutter_engine_commit/windows-x64/windows-x64-embedder.zip" -OutFile ".\build\windows-x64-embedder.zip"
