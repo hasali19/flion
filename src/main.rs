@@ -1,13 +1,17 @@
 #![feature(c_str_literals, lint_reasons)]
 
 mod compositor;
+mod egl_manager;
+mod resize_controller;
 mod task_runner;
 
+use std::cell::Cell;
 use std::ffi::{c_char, c_void, CStr};
-use std::sync::{Condvar, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{mem, ptr};
 
+use color_eyre::eyre::{self, ContextCompat};
 use color_eyre::Result;
 use flutter_embedder::{
     FlutterCompositor, FlutterCustomTaskRunners, FlutterEngine, FlutterEngineGetCurrentTime,
@@ -19,12 +23,15 @@ use flutter_embedder::{
     FlutterRendererType_kOpenGL, FlutterTask, FlutterTaskRunnerDescription,
     FlutterWindowMetricsEvent, FLUTTER_ENGINE_VERSION,
 };
-use khronos_egl as egl;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use windows::core::{ComInterface, Interface};
+use resize_controller::ResizeController;
+use windows::core::ComInterface;
 use windows::Foundation::Numerics::{Matrix4x4, Vector2, Vector3};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Direct3D11::ID3D11Device;
+use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11CreateDevice, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION,
+};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMSBT_TABBEDWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWM_SYSTEMBACKDROP_TYPE,
 };
@@ -33,7 +40,7 @@ use windows::Win32::System::WinRT::{
     CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_ASTA, DQTYPE_THREAD_CURRENT,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
-use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, WM_NCCALCSIZE};
+use windows::Win32::UI::WindowsAndMessaging::WM_NCCALCSIZE;
 use windows::UI::Composition::ContainerVisual;
 use windows::UI::Composition::Core::CompositorController;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
@@ -43,93 +50,14 @@ use winit::platform::windows::WindowBuilderExtWindows;
 use winit::window::{Theme, WindowBuilder};
 
 use crate::compositor::Compositor;
+use crate::egl_manager::EglManager;
 use crate::task_runner::TaskRunner;
-
-type EglInstance = egl::Instance<egl::Static>;
-
-enum ResizeState {
-    Started,
-    Done,
-}
-
-struct Gl {
-    egl: EglInstance,
-    display: egl::Display,
-    context: egl::Context,
-    resource_context: egl::Context,
-    config: egl::Config,
-    device: ID3D11Device,
-    compositor_controller: CompositorController,
-    root: ContainerVisual,
-    resize_condvar: Condvar,
-    resize_state: Mutex<ResizeState>,
-}
-
-const EGL_PLATFORM_ANGLE_ANGLE: egl::Enum = 0x3202;
-const EGL_PLATFORM_ANGLE_TYPE_ANGLE: egl::Attrib = 0x3203;
-const EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE: egl::Attrib = 0x3208;
 
 struct WindowData {
     engine: FlutterEngine,
-    gl: *mut Gl,
-    scale_factor: f64,
-}
-
-#[allow(unused)]
-extern "C" {
-    fn eglDebugMessageControlKHR(
-        callback: extern "C" fn(
-            egl::Enum,
-            *const c_char,
-            egl::Int,
-            *const c_void,
-            *const c_void,
-            *const c_char,
-        ),
-        attribs: *const egl::Attrib,
-    ) -> egl::Int;
-
-    fn eglCreateDeviceANGLE(
-        device_type: egl::Int,
-        native_device: *mut c_void,
-        attrib_list: *const egl::Attrib,
-    ) -> *mut c_void;
-
-    fn eglReleaseDeviceANGLE(device: *mut c_void);
-
-    fn eglPostSubBufferNV(
-        display: *mut c_void,
-        surface: *mut c_void,
-        x: egl::Int,
-        y: egl::Int,
-        width: egl::Int,
-        height: egl::Int,
-    ) -> egl::Boolean;
-
-    fn eglQueryDisplayAttribEXT(
-        display: *mut c_void,
-        attribute: egl::Int,
-        value: *mut egl::Attrib,
-    ) -> egl::Boolean;
-
-    fn eglQueryDeviceAttribEXT(
-        device: *mut c_void,
-        attribute: egl::Int,
-        value: *mut egl::Attrib,
-    ) -> egl::Boolean;
-}
-
-extern "C" fn debug_callback(
-    _error: egl::Enum,
-    _command: *const c_char,
-    _message_type: egl::Int,
-    _thread_label: *const c_void,
-    _object_label: *const c_void,
-    message: *const c_char,
-) {
-    let message = unsafe { CStr::from_ptr(message) };
-    let message = message.to_str().unwrap();
-    eprintln!("{message}");
+    resize_controller: Arc<ResizeController>,
+    scale_factor: Cell<f64>,
+    root_visual: ContainerVisual,
 }
 
 #[derive(Debug)]
@@ -211,107 +139,40 @@ fn main() -> Result<()> {
 
     composition_target.SetRoot(&root)?;
 
-    let egl = EglInstance::new(egl::Static);
-
-    let attribs = [egl::NONE as egl::Attrib];
-    unsafe { eglDebugMessageControlKHR(debug_callback, attribs.as_ptr()) };
-
-    let display = unsafe {
-        egl.get_platform_display(
-            EGL_PLATFORM_ANGLE_ANGLE,
-            egl::DEFAULT_DISPLAY,
-            &[
-                EGL_PLATFORM_ANGLE_TYPE_ANGLE,
-                EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE,
-                egl::NONE as egl::Attrib,
-            ],
-        )
-    }?;
-
-    egl.initialize(display)?;
-
     let device = unsafe {
-        let mut egl_device = 0;
-        assert!(
-            eglQueryDisplayAttribEXT(
-                display.as_ptr(),
-                0x322C, /* EGL_DEVICE_EXT */
-                &mut egl_device,
-            ) == egl::TRUE
-        );
-        let mut angle_device = 0;
-        assert!(
-            eglQueryDeviceAttribEXT(
-                egl_device as _,
-                0x33A1, /* EGL_D3D11_DEVICE_ANGLE */
-                &mut angle_device
-            ) == egl::TRUE
-        );
-        ID3D11Device::from_raw(angle_device as _)
+        let mut device = Default::default();
+
+        D3D11CreateDevice(
+            None,
+            D3D_DRIVER_TYPE_HARDWARE,
+            None,
+            D3D11_CREATE_DEVICE_FLAG::default(),
+            None,
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            None,
+        )?;
+
+        device.wrap_err("failed to create D3D11 device")?
     };
 
-    let mut configs = Vec::with_capacity(1);
-    let config_attribs = [
-        egl::RED_SIZE,
-        8,
-        egl::GREEN_SIZE,
-        8,
-        egl::BLUE_SIZE,
-        8,
-        egl::ALPHA_SIZE,
-        8,
-        egl::DEPTH_SIZE,
-        8,
-        egl::STENCIL_SIZE,
-        8,
-        egl::NONE,
-    ];
+    let egl_manager = EglManager::create(&device)?;
+    let resize_controller = Arc::new(ResizeController::new());
 
-    egl.choose_config(display, &config_attribs, &mut configs)?;
-
-    let context_attribs = [egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE];
-    let context = egl.create_context(display, configs[0], None, &context_attribs)?;
-    let resource_context =
-        egl.create_context(display, configs[0], Some(context), &context_attribs)?;
-
-    egl.make_current(display, None, None, Some(context))?;
-
-    macro_rules! gl_load {
-        ($($name:ident)*) => {
-            $(
-                gl::$name::load_with(|name| egl.get_proc_address(name).unwrap() as _);
-            )*
-        };
-    }
-
-    gl_load!(
-        GenTextures
-        BindTexture
-        BindFramebuffer
-        Flush
-        GenFramebuffers
-        TexParameteri
-        FramebufferTexture2D
-        DeleteTextures
-        DeleteFramebuffers
-    );
-
-    let gl = Box::leak(Box::new(Gl {
-        egl,
-        display,
-        context,
-        resource_context,
-        // surface: None,
-        config: configs[0],
-        device,
-        compositor_controller,
-        root,
-        // composition_surface,
-        resize_condvar: Condvar::new(),
-        resize_state: Mutex::new(ResizeState::Done),
-    }));
-
-    let engine = unsafe { create_engine(gl, event_loop.create_proxy()) };
+    let engine = unsafe {
+        create_engine(
+            Compositor::new(
+                device,
+                compositor_controller,
+                egl_manager.clone(),
+                resize_controller.clone(),
+                root.clone(),
+            )?,
+            egl_manager.clone(),
+            event_loop.create_proxy(),
+        )?
+    };
 
     unsafe {
         FlutterEngineSendWindowMetricsEvent(
@@ -326,15 +187,11 @@ fn main() -> Result<()> {
         )
     };
 
-    gl.egl.make_current(display, None, None, None)?;
-
-    assert!(gl.egl.get_current_context().is_none());
-    assert!(gl.egl.get_current_display().is_none());
-
     let window_data = Box::leak(Box::new(WindowData {
         engine,
-        gl,
-        scale_factor: window.scale_factor(),
+        resize_controller,
+        scale_factor: Cell::new(window.scale_factor()),
+        root_visual: root,
     }));
 
     unsafe { SetWindowSubclass(hwnd, Some(wnd_proc), 696969, window_data as *mut _ as _) };
@@ -357,7 +214,7 @@ fn main() -> Result<()> {
                     scale_factor,
                     inner_size_writer: _,
                 } => {
-                    window_data.scale_factor = scale_factor;
+                    window_data.scale_factor.set(scale_factor);
                 }
                 WindowEvent::CursorMoved { position, .. } => unsafe {
                     cursor_pos = position;
@@ -461,50 +318,38 @@ unsafe extern "system" fn wnd_proc(
     _uidsubclass: usize,
     dwrefdata: usize,
 ) -> LRESULT {
-    let data = dwrefdata as *mut WindowData;
+    let data = (dwrefdata as *const WindowData).as_ref().unwrap();
     match msg {
         WM_NCCALCSIZE => {
-            DefWindowProcW(window, msg, wparam, lparam);
+            DefSubclassProc(window, msg, wparam, lparam);
 
             let rect = lparam.0 as *const RECT;
             let rect = rect.as_ref().unwrap();
 
-            if !data.is_null() && rect.right > rect.left && rect.bottom > rect.top {
-                let gl = (*data).gl;
-                let mut resize_state = (*gl).resize_state.lock().unwrap();
+            if rect.right > rect.left && rect.bottom > rect.top {
+                data.resize_controller.begin_and_wait(|| {
+                    let width = rect.right - rect.left;
+                    let height = rect.bottom - rect.top;
 
-                let width = rect.right - rect.left;
-                let height = rect.bottom - rect.top;
+                    data.root_visual
+                        .SetSize(Vector2::new(width as f32, height as f32))
+                        .unwrap();
 
-                *resize_state = ResizeState::Started;
+                    data.root_visual
+                        .SetOffset(Vector3::new(0.0, height as f32, 0.0))
+                        .unwrap();
 
-                (*gl)
-                    .root
-                    .SetSize(Vector2::new(width as f32, height as f32))
-                    .unwrap();
-
-                (*gl)
-                    .root
-                    .SetOffset(Vector3::new(0.0, height as f32, 0.0))
-                    .unwrap();
-
-                FlutterEngineSendWindowMetricsEvent(
-                    (*data).engine,
-                    &FlutterWindowMetricsEvent {
-                        struct_size: mem::size_of::<FlutterWindowMetricsEvent>(),
-                        width: width as usize,
-                        height: height as usize,
-                        pixel_ratio: (*data).scale_factor,
-                        ..Default::default()
-                    },
-                );
-
-                let _unused = (*(*data).gl)
-                    .resize_condvar
-                    .wait_while(resize_state, |resize_state| {
-                        !matches!(resize_state, ResizeState::Done)
-                    })
-                    .unwrap();
+                    FlutterEngineSendWindowMetricsEvent(
+                        data.engine,
+                        &FlutterWindowMetricsEvent {
+                            struct_size: mem::size_of::<FlutterWindowMetricsEvent>(),
+                            width: width as usize,
+                            height: height as usize,
+                            pixel_ratio: data.scale_factor.get(),
+                            ..Default::default()
+                        },
+                    );
+                });
             }
         }
         _ => return DefSubclassProc(window, msg, wparam, lparam),
@@ -513,7 +358,11 @@ unsafe extern "system" fn wnd_proc(
     LRESULT(0)
 }
 
-unsafe fn create_engine(gl: &mut Gl, event_loop: EventLoopProxy<PlatformEvent>) -> FlutterEngine {
+unsafe fn create_engine(
+    compositor: Compositor,
+    egl_manager: Arc<EglManager>,
+    event_loop: EventLoopProxy<PlatformEvent>,
+) -> eyre::Result<FlutterEngine> {
     fn create_task_runner<F: Fn(u64, FlutterTask)>(
         id: usize,
         runner: &'static TaskRunner<F>,
@@ -589,8 +438,7 @@ unsafe fn create_engine(gl: &mut Gl, event_loop: EventLoopProxy<PlatformEvent>) 
             collect_backing_store_callback: Some(compositor::collect_backing_store),
             present_layers_callback: Some(compositor::present_layers),
             present_view_callback: None,
-            user_data: Box::leak(Box::new(Compositor::new(gl as *mut Gl))) as *mut Compositor
-                as *mut c_void,
+            user_data: Box::leak(Box::new(compositor)) as *mut Compositor as *mut c_void,
             avoid_backing_store_cache: false,
         },
         ..Default::default()
@@ -602,7 +450,7 @@ unsafe fn create_engine(gl: &mut Gl, event_loop: EventLoopProxy<PlatformEvent>) 
             FLUTTER_ENGINE_VERSION as usize,
             &renderer_config,
             &project_args,
-            gl as *mut Gl as *mut c_void,
+            Arc::into_raw(egl_manager) as *mut c_void,
             &mut engine,
         );
 
@@ -611,156 +459,47 @@ unsafe fn create_engine(gl: &mut Gl, event_loop: EventLoopProxy<PlatformEvent>) 
         }
     }
 
-    engine
+    Ok(engine)
 }
 
-#[tracing::instrument]
 unsafe extern "C" fn gl_make_current(user_data: *mut c_void) -> bool {
-    let gl = user_data.cast::<Gl>().as_mut().unwrap();
+    let egl_manager = user_data.cast::<EglManager>().as_ref().unwrap();
 
-    let res = gl
-        .egl
-        .make_current(gl.display, None, None, Some(gl.context));
-
-    if let Err(e) = res {
-        eprintln!("failed to make context current: {e}");
+    if let Err(e) = egl_manager.make_context_current() {
+        tracing::error!("failed to make context current: {e}");
+        return false;
     }
-
-    res.is_ok()
-}
-
-#[tracing::instrument]
-unsafe extern "C" fn gl_make_resource_current(user_data: *mut c_void) -> bool {
-    let gl = user_data.cast::<Gl>().as_mut().unwrap();
-
-    let res = gl
-        .egl
-        .make_current(gl.display, None, None, Some(gl.resource_context));
-
-    if let Err(e) = res {
-        eprintln!("failed to make resource context current: {e}");
-    }
-
-    res.is_ok()
-}
-
-#[tracing::instrument]
-unsafe extern "C" fn gl_clear_current(user_data: *mut c_void) -> bool {
-    let gl = user_data.cast::<Gl>().as_mut().unwrap();
-
-    let res = gl.egl.make_current(gl.display, None, None, None);
-
-    if let Err(e) = res {
-        eprintln!("failed to clear context: {e}");
-    }
-
-    res.is_ok()
-}
-
-#[tracing::instrument]
-unsafe extern "C" fn gl_present(user_data: *mut c_void) -> bool {
-    // let gl = user_data.cast::<Gl>().as_mut().unwrap();
-    // let mut resize_state = gl.resize_state.lock().unwrap();
-
-    // match *resize_state {
-    //     ResizeState::Started(_, _) => return false,
-    //     ResizeState::FrameGenerated => {
-    //         present_frame(gl, true).unwrap();
-    //         *resize_state = ResizeState::Done;
-    //         gl.resize_condvar.notify_all();
-    //     }
-    //     ResizeState::Done => {
-    //         present_frame(gl, false).unwrap();
-    //     }
-    // }
-
-    // gl.surface = None;
 
     true
 }
 
-// unsafe fn present_frame(gl: &Gl, sync_dwm: bool) -> Result<()> {
-//     let Some(egl_surface) = gl.surface else {
-//         panic!("BeginDraw() has not been called for composition surface");
-//     };
+unsafe extern "C" fn gl_make_resource_current(user_data: *mut c_void) -> bool {
+    let egl_manager = user_data.cast::<EglManager>().as_ref().unwrap();
 
-//     gl::Flush();
+    if let Err(e) = egl_manager.make_resource_context_current() {
+        tracing::error!("failed to make resource context current: {e}");
+        return false;
+    }
 
-//     gl.egl.destroy_surface(gl.display, egl_surface)?;
-//     gl.egl
-//         .make_current(gl.display, None, None, Some(gl.context))?;
+    true
+}
 
-//     let composition_surface_interop = gl
-//         .composition_surface
-//         .cast::<ICompositionDrawingSurfaceInterop>()?;
+unsafe extern "C" fn gl_clear_current(user_data: *mut c_void) -> bool {
+    let egl_manager = user_data.cast::<EglManager>().as_ref().unwrap();
 
-//     composition_surface_interop.EndDraw()?;
+    if let Err(e) = egl_manager.clear_current() {
+        tracing::error!("failed to clear context: {e}");
+        return false;
+    }
 
-//     if sync_dwm {
-//         DwmFlush()?;
-//     }
+    true
+}
 
-//     gl.compositor_controller.Commit()?;
+unsafe extern "C" fn gl_present(_user_data: *mut c_void) -> bool {
+    false
+}
 
-//     Ok(())
-// }
-
-#[tracing::instrument]
-unsafe extern "C" fn gl_fbo_callback(user_data: *mut c_void) -> u32 {
-    // let gl = user_data.cast::<Gl>().as_mut().unwrap();
-    // let mut resize_state = gl.resize_state.lock().unwrap();
-
-    // let composition_surface_interop = gl
-    //     .composition_surface
-    //     .cast::<ICompositionDrawingSurfaceInterop>()
-    //     .unwrap();
-
-    // if let ResizeState::Started(width, height) = *resize_state {
-    //     gl.root
-    //         .SetSize(Vector2 {
-    //             X: width as f32,
-    //             Y: height as f32,
-    //         })
-    //         .unwrap();
-
-    //     gl.root
-    //         .SetOffset(Vector3::new(0.0, height as f32, 0.0))
-    //         .unwrap();
-
-    //     gl.composition_surface
-    //         .Resize(SizeInt32 {
-    //             Width: width as i32,
-    //             Height: height as i32,
-    //         })
-    //         .unwrap();
-
-    //     *resize_state = ResizeState::FrameGenerated;
-    // }
-
-    // let mut update_offset = POINT::default();
-    // let texture: ID3D11Texture2D = composition_surface_interop
-    //     .BeginDraw(None, &mut update_offset)
-    //     .unwrap();
-
-    // let client_buffer = unsafe { ClientBuffer::from_ptr(texture.as_raw()) };
-
-    // let surface = gl
-    //     .egl
-    //     .create_pbuffer_from_client_buffer(
-    //         gl.display,
-    //         0x33A3,
-    //         client_buffer,
-    //         gl.config,
-    //         &[0x3490, update_offset.x, 0x3491, update_offset.y, egl::NONE],
-    //     )
-    //     .unwrap();
-
-    // gl.surface = Some(surface);
-
-    // gl.egl
-    //     .make_current(gl.display, gl.surface, gl.surface, Some(gl.context))
-    //     .unwrap();
-
+unsafe extern "C" fn gl_fbo_callback(_user_data: *mut c_void) -> u32 {
     0
 }
 
@@ -768,7 +507,9 @@ unsafe extern "C" fn gl_get_proc_address(
     user_data: *mut c_void,
     name: *const c_char,
 ) -> *mut c_void {
-    let gl = user_data.cast::<Gl>().as_mut().unwrap();
+    let egl_manager = user_data.cast::<EglManager>().as_ref().unwrap();
     let name = CStr::from_ptr(name);
-    gl.egl.get_proc_address(name.to_str().unwrap()).unwrap() as _
+    egl_manager
+        .get_proc_address(name.to_str().unwrap())
+        .unwrap_or(ptr::null_mut())
 }

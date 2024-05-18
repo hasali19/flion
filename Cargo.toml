@@ -28,6 +28,7 @@ features = [
     "UI_Composition_Core",
     "UI_Composition_Desktop",
     "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Dxgi",
