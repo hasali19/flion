@@ -563,6 +563,7 @@ unsafe fn create_engine(gl: &mut Gl, event_loop: EventLoopProxy<PlatformEvent>) 
             create_backing_store_callback: Some(compositor::create_backing_store),
             collect_backing_store_callback: Some(compositor::collect_backing_store),
             present_layers_callback: Some(compositor::present_layers),
+            present_view_callback: None,
             user_data: Box::leak(Box::new(Compositor::new(gl as *mut Gl))) as *mut Compositor
                 as *mut c_void,
             avoid_backing_store_cache: false,
