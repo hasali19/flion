@@ -1,4 +1,3 @@
-use std::ffi::c_void;
 use std::ptr;
 use std::sync::Arc;
 
@@ -97,7 +96,7 @@ impl Compositor {
         })
     }
 
-    fn create_backing_store(
+    pub fn create_backing_store(
         &mut self,
         config: &FlutterBackingStoreConfig,
         out: &mut FlutterBackingStore,
@@ -213,7 +212,10 @@ impl Compositor {
         Ok(())
     }
 
-    fn collect_backing_store(&mut self, backing_store: &FlutterBackingStore) -> eyre::Result<()> {
+    pub fn collect_backing_store(
+        &mut self,
+        backing_store: &FlutterBackingStore,
+    ) -> eyre::Result<()> {
         let render_target =
             unsafe { Box::from_raw(backing_store.user_data.cast::<CompositorFlutterLayer>()) };
 
@@ -230,7 +232,7 @@ impl Compositor {
         Ok(())
     }
 
-    fn present_layers(&mut self, layers: &[&FlutterLayer]) -> eyre::Result<()> {
+    pub fn present_layers(&mut self, layers: &[&FlutterLayer]) -> eyre::Result<()> {
         // Composition layers need to be updated if flutter layers are added or removed.
         let mut should_update_composition_layers = self.layers.len() != layers.len();
 
@@ -315,79 +317,4 @@ impl Compositor {
 
         Ok(())
     }
-}
-
-pub unsafe extern "C" fn create_backing_store(
-    config: *const FlutterBackingStoreConfig,
-    out: *mut FlutterBackingStore,
-    user_data: *mut c_void,
-) -> bool {
-    let Some(compositor) = user_data.cast::<Compositor>().as_mut() else {
-        tracing::error!("user_data is null");
-        return false;
-    };
-
-    let Some(config) = config.as_ref() else {
-        tracing::error!("config is null");
-        return false;
-    };
-
-    let Some(backing_store) = out.as_mut() else {
-        tracing::error!("out is null");
-        return false;
-    };
-
-    if let Err(e) = compositor.create_backing_store(config, backing_store) {
-        tracing::error!("{e}");
-        return false;
-    }
-
-    true
-}
-
-pub unsafe extern "C" fn collect_backing_store(
-    backing_store: *const FlutterBackingStore,
-    user_data: *mut c_void,
-) -> bool {
-    let Some(compositor) = user_data.cast::<Compositor>().as_mut() else {
-        tracing::error!("user_data is null");
-        return false;
-    };
-
-    let Some(backing_store) = backing_store.as_ref() else {
-        tracing::error!("config is null");
-        return false;
-    };
-
-    if let Err(e) = compositor.collect_backing_store(backing_store) {
-        tracing::error!("{e}");
-        return false;
-    }
-
-    true
-}
-
-pub unsafe extern "C" fn present_layers(
-    layers: *mut *const FlutterLayer,
-    layers_count: usize,
-    user_data: *mut c_void,
-) -> bool {
-    let Some(compositor) = user_data.cast::<Compositor>().as_mut() else {
-        tracing::error!("user_data is null");
-        return false;
-    };
-
-    if layers.is_null() {
-        tracing::error!("layers is null");
-        return false;
-    }
-
-    let layers = std::slice::from_raw_parts(layers.cast::<&FlutterLayer>(), layers_count);
-
-    if let Err(e) = compositor.present_layers(layers) {
-        tracing::error!("{e}");
-        return false;
-    };
-
-    true
 }
