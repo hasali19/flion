@@ -1,10 +1,9 @@
+use std::collections::BTreeMap;
 use std::ffi::{c_char, c_void, CStr};
-use std::io::{Cursor, Write};
 use std::sync::Arc;
 use std::{mem, ptr};
 
 use color_eyre::eyre::{self, bail};
-use flutter_codec::EncodableValue;
 use flutter_embedder::{
     FlutterBackingStore, FlutterBackingStoreConfig, FlutterCompositor, FlutterCustomTaskRunners,
     FlutterEngineGetCurrentTime, FlutterEngineInitialize, FlutterEngineResult_kSuccess,
@@ -21,11 +20,11 @@ use crate::compositor::Compositor;
 use crate::egl_manager::EglManager;
 use crate::task_runner::{self, Task, TaskRunner};
 
-pub struct FlutterEngineConfig {
+pub struct FlutterEngineConfig<'a> {
     pub egl_manager: Arc<EglManager>,
     pub compositor: Compositor,
     pub platform_task_handler: Box<dyn Fn(Task)>,
-    pub cursor_handler: Box<dyn Fn(&str) + Send + Sync>,
+    pub platform_message_handlers: Vec<(&'a str, Box<dyn BinaryMessageHandler>)>,
 }
 
 pub struct FlutterEngine {
@@ -35,7 +34,7 @@ pub struct FlutterEngine {
 struct FlutterEngineInner {
     handle: flutter_embedder::FlutterEngine,
     egl_manager: Arc<EglManager>,
-    cursor_handler: Box<dyn Fn(&str) + Send + Sync>,
+    platform_message_handlers: BTreeMap<String, Box<dyn BinaryMessageHandler>>,
 }
 
 #[repr(i32)]
@@ -100,7 +99,12 @@ impl FlutterEngine {
         let engine = Box::leak(Box::new(FlutterEngineInner {
             handle: ptr::null_mut(),
             egl_manager: config.egl_manager,
-            cursor_handler: config.cursor_handler,
+            platform_message_handlers: BTreeMap::from_iter(
+                config
+                    .platform_message_handlers
+                    .into_iter()
+                    .map(|(channel, handler)| (channel.to_owned(), handler)),
+            ),
         }));
 
         let engine_handle = unsafe {
@@ -220,80 +224,28 @@ fn create_task_runner<F: Fn(Task)>(
     }
 }
 
-unsafe extern "C" fn platform_message_callback(
-    message: *const FlutterPlatformMessage,
-    user_data: *mut c_void,
-) {
-    let engine = user_data.cast::<FlutterEngineInner>().as_ref().unwrap();
-    let message = &*message;
-    let channel = CStr::from_ptr(message.channel).to_str().unwrap();
-
-    let reply = FlutterPlatformMessageReply {
-        engine: engine.handle,
-        response_handle: message.response_handle,
-    };
-
-    match channel {
-        "flutter/mousecursor" => {
-            let bytes = std::slice::from_raw_parts(message.message, message.message_size);
-
-            let mut cursor = Cursor::new(bytes);
-            let method_name = flutter_codec::read_value(&mut cursor).unwrap();
-            let method_args = flutter_codec::read_value(&mut cursor).unwrap();
-
-            let EncodableValue::Str(method_name) = method_name else {
-                tracing::error!("[method_call({channel})] invalid method name: {method_name:?}");
-                return;
-            };
-
-            match method_name {
-                "activateSystemCursor" => {
-                    let args = method_args.as_map().unwrap();
-                    let kind = args
-                        .get(&EncodableValue::Str("kind"))
-                        .unwrap()
-                        .as_string()
-                        .unwrap();
-
-                    (engine.cursor_handler)(kind);
-
-                    reply.success(&EncodableValue::Null);
-                }
-                _ => {
-                    tracing::error!("unimplemented method: [{channel}] {method_name}");
-                    reply.not_implemented();
-                }
-            }
-        }
-        _ => {
-            tracing::warn!("unimplemented message on '{channel}'");
-            reply.not_implemented();
-        }
-    }
+pub trait BinaryMessageHandler {
+    fn handle(&self, message: &[u8], reply: BinaryMessageReply);
 }
 
-pub struct FlutterPlatformMessageReply {
+pub struct BinaryMessageReply {
     engine: flutter_embedder::FlutterEngine,
     response_handle: *const FlutterPlatformMessageResponseHandle,
 }
 
-impl FlutterPlatformMessageReply {
-    pub fn success(&self, value: &EncodableValue) {
-        let mut bytes = vec![];
-        let mut cursor = Cursor::new(&mut bytes);
-        cursor.write_all(&[0]).unwrap();
-        flutter_codec::write_value(&mut cursor, value).unwrap();
+impl BinaryMessageReply {
+    pub fn send(self, message: &[u8]) {
         unsafe {
             FlutterEngineSendPlatformMessageResponse(
                 self.engine,
                 self.response_handle,
-                bytes.as_ptr(),
-                bytes.len(),
+                message.as_ptr(),
+                message.len(),
             );
         }
     }
 
-    pub fn not_implemented(&self) {
+    pub fn not_implemented(self) {
         unsafe {
             FlutterEngineSendPlatformMessageResponse(
                 self.engine,
@@ -303,6 +255,42 @@ impl FlutterPlatformMessageReply {
             );
         }
     }
+}
+
+unsafe extern "C" fn platform_message_callback(
+    message: *const FlutterPlatformMessage,
+    user_data: *mut c_void,
+) {
+    let engine = user_data.cast::<FlutterEngineInner>().as_ref().unwrap();
+    let message = message.as_ref().unwrap();
+
+    let reply = BinaryMessageReply {
+        engine: engine.handle,
+        response_handle: message.response_handle,
+    };
+
+    let channel = CStr::from_ptr(message.channel);
+    let Ok(channel) = channel.to_str() else {
+        tracing::error!("invalid channel name: {channel:?}");
+        reply.not_implemented();
+        return;
+    };
+
+    let Some(handler) = engine.platform_message_handlers.get(channel) else {
+        tracing::warn!(channel, "unimplemented");
+        reply.not_implemented();
+        return;
+    };
+
+    if message.message.is_null() {
+        tracing::error!(channel, "message is null");
+        reply.not_implemented();
+        return;
+    }
+
+    let bytes = std::slice::from_raw_parts(message.message, message.message_size);
+
+    handler.handle(bytes, reply);
 }
 
 unsafe extern "C" fn gl_make_current(user_data: *mut c_void) -> bool {

@@ -3,7 +3,9 @@
 mod compositor;
 mod egl_manager;
 mod engine;
+mod mouse_cursor;
 mod resize_controller;
+mod standard_method_channel;
 mod task_runner;
 
 use std::cell::Cell;
@@ -38,11 +40,12 @@ use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoopBuilder};
 use winit::platform::windows::WindowBuilderExtWindows;
-use winit::window::{CursorIcon, Theme, WindowBuilder};
+use winit::window::{Theme, WindowBuilder};
 
 use crate::compositor::Compositor;
 use crate::egl_manager::EglManager;
 use crate::engine::{FlutterEngineConfig, PointerPhase};
+use crate::mouse_cursor::MouseCursorHandler;
 use crate::task_runner::TaskRunnerExecutor;
 
 struct WindowData {
@@ -171,22 +174,10 @@ fn main() -> Result<()> {
                 }
             }
         }),
-        cursor_handler: Box::new({
-            let window = window.clone();
-            move |icon| {
-                let cursor = match icon {
-                    "basic" => CursorIcon::Default,
-                    "click" => CursorIcon::Pointer,
-                    "text" => CursorIcon::Text,
-                    name => {
-                        tracing::warn!("unknown cursor name: {name}");
-                        CursorIcon::Default
-                    }
-                };
-
-                window.set_cursor_icon(cursor);
-            }
-        }),
+        platform_message_handlers: vec![(
+            "flutter/mousecursor",
+            Box::new(MouseCursorHandler::new(window.clone())),
+        )],
     })?;
 
     engine.send_window_metrics_event(width as usize, height as usize, window.scale_factor())?;
