@@ -7,17 +7,20 @@ mod task_runner;
 
 use std::cell::Cell;
 use std::ffi::{c_char, c_void, CStr};
+use std::io::{Cursor, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{mem, ptr};
 
 use color_eyre::eyre::{self, ContextCompat};
 use color_eyre::Result;
+use flutter_codec::EncodableValue;
 use flutter_embedder::{
     FlutterCompositor, FlutterCustomTaskRunners, FlutterEngine, FlutterEngineGetCurrentTime,
     FlutterEngineResult_kSuccess, FlutterEngineRun, FlutterEngineRunTask,
-    FlutterEngineSendPointerEvent, FlutterEngineSendWindowMetricsEvent,
-    FlutterOpenGLRendererConfig, FlutterPointerEvent, FlutterPointerPhase_kAdd,
+    FlutterEngineSendPlatformMessageResponse, FlutterEngineSendPointerEvent,
+    FlutterEngineSendWindowMetricsEvent, FlutterOpenGLRendererConfig, FlutterPlatformMessage,
+    FlutterPlatformMessageResponseHandle, FlutterPointerEvent, FlutterPointerPhase_kAdd,
     FlutterPointerPhase_kDown, FlutterPointerPhase_kHover, FlutterPointerPhase_kRemove,
     FlutterPointerPhase_kUp, FlutterProjectArgs, FlutterRendererConfig,
     FlutterRendererType_kOpenGL, FlutterTask, FlutterTaskRunnerDescription,
@@ -47,7 +50,7 @@ use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use winit::platform::windows::WindowBuilderExtWindows;
-use winit::window::{Theme, WindowBuilder};
+use winit::window::{CursorIcon, Theme, WindowBuilder};
 
 use crate::compositor::Compositor;
 use crate::egl_manager::EglManager;
@@ -160,6 +163,8 @@ fn main() -> Result<()> {
     let egl_manager = EglManager::create(&device)?;
     let resize_controller = Arc::new(ResizeController::new());
 
+    let window = Arc::new(window);
+
     let engine = unsafe {
         create_engine(
             Compositor::new(
@@ -171,6 +176,12 @@ fn main() -> Result<()> {
             )?,
             egl_manager.clone(),
             event_loop.create_proxy(),
+            Box::new({
+                let window = window.clone();
+                move |icon| {
+                    window.set_cursor_icon(icon);
+                }
+            }),
         )?
     };
 
@@ -358,10 +369,17 @@ unsafe extern "system" fn wnd_proc(
     LRESULT(0)
 }
 
+struct Engine {
+    handle: Cell<Option<FlutterEngine>>,
+    egl_manager: Arc<EglManager>,
+    cursor_handler: Box<dyn Fn(CursorIcon) + Send + Sync>,
+}
+
 unsafe fn create_engine(
     compositor: Compositor,
     egl_manager: Arc<EglManager>,
     event_loop: EventLoopProxy<PlatformEvent>,
+    cursor_handler: Box<dyn Fn(CursorIcon) + Send + Sync>,
 ) -> eyre::Result<FlutterEngine> {
     fn create_task_runner<F: Fn(u64, FlutterTask)>(
         id: usize,
@@ -422,6 +440,12 @@ unsafe fn create_engine(
         }))),
     );
 
+    let engine = Box::leak(Box::new(Engine {
+        handle: Cell::new(None),
+        egl_manager,
+        cursor_handler,
+    }));
+
     let project_args = FlutterProjectArgs {
         struct_size: mem::size_of::<FlutterProjectArgs>(),
         assets_path: c"example/build/flutter_assets".as_ptr(),
@@ -441,31 +465,131 @@ unsafe fn create_engine(
             user_data: Box::leak(Box::new(compositor)) as *mut Compositor as *mut c_void,
             avoid_backing_store_cache: false,
         },
+        platform_message_callback: Some(platform_message_callback),
         ..Default::default()
     };
 
-    let mut engine = ptr::null_mut();
-    unsafe {
+    let engine_handle = unsafe {
+        let mut engine_ptr = ptr::null_mut();
         let result = FlutterEngineRun(
             FLUTTER_ENGINE_VERSION as usize,
             &renderer_config,
             &project_args,
-            Arc::into_raw(egl_manager) as *mut c_void,
-            &mut engine,
+            (engine as *mut Engine).cast(),
+            &mut engine_ptr,
         );
 
-        if result != FlutterEngineResult_kSuccess || engine.is_null() {
+        if result != FlutterEngineResult_kSuccess || engine_ptr.is_null() {
             panic!("could not run the flutter engine");
+        }
+
+        engine_ptr
+    };
+
+    engine.handle.set(Some(engine_handle));
+
+    Ok(engine.handle.get().unwrap())
+}
+
+unsafe extern "C" fn platform_message_callback(
+    message: *const FlutterPlatformMessage,
+    user_data: *mut c_void,
+) {
+    let engine = user_data.cast::<Engine>().as_ref().unwrap();
+    let message = &*message;
+    let channel = CStr::from_ptr(message.channel).to_str().unwrap();
+
+    let reply = FlutterPlatformMessageReply {
+        engine: engine.handle.get().unwrap(),
+        response_handle: message.response_handle,
+    };
+
+    match channel {
+        "flutter/mousecursor" => {
+            let bytes = std::slice::from_raw_parts(message.message, message.message_size);
+
+            let mut cursor = Cursor::new(bytes);
+            let method_name = flutter_codec::read_value(&mut cursor).unwrap();
+            let method_args = flutter_codec::read_value(&mut cursor).unwrap();
+
+            let EncodableValue::Str(method_name) = method_name else {
+                tracing::error!("[method_call({channel})] invalid method name: {method_name:?}");
+                return;
+            };
+
+            match method_name {
+                "activateSystemCursor" => {
+                    let args = method_args.as_map().unwrap();
+                    let kind = args
+                        .get(&EncodableValue::Str("kind"))
+                        .unwrap()
+                        .as_string()
+                        .unwrap();
+
+                    let cursor = match kind {
+                        "basic" => CursorIcon::Default,
+                        "click" => CursorIcon::Pointer,
+                        "text" => CursorIcon::Text,
+                        name => {
+                            tracing::warn!("unknown cursor name: {name}");
+                            CursorIcon::Default
+                        }
+                    };
+
+                    (engine.cursor_handler)(cursor);
+
+                    reply.success(&EncodableValue::Null);
+                }
+                _ => {
+                    tracing::error!("unimplemented method: [{channel}] {method_name}");
+                    reply.not_implemented();
+                }
+            }
+        }
+        _ => {
+            tracing::warn!("unimplemented message on '{channel}'");
+            reply.not_implemented();
+        }
+    }
+}
+
+pub struct FlutterPlatformMessageReply {
+    engine: FlutterEngine,
+    response_handle: *const FlutterPlatformMessageResponseHandle,
+}
+
+impl FlutterPlatformMessageReply {
+    pub fn success(&self, value: &EncodableValue) {
+        let mut bytes = vec![];
+        let mut cursor = Cursor::new(&mut bytes);
+        cursor.write_all(&[0]).unwrap();
+        flutter_codec::write_value(&mut cursor, value).unwrap();
+        unsafe {
+            FlutterEngineSendPlatformMessageResponse(
+                self.engine,
+                self.response_handle,
+                bytes.as_ptr(),
+                bytes.len(),
+            );
         }
     }
 
-    Ok(engine)
+    pub fn not_implemented(&self) {
+        unsafe {
+            FlutterEngineSendPlatformMessageResponse(
+                self.engine,
+                self.response_handle,
+                std::ptr::null(),
+                0,
+            );
+        }
+    }
 }
 
 unsafe extern "C" fn gl_make_current(user_data: *mut c_void) -> bool {
-    let egl_manager = user_data.cast::<EglManager>().as_ref().unwrap();
+    let engine = user_data.cast::<Engine>().as_ref().unwrap();
 
-    if let Err(e) = egl_manager.make_context_current() {
+    if let Err(e) = engine.egl_manager.make_context_current() {
         tracing::error!("failed to make context current: {e}");
         return false;
     }
@@ -474,9 +598,9 @@ unsafe extern "C" fn gl_make_current(user_data: *mut c_void) -> bool {
 }
 
 unsafe extern "C" fn gl_make_resource_current(user_data: *mut c_void) -> bool {
-    let egl_manager = user_data.cast::<EglManager>().as_ref().unwrap();
+    let engine = user_data.cast::<Engine>().as_ref().unwrap();
 
-    if let Err(e) = egl_manager.make_resource_context_current() {
+    if let Err(e) = engine.egl_manager.make_resource_context_current() {
         tracing::error!("failed to make resource context current: {e}");
         return false;
     }
@@ -485,9 +609,9 @@ unsafe extern "C" fn gl_make_resource_current(user_data: *mut c_void) -> bool {
 }
 
 unsafe extern "C" fn gl_clear_current(user_data: *mut c_void) -> bool {
-    let egl_manager = user_data.cast::<EglManager>().as_ref().unwrap();
+    let engine = user_data.cast::<Engine>().as_ref().unwrap();
 
-    if let Err(e) = egl_manager.clear_current() {
+    if let Err(e) = engine.egl_manager.clear_current() {
         tracing::error!("failed to clear context: {e}");
         return false;
     }
@@ -507,9 +631,10 @@ unsafe extern "C" fn gl_get_proc_address(
     user_data: *mut c_void,
     name: *const c_char,
 ) -> *mut c_void {
-    let egl_manager = user_data.cast::<EglManager>().as_ref().unwrap();
+    let engine = user_data.cast::<Engine>().as_ref().unwrap();
     let name = CStr::from_ptr(name);
-    egl_manager
+    engine
+        .egl_manager
         .get_proc_address(name.to_str().unwrap())
         .unwrap_or(ptr::null_mut())
 }
