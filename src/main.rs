@@ -1,10 +1,11 @@
-#![feature(c_str_literals, lint_reasons)]
+#![feature(lint_reasons)]
 
 mod compositor;
 mod egl_manager;
 mod engine;
 mod mouse_cursor;
 mod resize_controller;
+mod settings;
 mod standard_method_channel;
 mod task_runner;
 
@@ -26,7 +27,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION,
 };
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMSBT_TABBEDWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWM_SYSTEMBACKDROP_TYPE,
+    DwmSetWindowAttribute, DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWM_SYSTEMBACKDROP_TYPE,
 };
 use windows::Win32::System::WinRT::Composition::ICompositorDesktopInterop;
 use windows::Win32::System::WinRT::{
@@ -40,7 +41,7 @@ use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoopBuilder};
 use winit::platform::windows::WindowBuilderExtWindows;
-use winit::window::{Theme, WindowBuilder};
+use winit::window::WindowBuilder;
 
 use crate::compositor::Compositor;
 use crate::egl_manager::EglManager;
@@ -76,7 +77,6 @@ fn main() -> Result<()> {
     let window = WindowBuilder::new()
         .with_inner_size(LogicalSize::new(800, 600))
         .with_no_redirection_bitmap(true)
-        .with_theme(Some(Theme::Light))
         .build(&event_loop)?;
 
     let hwnd = match window.window_handle()?.as_raw() {
@@ -88,7 +88,7 @@ fn main() -> Result<()> {
         DwmSetWindowAttribute(
             hwnd,
             DWMWA_SYSTEMBACKDROP_TYPE,
-            &DWMSBT_TABBEDWINDOW as *const DWM_SYSTEMBACKDROP_TYPE as *const c_void,
+            &DWMSBT_MAINWINDOW as *const DWM_SYSTEMBACKDROP_TYPE as *const c_void,
             mem::size_of::<DWM_SYSTEMBACKDROP_TYPE>() as u32,
         )
     }?;
@@ -181,6 +181,8 @@ fn main() -> Result<()> {
     })?;
 
     engine.send_window_metrics_event(width as usize, height as usize, window.scale_factor())?;
+
+    settings::send_to_engine(&engine)?;
 
     let window_data = Box::leak(Box::new(WindowData {
         engine: &engine,

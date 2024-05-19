@@ -7,9 +7,11 @@ use color_eyre::eyre::{self, bail};
 use flutter_embedder::{
     FlutterBackingStore, FlutterBackingStoreConfig, FlutterCompositor, FlutterCustomTaskRunners,
     FlutterEngineGetCurrentTime, FlutterEngineInitialize, FlutterEngineResult_kSuccess,
-    FlutterEngineRunInitialized, FlutterEngineRunTask, FlutterEngineSendPlatformMessageResponse,
-    FlutterEngineSendPointerEvent, FlutterEngineSendWindowMetricsEvent, FlutterLayer,
-    FlutterOpenGLRendererConfig, FlutterPlatformMessage, FlutterPlatformMessageResponseHandle,
+    FlutterEngineRunInitialized, FlutterEngineRunTask, FlutterEngineSendPlatformMessage,
+    FlutterEngineSendPlatformMessageResponse, FlutterEngineSendPointerEvent,
+    FlutterEngineSendWindowMetricsEvent, FlutterLayer, FlutterOpenGLRendererConfig,
+    FlutterPlatformMessage, FlutterPlatformMessageCreateResponseHandle,
+    FlutterPlatformMessageReleaseResponseHandle, FlutterPlatformMessageResponseHandle,
     FlutterPointerEvent, FlutterPointerPhase, FlutterPointerPhase_kAdd, FlutterPointerPhase_kDown,
     FlutterPointerPhase_kHover, FlutterPointerPhase_kRemove, FlutterPointerPhase_kUp,
     FlutterProjectArgs, FlutterRendererConfig, FlutterRendererType_kOpenGL, FlutterTask,
@@ -191,6 +193,86 @@ impl FlutterEngine {
         }
 
         Ok(())
+    }
+
+    pub fn send_platform_message(&self, channel: &CStr, message: &[u8]) -> eyre::Result<()> {
+        unsafe {
+            let result = FlutterEngineSendPlatformMessage(
+                self.inner.handle,
+                &FlutterPlatformMessage {
+                    struct_size: mem::size_of::<FlutterPlatformMessage>(),
+                    channel: channel.as_ptr(),
+                    message: message.as_ptr(),
+                    message_size: message.len(),
+                    response_handle: ptr::null_mut(),
+                },
+            );
+
+            if result != FlutterEngineResult_kSuccess {
+                bail!("failed to send platform message: {result}");
+            }
+
+            Ok(())
+        }
+    }
+
+    pub fn send_platform_message_with_reply<F>(
+        &self,
+        channel: &CStr,
+        message: &[u8],
+        reply_handler: F,
+    ) -> eyre::Result<()>
+    where
+        F: FnMut(&[u8]),
+    {
+        unsafe extern "C" fn callback<F: FnMut(&[u8])>(
+            data: *const u8,
+            size: usize,
+            user_data: *mut ::std::os::raw::c_void,
+        ) {
+            let mut reply_handler = Box::from_raw(user_data.cast::<F>());
+            reply_handler(std::slice::from_raw_parts(data, size));
+        }
+
+        unsafe {
+            let mut response_handle = ptr::null_mut();
+
+            let reply = Box::leak(Box::new(reply_handler));
+            let result = FlutterPlatformMessageCreateResponseHandle(
+                self.inner.handle,
+                Some(callback::<F>),
+                reply as *mut F as _,
+                &mut response_handle,
+            );
+
+            if result != FlutterEngineResult_kSuccess {
+                bail!("failed to create response handle: {result}");
+            }
+
+            let result = FlutterEngineSendPlatformMessage(
+                self.inner.handle,
+                &FlutterPlatformMessage {
+                    struct_size: mem::size_of::<FlutterPlatformMessage>(),
+                    channel: channel.as_ptr(),
+                    message: message.as_ptr(),
+                    message_size: message.len(),
+                    response_handle,
+                },
+            );
+
+            if result != FlutterEngineResult_kSuccess {
+                bail!("failed to send platform message: {result}");
+            }
+
+            let result =
+                FlutterPlatformMessageReleaseResponseHandle(self.inner.handle, response_handle);
+
+            if result != FlutterEngineResult_kSuccess {
+                bail!("failed to release response handle: {result}");
+            }
+
+            Ok(())
+        }
     }
 }
 
