@@ -214,11 +214,19 @@ impl FlutterEngine {
         Ok(())
     }
 
-    pub fn send_key_event(&self, event: KeyEvent) -> eyre::Result<()> {
-        unsafe extern "C" fn callback(handled: bool, _user_data: *mut ::std::os::raw::c_void) {
-            // TODO: Handle response
-            tracing::debug!(handled, "sent key event to embedder");
+    pub fn send_key_event<F: FnOnce(bool)>(
+        &self,
+        event: KeyEvent,
+        callback: F,
+    ) -> eyre::Result<()> {
+        unsafe extern "C" fn _callback<F: FnOnce(bool)>(
+            handled: bool,
+            user_data: *mut ::std::os::raw::c_void,
+        ) {
+            Box::from_raw(user_data.cast::<F>())(handled);
         }
+
+        let reply = Box::leak(Box::new(callback));
 
         let event = FlutterKeyEvent {
             struct_size: mem::size_of::<FlutterKeyEvent>(),
@@ -238,8 +246,8 @@ impl FlutterEngine {
             let result = FlutterEngineSendKeyEvent(
                 self.inner.handle,
                 &event,
-                Some(callback),
-                ptr::null_mut(),
+                Some(_callback::<F>),
+                reply as *mut F as _,
             );
 
             if result != FlutterEngineResult_kSuccess {

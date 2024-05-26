@@ -3,6 +3,7 @@
 mod compositor;
 mod egl_manager;
 mod engine;
+mod error_utils;
 mod logical_keys;
 mod mouse_cursor;
 mod resize_controller;
@@ -52,6 +53,7 @@ use winit::window::WindowBuilder;
 use crate::compositor::Compositor;
 use crate::egl_manager::EglManager;
 use crate::engine::{FlutterEngine, FlutterEngineConfig, KeyEvent, KeyEventType, PointerPhase};
+use crate::error_utils::ResultExt;
 use crate::mouse_cursor::MouseCursorHandler;
 use crate::task_runner::TaskRunnerExecutor;
 use crate::text_input::{TextInputHandler, TextInputState};
@@ -265,31 +267,26 @@ fn main() -> Result<()> {
                         "keyboard event"
                     );
 
-                    if let Err(e) = send_embedder_key_event(&engine, &event, is_synthetic)
-                        .wrap_err("failed to send embedder key event")
-                    {
-                        tracing::error!("{e:#?}");
-                    };
-
-                    let process_text_input = |event, handled| {
-                        if handled {
-                            return;
-                        }
-
+                    let process_text_input = |event: winit::event::KeyEvent| {
                         let mut text_input = text_input.borrow_mut();
-                        if let Err(e) = text_input
+                        let _ = text_input
                             .process_key_event(&event, &engine)
                             .wrap_err("text input plugin failed to process key event")
-                        {
-                            tracing::error!("{e:#?}");
-                        };
+                            .trace_err();
                     };
 
-                    if let Err(e) = send_channel_key_event(&engine, event, process_text_input)
-                        .wrap_err("failed to send channel key event")
-                    {
-                        tracing::error!("{e:#?}");
+                    let send_channel = |event: winit::event::KeyEvent| {
+                        let _ =
+                            send_channel_key_event(&engine, event, process_text_input).trace_err();
                     };
+
+                    let send_embedder = |event: winit::event::KeyEvent| {
+                        let _ = send_embedder_key_event(&engine, event, is_synthetic, send_channel)
+                            .wrap_err("failed to send embedder key event")
+                            .trace_err();
+                    };
+
+                    send_embedder(event);
                 }
                 _ => {}
             },
@@ -307,37 +304,46 @@ fn main() -> Result<()> {
 
 fn send_embedder_key_event(
     engine: &FlutterEngine,
-    event: &winit::event::KeyEvent,
+    event: winit::event::KeyEvent,
     is_synthetic: bool,
+    next_handler: impl FnOnce(winit::event::KeyEvent),
 ) -> eyre::Result<()> {
-    engine.send_key_event(KeyEvent {
+    let character = match &event.logical_key {
+        Key::Named(_) => None,
+        Key::Character(c) => {
+            if event.state == ElementState::Released {
+                None
+            } else {
+                Some(c.clone())
+            }
+        }
+        Key::Unidentified(_) => None,
+        Key::Dead(_) => None,
+    };
+
+    let key_event = KeyEvent {
         event_type: match event.state {
             ElementState::Pressed if event.repeat => KeyEventType::Repeat,
             ElementState::Pressed => KeyEventType::Down,
             ElementState::Released => KeyEventType::Up,
         },
         synthesized: is_synthetic,
-        character: match &event.logical_key {
-            Key::Named(_) => None,
-            Key::Character(c) => {
-                if event.state == ElementState::Released {
-                    None
-                } else {
-                    Some(c)
-                }
-            }
-            Key::Unidentified(_) => None,
-            Key::Dead(_) => None,
-        },
+        character: character.as_ref(),
         logical: logical_keys::to_flutter(&event.logical_key),
         physical: event.physical_key.to_scancode().map(|code| code.into()),
+    };
+
+    engine.send_key_event(key_event, move |handled| {
+        if !handled {
+            next_handler(event);
+        }
     })
 }
 
 fn send_channel_key_event(
     engine: &FlutterEngine,
     event: winit::event::KeyEvent,
-    callback: impl FnOnce(winit::event::KeyEvent, bool),
+    next_handler: impl FnOnce(winit::event::KeyEvent),
 ) -> eyre::Result<()> {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
@@ -381,18 +387,24 @@ fn send_channel_key_event(
         modifiers: None,
     };
 
-    engine
-        .send_platform_message_with_reply(
-            c"flutter/keyevent",
-            &serde_json::to_vec(&message).unwrap(),
-            |response| {
-                let response: Response = serde_json::from_slice(response).unwrap();
-                callback(event, response.handled);
-            },
-        )
-        .unwrap();
+    engine.send_platform_message_with_reply(
+        c"flutter/keyevent",
+        &serde_json::to_vec(&message)?,
+        |response| {
+            let Ok(response) = serde_json::from_slice::<Response>(response)
+                .wrap_err("invalid response from flutter/keyevent")
+                .trace_err()
+            else {
+                return;
+            };
 
-    Ok(())
+            if response.handled {
+                return;
+            }
+
+            next_handler(event);
+        },
+    )
 }
 
 unsafe extern "system" fn wnd_proc(
