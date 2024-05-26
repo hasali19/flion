@@ -214,9 +214,9 @@ impl FlutterEngine {
         Ok(())
     }
 
-    pub fn send_key_event<'s, F>(&'s self, event: KeyEvent, callback: F) -> eyre::Result<()>
+    pub fn send_key_event<F>(&self, event: KeyEvent, callback: F) -> eyre::Result<()>
     where
-        F: FnOnce(bool) + 's,
+        F: FnOnce(bool) + 'static,
     {
         unsafe extern "C" fn _callback<F: FnOnce(bool)>(
             handled: bool,
@@ -278,14 +278,14 @@ impl FlutterEngine {
         }
     }
 
-    pub fn send_platform_message_with_reply<'s, F>(
-        &'s self,
+    pub fn send_platform_message_with_reply<F>(
+        &self,
         channel: &CStr,
         message: &[u8],
         reply_handler: F,
     ) -> eyre::Result<()>
     where
-        F: FnOnce(&[u8]) + 's,
+        F: FnOnce(&[u8]) + 'static,
     {
         unsafe extern "C" fn callback<F: FnOnce(&[u8])>(
             data: *const u8,

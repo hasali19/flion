@@ -167,7 +167,7 @@ fn main() -> Result<()> {
     let window = Rc::new(window);
     let text_input = Rc::new(RefCell::new(TextInputState::new()));
 
-    let engine = FlutterEngine::new(FlutterEngineConfig {
+    let engine = Rc::new(FlutterEngine::new(FlutterEngineConfig {
         egl_manager: egl_manager.clone(),
         compositor: Compositor::new(
             device,
@@ -194,14 +194,14 @@ fn main() -> Result<()> {
                 Box::new(TextInputHandler::new(text_input.clone())),
             ),
         ],
-    })?;
+    })?);
 
     engine.send_window_metrics_event(width as usize, height as usize, window.scale_factor())?;
 
     settings::send_to_engine(&engine)?;
 
     let window_data = Box::leak(Box::new(WindowData {
-        engine: &engine,
+        engine: &*engine,
         resize_controller,
         scale_factor: Cell::new(window.scale_factor()),
         root_visual: root,
@@ -211,7 +211,7 @@ fn main() -> Result<()> {
 
     let mut cursor_pos = PhysicalPosition::new(0.0, 0.0);
     let mut task_executor = TaskRunnerExecutor::default();
-    let mut keyboard = Keyboard::new(text_input);
+    let mut keyboard = Keyboard::new(engine.clone(), text_input);
 
     event_loop.run(move |event, target| {
         match event {
@@ -271,7 +271,7 @@ fn main() -> Result<()> {
                     );
 
                     let _ = keyboard
-                        .handle_keyboard_input(event, is_synthetic, &engine)
+                        .handle_keyboard_input(event, is_synthetic)
                         .trace_err();
                 }
                 _ => {}

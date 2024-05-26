@@ -14,6 +14,7 @@ use crate::keymap;
 use crate::text_input::TextInputState;
 
 pub struct Keyboard {
+    engine: Rc<FlutterEngine>,
     text_input: Rc<RefCell<TextInputState>>,
     modifiers: ModifierState,
 }
@@ -39,8 +40,9 @@ bitflags! {
 }
 
 impl Keyboard {
-    pub fn new(text_input: Rc<RefCell<TextInputState>>) -> Keyboard {
+    pub fn new(engine: Rc<FlutterEngine>, text_input: Rc<RefCell<TextInputState>>) -> Keyboard {
         Keyboard {
+            engine,
             text_input,
             modifiers: ModifierState::default(),
         }
@@ -50,7 +52,6 @@ impl Keyboard {
         &mut self,
         event: winit::event::KeyEvent,
         is_synthetic: bool,
-        engine: &FlutterEngine,
     ) -> eyre::Result<()> {
         if let Key::Named(key) = event.logical_key {
             match key {
@@ -70,26 +71,34 @@ impl Keyboard {
             }
         }
 
-        let text_input = &*self.text_input;
-        let modifiers = self.modifiers;
-
-        let process_text_input = |event: winit::event::KeyEvent| {
-            let mut text_input = text_input.borrow_mut();
-            let _ = text_input
-                .process_key_event(&event, engine)
-                .wrap_err("text input plugin failed to process key event")
-                .trace_err();
+        let process_text_input = {
+            let engine = self.engine.clone();
+            let text_input = self.text_input.clone();
+            move |event: winit::event::KeyEvent| {
+                let mut text_input = text_input.borrow_mut();
+                let _ = text_input
+                    .process_key_event(&event, &engine)
+                    .wrap_err("text input plugin failed to process key event")
+                    .trace_err();
+            }
         };
 
-        let send_channel = move |event: winit::event::KeyEvent| {
-            let _ =
-                send_channel_key_event(engine, event, modifiers, process_text_input).trace_err();
+        let send_channel = {
+            let engine = self.engine.clone();
+            let modifiers = self.modifiers;
+            move |event: winit::event::KeyEvent| {
+                let _ = send_channel_key_event(&engine, event, modifiers, process_text_input)
+                    .trace_err();
+            }
         };
 
-        let send_embedder = |event: winit::event::KeyEvent| {
-            let _ = send_embedder_key_event(engine, event, is_synthetic, send_channel)
-                .wrap_err("failed to send embedder key event")
-                .trace_err();
+        let send_embedder = {
+            let engine = self.engine.clone();
+            move |event: winit::event::KeyEvent| {
+                let _ = send_embedder_key_event(&engine, event, is_synthetic, send_channel)
+                    .wrap_err("failed to send embedder key event")
+                    .trace_err();
+            }
         };
 
         send_embedder(event);
@@ -108,11 +117,11 @@ impl Keyboard {
     }
 }
 
-fn send_embedder_key_event<'e>(
-    engine: &'e FlutterEngine,
+fn send_embedder_key_event(
+    engine: &FlutterEngine,
     event: winit::event::KeyEvent,
     is_synthetic: bool,
-    next_handler: impl FnOnce(winit::event::KeyEvent) + 'e,
+    next_handler: impl FnOnce(winit::event::KeyEvent) + 'static,
 ) -> eyre::Result<()> {
     let character = match &event.logical_key {
         Key::Named(_) => None,
@@ -146,11 +155,11 @@ fn send_embedder_key_event<'e>(
     })
 }
 
-fn send_channel_key_event<'e>(
-    engine: &'e FlutterEngine,
+fn send_channel_key_event(
+    engine: &FlutterEngine,
     event: winit::event::KeyEvent,
     modifiers: ModifierState,
-    next_handler: impl FnOnce(winit::event::KeyEvent) + 'e,
+    next_handler: impl FnOnce(winit::event::KeyEvent) + 'static,
 ) -> eyre::Result<()> {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
