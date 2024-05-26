@@ -267,21 +267,24 @@ fn main() -> Result<()> {
                         "keyboard event"
                     );
 
-                    let process_text_input = |event: winit::event::KeyEvent| {
+                    let text_input = &*text_input;
+                    let engine = &engine;
+
+                    let process_text_input = move |event: winit::event::KeyEvent| {
                         let mut text_input = text_input.borrow_mut();
                         let _ = text_input
-                            .process_key_event(&event, &engine)
+                            .process_key_event(&event, engine)
                             .wrap_err("text input plugin failed to process key event")
                             .trace_err();
                     };
 
-                    let send_channel = |event: winit::event::KeyEvent| {
+                    let send_channel = move |event: winit::event::KeyEvent| {
                         let _ =
-                            send_channel_key_event(&engine, event, process_text_input).trace_err();
+                            send_channel_key_event(engine, event, process_text_input).trace_err();
                     };
 
-                    let send_embedder = |event: winit::event::KeyEvent| {
-                        let _ = send_embedder_key_event(&engine, event, is_synthetic, send_channel)
+                    let send_embedder = move |event: winit::event::KeyEvent| {
+                        let _ = send_embedder_key_event(engine, event, is_synthetic, send_channel)
                             .wrap_err("failed to send embedder key event")
                             .trace_err();
                     };
@@ -302,11 +305,11 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn send_embedder_key_event(
-    engine: &FlutterEngine,
+fn send_embedder_key_event<'e>(
+    engine: &'e FlutterEngine,
     event: winit::event::KeyEvent,
     is_synthetic: bool,
-    next_handler: impl FnOnce(winit::event::KeyEvent),
+    next_handler: impl FnOnce(winit::event::KeyEvent) + 'e,
 ) -> eyre::Result<()> {
     let character = match &event.logical_key {
         Key::Named(_) => None,
@@ -340,10 +343,10 @@ fn send_embedder_key_event(
     })
 }
 
-fn send_channel_key_event(
-    engine: &FlutterEngine,
+fn send_channel_key_event<'e>(
+    engine: &'e FlutterEngine,
     event: winit::event::KeyEvent,
-    next_handler: impl FnOnce(winit::event::KeyEvent),
+    next_handler: impl FnOnce(winit::event::KeyEvent) + 'e,
 ) -> eyre::Result<()> {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]

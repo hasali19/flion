@@ -30,7 +30,7 @@ pub struct FlutterEngineConfig<'a> {
     pub egl_manager: Arc<EglManager>,
     pub compositor: Compositor,
     pub platform_task_handler: Box<dyn Fn(Task)>,
-    pub platform_message_handlers: Vec<(&'a str, Box<dyn BinaryMessageHandler>)>,
+    pub platform_message_handlers: Vec<(&'a str, Box<dyn BinaryMessageHandler + 'static>)>,
 }
 
 pub struct FlutterEngine {
@@ -40,7 +40,7 @@ pub struct FlutterEngine {
 struct FlutterEngineInner {
     handle: flutter_embedder::FlutterEngine,
     egl_manager: Arc<EglManager>,
-    platform_message_handlers: BTreeMap<String, Box<dyn BinaryMessageHandler>>,
+    platform_message_handlers: BTreeMap<String, Box<dyn BinaryMessageHandler + 'static>>,
 }
 
 #[repr(i32)]
@@ -214,11 +214,10 @@ impl FlutterEngine {
         Ok(())
     }
 
-    pub fn send_key_event<F: FnOnce(bool)>(
-        &self,
-        event: KeyEvent,
-        callback: F,
-    ) -> eyre::Result<()> {
+    pub fn send_key_event<'s, F>(&'s self, event: KeyEvent, callback: F) -> eyre::Result<()>
+    where
+        F: FnOnce(bool) + 's,
+    {
         unsafe extern "C" fn _callback<F: FnOnce(bool)>(
             handled: bool,
             user_data: *mut ::std::os::raw::c_void,
@@ -279,14 +278,14 @@ impl FlutterEngine {
         }
     }
 
-    pub fn send_platform_message_with_reply<F>(
-        &self,
+    pub fn send_platform_message_with_reply<'s, F>(
+        &'s self,
         channel: &CStr,
         message: &[u8],
         reply_handler: F,
     ) -> eyre::Result<()>
     where
-        F: FnOnce(&[u8]),
+        F: FnOnce(&[u8]) + 's,
     {
         unsafe extern "C" fn callback<F: FnOnce(&[u8])>(
             data: *const u8,
@@ -343,7 +342,7 @@ impl FlutterEngine {
     }
 }
 
-fn create_task_runner<F: Fn(Task)>(
+fn create_task_runner<F: Fn(Task) + 'static>(
     id: usize,
     runner: &'static TaskRunner<F>,
 ) -> FlutterTaskRunnerDescription {
