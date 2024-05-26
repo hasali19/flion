@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::fmt::Write;
 use std::rc::Rc;
 
 use color_eyre::eyre;
@@ -21,12 +20,6 @@ impl TextInputState {
             client: None,
             value: TextEditingValue::default(),
         }
-    }
-
-    fn insert_text(&mut self, text: &str) {
-        write!(&mut self.value.text, "{text}").unwrap();
-        self.value.selection_base += text.len();
-        self.value.selection_extent = self.value.selection_base;
     }
 
     pub fn process_key_event(
@@ -65,6 +58,30 @@ impl TextInputState {
         }
 
         Ok(())
+    }
+
+    fn insert_text(&mut self, text: &str) {
+        self.delete_selected();
+        self.value.text.insert_str(self.value.selection_base, text);
+        self.value.selection_base += text.len();
+        self.value.selection_extent = self.value.selection_base;
+    }
+
+    fn delete_selected(&mut self) {
+        let range = if self.value.selection_base < self.value.selection_extent {
+            self.value.selection_base..self.value.selection_extent
+        } else {
+            self.value.selection_extent..self.value.selection_base
+        };
+
+        if range.is_empty() {
+            return;
+        }
+
+        self.value.text.drain(range.clone());
+
+        self.value.selection_base = range.start;
+        self.value.selection_extent = range.end;
     }
 }
 
