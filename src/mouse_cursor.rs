@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::rc::Rc;
 
 use flutter_codec::EncodableValue;
 use winit::window::{CursorIcon, Window};
@@ -6,11 +6,11 @@ use winit::window::{CursorIcon, Window};
 use crate::standard_method_channel::{StandardMethodHandler, StandardMethodReply};
 
 pub struct MouseCursorHandler {
-    window: Arc<Window>,
+    window: Rc<Window>,
 }
 
 impl MouseCursorHandler {
-    pub fn new(window: Arc<Window>) -> MouseCursorHandler {
+    pub fn new(window: Rc<Window>) -> MouseCursorHandler {
         MouseCursorHandler { window }
     }
 }

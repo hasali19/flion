@@ -49,6 +49,8 @@ class MyHomePage extends StatefulWidget {
 }
 
 class _MyHomePageState extends State<MyHomePage> {
+  final _textController = TextEditingController();
+
   int _counter = 0;
 
   void _incrementCounter() {
@@ -97,6 +99,9 @@ class _MyHomePageState extends State<MyHomePage> {
           // horizontal).
           mainAxisAlignment: MainAxisAlignment.center,
           children: <Widget>[
+            TextField(
+              controller: _textController,
+            ),
             const Text(
               'You have pushed the button this many times:',
             ),

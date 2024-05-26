@@ -3,21 +3,25 @@
 mod compositor;
 mod egl_manager;
 mod engine;
+mod logical_keys;
 mod mouse_cursor;
 mod resize_controller;
 mod settings;
 mod standard_method_channel;
 mod task_runner;
+mod text_input;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::mem;
+use std::rc::Rc;
 use std::sync::Arc;
 
-use color_eyre::eyre::ContextCompat;
+use color_eyre::eyre::{self, Context, OptionExt};
 use color_eyre::Result;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use resize_controller::ResizeController;
+use serde::{Deserialize, Serialize};
 use task_runner::Task;
 use windows::core::ComInterface;
 use windows::Foundation::Numerics::{Matrix4x4, Vector2, Vector3};
@@ -40,14 +44,17 @@ use windows::UI::Composition::Core::CompositorController;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoopBuilder};
+use winit::keyboard::Key;
+use winit::platform::scancode::PhysicalKeyExtScancode;
 use winit::platform::windows::WindowBuilderExtWindows;
 use winit::window::WindowBuilder;
 
 use crate::compositor::Compositor;
 use crate::egl_manager::EglManager;
-use crate::engine::{FlutterEngineConfig, PointerPhase};
+use crate::engine::{FlutterEngine, FlutterEngineConfig, KeyEvent, KeyEventType, PointerPhase};
 use crate::mouse_cursor::MouseCursorHandler;
 use crate::task_runner::TaskRunnerExecutor;
+use crate::text_input::{TextInputHandler, TextInputState};
 
 struct WindowData {
     engine: *const engine::FlutterEngine,
@@ -70,6 +77,7 @@ fn main() -> Result<()> {
         tracing_subscriber::fmt()
             .with_span_events(FmtSpan::ENTER)
             .with_thread_names(true)
+            .with_max_level(tracing::Level::DEBUG)
             .init();
     }
 
@@ -149,15 +157,16 @@ fn main() -> Result<()> {
             None,
         )?;
 
-        device.wrap_err("failed to create D3D11 device")?
+        device.ok_or_eyre("failed to create D3D11 device")?
     };
 
     let egl_manager = EglManager::create(&device)?;
     let resize_controller = Arc::new(ResizeController::new());
 
-    let window = Arc::new(window);
+    let window = Rc::new(window);
+    let text_input = Rc::new(RefCell::new(TextInputState::new()));
 
-    let engine = engine::FlutterEngine::new(FlutterEngineConfig {
+    let engine = FlutterEngine::new(FlutterEngineConfig {
         egl_manager: egl_manager.clone(),
         compositor: Compositor::new(
             device,
@@ -174,10 +183,16 @@ fn main() -> Result<()> {
                 }
             }
         }),
-        platform_message_handlers: vec![(
-            "flutter/mousecursor",
-            Box::new(MouseCursorHandler::new(window.clone())),
-        )],
+        platform_message_handlers: vec![
+            (
+                "flutter/mousecursor",
+                Box::new(MouseCursorHandler::new(window.clone())),
+            ),
+            (
+                "flutter/textinput",
+                Box::new(TextInputHandler::new(text_input.clone())),
+            ),
+        ],
     })?;
 
     engine.send_window_metrics_event(width as usize, height as usize, window.scale_factor())?;
@@ -238,8 +253,47 @@ fn main() -> Result<()> {
                         .send_pointer_event(phase, cursor_pos.x, cursor_pos.y)
                         .unwrap();
                 }
+                WindowEvent::KeyboardInput {
+                    device_id: _,
+                    event,
+                    is_synthetic,
+                } => {
+                    tracing::debug!(
+                        key = ?event.logical_key,
+                        state = ?event.state,
+                        is_synthetic,
+                        "keyboard event"
+                    );
+
+                    if let Err(e) = send_embedder_key_event(&engine, &event, is_synthetic)
+                        .wrap_err("failed to send embedder key event")
+                    {
+                        tracing::error!("{e:#?}");
+                    };
+
+                    let process_text_input = |event, handled| {
+                        if handled {
+                            return;
+                        }
+
+                        let mut text_input = text_input.borrow_mut();
+                        if let Err(e) = text_input
+                            .process_key_event(&event, &engine)
+                            .wrap_err("text input plugin failed to process key event")
+                        {
+                            tracing::error!("{e:#?}");
+                        };
+                    };
+
+                    if let Err(e) = send_channel_key_event(&engine, event, process_text_input)
+                        .wrap_err("failed to send channel key event")
+                    {
+                        tracing::error!("{e:#?}");
+                    };
+                }
                 _ => {}
             },
+
             _ => (),
         }
 
@@ -247,6 +301,96 @@ fn main() -> Result<()> {
             target.set_control_flow(ControlFlow::WaitUntil(next_task_target_time));
         }
     })?;
+
+    Ok(())
+}
+
+fn send_embedder_key_event(
+    engine: &FlutterEngine,
+    event: &winit::event::KeyEvent,
+    is_synthetic: bool,
+) -> eyre::Result<()> {
+    engine.send_key_event(KeyEvent {
+        event_type: match event.state {
+            ElementState::Pressed if event.repeat => KeyEventType::Repeat,
+            ElementState::Pressed => KeyEventType::Down,
+            ElementState::Released => KeyEventType::Up,
+        },
+        synthesized: is_synthetic,
+        character: match &event.logical_key {
+            Key::Named(_) => None,
+            Key::Character(c) => {
+                if event.state == ElementState::Released {
+                    None
+                } else {
+                    Some(c)
+                }
+            }
+            Key::Unidentified(_) => None,
+            Key::Dead(_) => None,
+        },
+        logical: logical_keys::to_flutter(&event.logical_key),
+        physical: event.physical_key.to_scancode().map(|code| code.into()),
+    })
+}
+
+fn send_channel_key_event(
+    engine: &FlutterEngine,
+    event: winit::event::KeyEvent,
+    callback: impl FnOnce(winit::event::KeyEvent, bool),
+) -> eyre::Result<()> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Message<'a> {
+        keymap: &'a str,
+        #[serde(rename = "type")]
+        event_type: &'a str,
+        character_code_point: Option<u64>,
+        key_code: Option<u64>,
+        scan_code: Option<u64>,
+        modifiers: Option<u64>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct Response {
+        handled: bool,
+    }
+
+    let character = match &event.logical_key {
+        Key::Character(c) => {
+            if (1..=4).contains(&c.len()) {
+                let mut bytes = [0u8; 4];
+                bytes[..c.len()].copy_from_slice(c.as_bytes());
+                Some(u32::from_le_bytes(bytes) as u64)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
+    let message = Message {
+        keymap: "windows",
+        event_type: match event.state {
+            ElementState::Pressed => "keydown",
+            ElementState::Released => "keyup",
+        },
+        character_code_point: character,
+        key_code: logical_keys::to_flutter(&event.logical_key),
+        scan_code: event.physical_key.to_scancode().map(|code| code.into()),
+        modifiers: None,
+    };
+
+    engine
+        .send_platform_message_with_reply(
+            c"flutter/keyevent",
+            &serde_json::to_vec(&message).unwrap(),
+            |response| {
+                let response: Response = serde_json::from_slice(response).unwrap();
+                callback(event, response.handled);
+            },
+        )
+        .unwrap();
 
     Ok(())
 }

@@ -7,9 +7,12 @@ use color_eyre::eyre::{self, bail};
 use flutter_embedder::{
     FlutterBackingStore, FlutterBackingStoreConfig, FlutterCompositor, FlutterCustomTaskRunners,
     FlutterEngineGetCurrentTime, FlutterEngineInitialize, FlutterEngineResult_kSuccess,
-    FlutterEngineRunInitialized, FlutterEngineRunTask, FlutterEngineSendPlatformMessage,
-    FlutterEngineSendPlatformMessageResponse, FlutterEngineSendPointerEvent,
-    FlutterEngineSendWindowMetricsEvent, FlutterLayer, FlutterOpenGLRendererConfig,
+    FlutterEngineRunInitialized, FlutterEngineRunTask, FlutterEngineSendKeyEvent,
+    FlutterEngineSendPlatformMessage, FlutterEngineSendPlatformMessageResponse,
+    FlutterEngineSendPointerEvent, FlutterEngineSendWindowMetricsEvent, FlutterKeyEvent,
+    FlutterKeyEventDeviceType_kFlutterKeyEventDeviceTypeKeyboard,
+    FlutterKeyEventType_kFlutterKeyEventTypeDown, FlutterKeyEventType_kFlutterKeyEventTypeRepeat,
+    FlutterKeyEventType_kFlutterKeyEventTypeUp, FlutterLayer, FlutterOpenGLRendererConfig,
     FlutterPlatformMessage, FlutterPlatformMessageCreateResponseHandle,
     FlutterPlatformMessageReleaseResponseHandle, FlutterPlatformMessageResponseHandle,
     FlutterPointerEvent, FlutterPointerPhase, FlutterPointerPhase_kAdd, FlutterPointerPhase_kDown,
@@ -17,6 +20,7 @@ use flutter_embedder::{
     FlutterProjectArgs, FlutterRendererConfig, FlutterRendererType_kOpenGL, FlutterTask,
     FlutterTaskRunnerDescription, FlutterWindowMetricsEvent, FLUTTER_ENGINE_VERSION,
 };
+use smol_str::SmolStr;
 
 use crate::compositor::Compositor;
 use crate::egl_manager::EglManager;
@@ -46,6 +50,21 @@ pub enum PointerPhase {
     Add = FlutterPointerPhase_kAdd,
     Remove = FlutterPointerPhase_kRemove,
     Hover = FlutterPointerPhase_kHover,
+}
+
+#[repr(i32)]
+pub enum KeyEventType {
+    Up = FlutterKeyEventType_kFlutterKeyEventTypeUp,
+    Down = FlutterKeyEventType_kFlutterKeyEventTypeDown,
+    Repeat = FlutterKeyEventType_kFlutterKeyEventTypeRepeat,
+}
+
+pub struct KeyEvent<'a> {
+    pub event_type: KeyEventType,
+    pub synthesized: bool,
+    pub character: Option<&'a SmolStr>,
+    pub logical: Option<u64>,
+    pub physical: Option<u64>,
 }
 
 impl FlutterEngine {
@@ -195,6 +214,42 @@ impl FlutterEngine {
         Ok(())
     }
 
+    pub fn send_key_event(&self, event: KeyEvent) -> eyre::Result<()> {
+        unsafe extern "C" fn callback(handled: bool, _user_data: *mut ::std::os::raw::c_void) {
+            // TODO: Handle response
+            tracing::debug!(handled, "sent key event to embedder");
+        }
+
+        let event = FlutterKeyEvent {
+            struct_size: mem::size_of::<FlutterKeyEvent>(),
+            timestamp: unsafe { FlutterEngineGetCurrentTime() as f64 },
+            type_: event.event_type as i32,
+            character: event
+                .character
+                .map(|c| c.as_ptr().cast())
+                .unwrap_or(ptr::null()),
+            synthesized: event.synthesized,
+            logical: event.logical.unwrap_or(0),
+            physical: event.physical.unwrap_or(0),
+            device_type: FlutterKeyEventDeviceType_kFlutterKeyEventDeviceTypeKeyboard,
+        };
+
+        unsafe {
+            let result = FlutterEngineSendKeyEvent(
+                self.inner.handle,
+                &event,
+                Some(callback),
+                ptr::null_mut(),
+            );
+
+            if result != FlutterEngineResult_kSuccess {
+                bail!("failed to send key event: {result}");
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn send_platform_message(&self, channel: &CStr, message: &[u8]) -> eyre::Result<()> {
         unsafe {
             let result = FlutterEngineSendPlatformMessage(
@@ -223,15 +278,19 @@ impl FlutterEngine {
         reply_handler: F,
     ) -> eyre::Result<()>
     where
-        F: FnMut(&[u8]),
+        F: FnOnce(&[u8]),
     {
-        unsafe extern "C" fn callback<F: FnMut(&[u8])>(
+        unsafe extern "C" fn callback<F: FnOnce(&[u8])>(
             data: *const u8,
             size: usize,
             user_data: *mut ::std::os::raw::c_void,
         ) {
-            let mut reply_handler = Box::from_raw(user_data.cast::<F>());
-            reply_handler(std::slice::from_raw_parts(data, size));
+            let reply_handler = Box::from_raw(user_data.cast::<F>());
+            if data.is_null() {
+                tracing::warn!("null reply from platform message");
+            } else {
+                reply_handler(std::slice::from_raw_parts(data, size));
+            }
         }
 
         unsafe {

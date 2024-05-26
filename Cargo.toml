@@ -15,8 +15,9 @@ flutter-embedder = { path = "flutter-embedder" }
 gl = "0.14"
 khronos-egl = { version = "6.0", features = ["static", "no-pkg-config"] }
 raw-window-handle = "0.6"
-serde = "1.0"
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+smol_str = "0.2.2"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 winit = "0.29"
