@@ -126,21 +126,23 @@ impl BinaryMessageHandler for TextInputHandler {
     fn handle(&self, message: &[u8], reply: BinaryMessageReply) {
         let Ok(req) = serde_json::from_slice::<TextInputRequest>(message) else {
             let message = std::str::from_utf8(message).unwrap();
-            tracing::warn!("{message}");
+            tracing::warn!("unimplemented: {message}");
             reply.not_implemented();
             return;
         };
 
-        tracing::info!("{req:?}");
+        tracing::debug!("{req:?}");
+
+        const RES_SUCCESS: &[u8] = c"[null]".to_bytes();
 
         match req {
             TextInputRequest::SetClient(client, _) => {
                 self.state.borrow_mut().client = Some(client);
-                reply.send(&serde_json::to_vec(&json!([null])).unwrap());
+                reply.send(RES_SUCCESS);
             }
             TextInputRequest::ClearClient => {
                 self.state.borrow_mut().client = None;
-                reply.send(&serde_json::to_vec(&json!([null])).unwrap());
+                reply.send(RES_SUCCESS);
             }
             TextInputRequest::Show => {
                 reply.not_implemented();
@@ -150,7 +152,7 @@ impl BinaryMessageHandler for TextInputHandler {
             }
             TextInputRequest::SetEditingState(value) => {
                 self.state.borrow_mut().value = value;
-                reply.send(&serde_json::to_vec(&json!([null])).unwrap());
+                reply.send(RES_SUCCESS);
             }
         }
     }

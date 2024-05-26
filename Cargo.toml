@@ -9,6 +9,7 @@ edition = "2021"
 members = ["flutter-codec", "flutter-embedder"]
 
 [dependencies]
+bitflags = "2.5.0"
 color-eyre = "0.6"
 flutter-codec = { path = "flutter-codec" }
 flutter-embedder = { path = "flutter-embedder" }
