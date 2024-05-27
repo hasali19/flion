@@ -16,9 +16,10 @@ use flutter_embedder::{
     FlutterPlatformMessage, FlutterPlatformMessageCreateResponseHandle,
     FlutterPlatformMessageReleaseResponseHandle, FlutterPlatformMessageResponseHandle,
     FlutterPointerEvent, FlutterPointerPhase, FlutterPointerPhase_kAdd, FlutterPointerPhase_kDown,
-    FlutterPointerPhase_kHover, FlutterPointerPhase_kRemove, FlutterPointerPhase_kUp,
-    FlutterProjectArgs, FlutterRendererConfig, FlutterRendererType_kOpenGL, FlutterTask,
-    FlutterTaskRunnerDescription, FlutterWindowMetricsEvent, FLUTTER_ENGINE_VERSION,
+    FlutterPointerPhase_kHover, FlutterPointerPhase_kMove, FlutterPointerPhase_kRemove,
+    FlutterPointerPhase_kUp, FlutterProjectArgs, FlutterRendererConfig,
+    FlutterRendererType_kOpenGL, FlutterTask, FlutterTaskRunnerDescription,
+    FlutterWindowMetricsEvent, FLUTTER_ENGINE_VERSION,
 };
 use smol_str::SmolStr;
 
@@ -50,6 +51,7 @@ pub enum PointerPhase {
     Add = FlutterPointerPhase_kAdd,
     Remove = FlutterPointerPhase_kRemove,
     Hover = FlutterPointerPhase_kHover,
+    Move = FlutterPointerPhase_kMove,
 }
 
 #[repr(i32)]

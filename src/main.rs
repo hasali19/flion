@@ -213,6 +213,8 @@ fn main() -> Result<()> {
     let mut task_executor = TaskRunnerExecutor::default();
     let mut keyboard = Keyboard::new(engine.clone(), text_input);
 
+    let mut pointer_is_down = false;
+
     event_loop.run(move |event, target| {
         match event {
             Event::UserEvent(event) => match event {
@@ -232,8 +234,15 @@ fn main() -> Result<()> {
                 }
                 WindowEvent::CursorMoved { position, .. } => {
                     cursor_pos = position;
+
+                    let phase = if pointer_is_down {
+                        PointerPhase::Move
+                    } else {
+                        PointerPhase::Hover
+                    };
+
                     engine
-                        .send_pointer_event(PointerPhase::Hover, position.x, position.y)
+                        .send_pointer_event(phase, position.x, position.y)
                         .unwrap();
                 }
                 WindowEvent::CursorEntered { .. } => {
@@ -251,6 +260,9 @@ fn main() -> Result<()> {
                         ElementState::Pressed => PointerPhase::Down,
                         ElementState::Released => PointerPhase::Up,
                     };
+
+                    pointer_is_down = state == ElementState::Pressed;
+
                     engine
                         .send_pointer_event(phase, cursor_pos.x, cursor_pos.y)
                         .unwrap();
