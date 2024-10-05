@@ -1,25 +1,23 @@
-use std::ptr;
+use std::ffi::c_void;
 use std::sync::Arc;
+use std::{mem, ptr};
 
-use color_eyre::eyre::{self, ContextCompat};
+use color_eyre::eyre;
 use flutter_embedder::{
     FlutterBackingStore, FlutterBackingStoreConfig,
     FlutterBackingStoreType_kFlutterBackingStoreTypeOpenGL, FlutterBackingStore__bindgen_ty_1,
     FlutterLayer, FlutterLayerContentType_kFlutterLayerContentTypeBackingStore,
-    FlutterOpenGLBackingStore, FlutterOpenGLBackingStore__bindgen_ty_1, FlutterOpenGLFramebuffer,
-    FlutterOpenGLTargetType_kFlutterOpenGLTargetTypeFramebuffer,
+    FlutterOpenGLBackingStore, FlutterOpenGLBackingStore__bindgen_ty_1, FlutterOpenGLSurface,
+    FlutterOpenGLTargetType_kFlutterOpenGLTargetTypeSurface,
 };
-use khronos_egl as egl;
+use khronos_egl::{self as egl};
 use windows::core::ComInterface;
 use windows::Foundation::Numerics::Vector2;
 use windows::Foundation::Size;
 use windows::Graphics::DirectX::{DirectXAlphaMode, DirectXPixelFormat};
-use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_CPU_ACCESS_FLAG, D3D11_RESOURCE_MISC_SHARED, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-};
+use windows::Win32::Foundation::POINT;
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 use windows::Win32::Graphics::Dwm::DwmFlush;
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::System::WinRT::Composition::{
     ICompositionDrawingSurfaceInterop, ICompositorInterop,
 };
@@ -32,7 +30,6 @@ use crate::egl_manager::EglManager;
 use crate::resize_controller::ResizeController;
 
 pub struct Compositor {
-    device: ID3D11Device,
     compositor_controller: CompositorController,
     composition_device: CompositionGraphicsDevice,
     egl_manager: Arc<EglManager>,
@@ -42,12 +39,10 @@ pub struct Compositor {
 }
 
 struct CompositorFlutterLayer {
+    egl_manager: Arc<EglManager>,
     visual: SpriteVisual,
     composition_surface: CompositionDrawingSurface,
-    texture: ID3D11Texture2D,
-    egl_surface: egl::Surface,
-    gl_framebuffer: u32,
-    gl_texture: u32,
+    egl_surface: Option<egl::Surface>,
 }
 
 impl Compositor {
@@ -86,7 +81,6 @@ impl Compositor {
         );
 
         Ok(Compositor {
-            device,
             compositor_controller,
             composition_device,
             egl_manager,
@@ -122,29 +116,6 @@ impl Compositor {
             )
             .unwrap();
 
-        let texture_desc = D3D11_TEXTURE2D_DESC {
-            Width: size.width as u32,
-            Height: size.height as u32,
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            MipLevels: 1,
-            ArraySize: 1,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
-            CPUAccessFlags: D3D11_CPU_ACCESS_FLAG::default().0 as u32,
-            MiscFlags: D3D11_RESOURCE_MISC_SHARED.0 as u32,
-        };
-
-        let texture = unsafe {
-            let mut texture = None;
-            self.device
-                .CreateTexture2D(&texture_desc, None, Some(&mut texture))?;
-            texture.wrap_err("failed to create texture")?
-        };
-
         let surface_brush = self
             .compositor_controller
             .Compositor()?
@@ -152,58 +123,83 @@ impl Compositor {
 
         visual.SetBrush(&surface_brush)?;
 
-        let egl_surface = self
-            .egl_manager
-            .create_surface_from_d3d11_texture(&texture)?;
-
-        let mut gl_texture = 0;
-        let mut gl_framebuffer = 0;
-        unsafe {
-            gl::GenTextures(1, &mut gl_texture);
-            gl::GenFramebuffers(1, &mut gl_framebuffer);
-
-            gl::BindFramebuffer(gl::FRAMEBUFFER, gl_framebuffer);
-
-            gl::BindTexture(gl::TEXTURE_2D, gl_texture);
-            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::NEAREST as i32);
-            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::NEAREST as i32);
-            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
-            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
-
-            self.egl_manager
-                .bind_tex_image(egl_surface, egl::BACK_BUFFER)?;
-
-            gl::BindTexture(gl::TEXTURE_2D, 0);
-
-            gl::FramebufferTexture2D(
-                gl::FRAMEBUFFER,
-                gl::COLOR_ATTACHMENT0,
-                gl::TEXTURE_2D,
-                gl_texture,
-                0,
-            );
-        }
-
         let compositor_layer = Box::leak(Box::new(CompositorFlutterLayer {
+            egl_manager: self.egl_manager.clone(),
             visual,
             composition_surface,
-            texture,
-            egl_surface,
-            gl_framebuffer,
-            gl_texture,
+            egl_surface: None,
         }));
+
+        extern "C" fn make_surface_current(
+            user_data: *mut c_void,
+            gl_state_changed: *mut bool,
+        ) -> bool {
+            let layer = unsafe {
+                user_data
+                    .cast::<CompositorFlutterLayer>()
+                    .as_mut()
+                    .expect("layer must not be null")
+            };
+
+            let composition_surface_interop = layer
+                .composition_surface
+                .cast::<ICompositionDrawingSurfaceInterop>()
+                .unwrap();
+
+            let mut update_offset = POINT::default();
+            let texture: ID3D11Texture2D = unsafe {
+                composition_surface_interop
+                    .BeginDraw(None, &mut update_offset)
+                    .unwrap()
+            };
+
+            assert!(layer.egl_surface.is_none());
+
+            let egl_surface = layer.egl_surface.insert(
+                layer
+                    .egl_manager
+                    .create_surface_from_d3d11_texture(&texture, (update_offset.x, update_offset.y))
+                    .unwrap(),
+            );
+
+            layer
+                .egl_manager
+                .make_surface_current(*egl_surface)
+                .unwrap();
+
+            unsafe {
+                *gl_state_changed = false;
+            }
+
+            true
+        }
+
+        extern "C" fn clear_current_surface(user_data: *mut c_void, _: *mut bool) -> bool {
+            let layer = unsafe {
+                user_data
+                    .cast::<CompositorFlutterLayer>()
+                    .as_mut()
+                    .expect("layer must not be null")
+            };
+
+            layer.egl_manager.clear_current().unwrap();
+
+            true
+        }
 
         out.type_ = FlutterBackingStoreType_kFlutterBackingStoreTypeOpenGL;
         out.user_data = (compositor_layer as *mut CompositorFlutterLayer).cast();
         out.__bindgen_anon_1 = FlutterBackingStore__bindgen_ty_1 {
             open_gl: FlutterOpenGLBackingStore {
-                type_: FlutterOpenGLTargetType_kFlutterOpenGLTargetTypeFramebuffer,
+                type_: FlutterOpenGLTargetType_kFlutterOpenGLTargetTypeSurface,
                 __bindgen_anon_1: FlutterOpenGLBackingStore__bindgen_ty_1 {
-                    framebuffer: FlutterOpenGLFramebuffer {
-                        name: gl_framebuffer,
-                        target: /* GL_BGRA8_EXT */ 0x93a1,
-                        user_data: ptr::null_mut(),
+                    surface: FlutterOpenGLSurface {
+                        struct_size: mem::size_of::<FlutterOpenGLSurface>(),
+                        format: /* GL_BGRA8_EXT */ 0x93A1,
+                        make_current_callback: Some(make_surface_current),
+                        clear_current_callback: Some(clear_current_surface),
                         destruction_callback: None,
+                        user_data: compositor_layer as *mut _ as _,
                     },
                 },
             },
@@ -216,16 +212,12 @@ impl Compositor {
         &mut self,
         backing_store: &FlutterBackingStore,
     ) -> eyre::Result<()> {
-        let render_target =
+        let mut render_target =
             unsafe { Box::from_raw(backing_store.user_data.cast::<CompositorFlutterLayer>()) };
 
-        unsafe {
-            gl::DeleteFramebuffers(1, &render_target.gl_framebuffer);
-            gl::DeleteTextures(1, &render_target.gl_texture);
+        if let Some(egl_surface) = render_target.egl_surface.take() {
+            self.egl_manager.destroy_surface(egl_surface)?;
         }
-
-        self.egl_manager
-            .destroy_surface(render_target.egl_surface)?;
 
         drop(render_target);
 
@@ -259,25 +251,9 @@ impl Compositor {
                 .composition_surface
                 .cast::<ICompositionDrawingSurfaceInterop>()?;
 
-            unsafe {
-                let mut update_offset = Default::default();
-                let texture: ID3D11Texture2D =
-                    composition_surface_interop.BeginDraw(None, &mut update_offset)?;
-
-                let context = self.device.GetImmediateContext()?;
-
-                context.CopySubresourceRegion(
-                    &texture,
-                    0,
-                    update_offset.x as u32,
-                    update_offset.y as u32,
-                    0,
-                    &compositor_layer.texture,
-                    0,
-                    None,
-                );
-
-                composition_surface_interop.EndDraw()?;
+            if let Some(egl_surface) = compositor_layer.egl_surface.take() {
+                unsafe { composition_surface_interop.EndDraw()? };
+                compositor_layer.egl_manager.destroy_surface(egl_surface)?;
             }
         }
 

@@ -13,6 +13,9 @@ const EGL_PLATFORM_DEVICE_EXT: egl::Enum = 0x313F;
 const EGL_D3D11_DEVICE_ANGLE: egl::Int = 0x33A1;
 const EGL_D3D_TEXTURE_ANGLE: egl::Enum = 0x33A3;
 
+const EGL_TEXTURE_OFFSET_X_ANGLE: i32 = 0x3490;
+const EGL_TEXTURE_OFFSET_Y_ANGLE: i32 = 0x3491;
+
 pub struct EglManager {
     egl: egl::Instance<egl::Static>,
     angle_device: *mut c_void,
@@ -82,6 +85,16 @@ impl EglManager {
         }))
     }
 
+    pub fn make_surface_current(&self, surface: egl::Surface) -> eyre::Result<()> {
+        self.egl.make_current(
+            self.display,
+            Some(surface),
+            Some(surface),
+            Some(self.context),
+        )?;
+        Ok(())
+    }
+
     pub fn make_context_current(&self) -> eyre::Result<()> {
         self.egl
             .make_current(self.display, None, None, Some(self.context))?;
@@ -106,22 +119,24 @@ impl EglManager {
     pub fn create_surface_from_d3d11_texture(
         &self,
         texture: &ID3D11Texture2D,
+        offset: (i32, i32),
     ) -> eyre::Result<egl::Surface> {
         let buffer = unsafe { ClientBuffer::from_ptr(texture.as_raw()) };
+
         let surface = self.egl.create_pbuffer_from_client_buffer(
             self.display,
             EGL_D3D_TEXTURE_ANGLE,
             buffer,
             self.config,
             &[
-                // egl::WIDTH,
-                // size.width as i32,
-                // egl::HEIGHT,
-                // size.height as i32,
                 egl::TEXTURE_FORMAT,
                 egl::TEXTURE_RGBA,
                 egl::TEXTURE_TARGET,
                 egl::TEXTURE_2D,
+                EGL_TEXTURE_OFFSET_X_ANGLE,
+                offset.0,
+                EGL_TEXTURE_OFFSET_Y_ANGLE,
+                offset.1,
                 egl::NONE,
             ],
         )?;
