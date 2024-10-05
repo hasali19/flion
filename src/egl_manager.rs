@@ -143,11 +143,6 @@ impl EglManager {
         Ok(surface)
     }
 
-    pub fn bind_tex_image(&self, surface: egl::Surface, buffer: egl::Int) -> eyre::Result<()> {
-        self.egl.bind_tex_image(self.display, surface, buffer)?;
-        Ok(())
-    }
-
     pub fn destroy_surface(&self, surface: egl::Surface) -> eyre::Result<()> {
         self.egl.destroy_surface(self.display, surface)?;
         Ok(())
