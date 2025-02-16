@@ -11,7 +11,7 @@ use flutter_embedder::{
     FlutterOpenGLTargetType_kFlutterOpenGLTargetTypeSurface,
 };
 use khronos_egl::{self as egl};
-use windows::core::ComInterface;
+use windows::core::Interface;
 use windows::Foundation::Numerics::{Matrix4x4, Vector2, Vector3};
 use windows::Foundation::Size;
 use windows::Graphics::DirectX::{DirectXAlphaMode, DirectXPixelFormat};

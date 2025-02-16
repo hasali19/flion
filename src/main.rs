@@ -1,5 +1,3 @@
-#![feature(lint_reasons)]
-
 mod compositor;
 mod egl_manager;
 mod engine;
@@ -83,7 +81,7 @@ fn main() -> Result<()> {
         .build(&event_loop)?;
 
     let hwnd = match window.window_handle()?.as_raw() {
-        RawWindowHandle::Win32(handle) => HWND(handle.hwnd.get()),
+        RawWindowHandle::Win32(handle) => HWND(handle.hwnd.get() as _),
         _ => unreachable!(),
     };
 
@@ -114,7 +112,7 @@ fn main() -> Result<()> {
         D3D11CreateDevice(
             None,
             D3D_DRIVER_TYPE_HARDWARE,
-            None,
+            Default::default(),
             D3D11_CREATE_DEVICE_FLAG::default(),
             None,
             D3D11_SDK_VERSION,
@@ -165,7 +163,7 @@ fn main() -> Result<()> {
         scale_factor: Cell::new(window.scale_factor()),
     }));
 
-    unsafe { SetWindowSubclass(hwnd, Some(wnd_proc), 696969, window_data as *mut _ as _) };
+    unsafe { SetWindowSubclass(hwnd, Some(wnd_proc), 696969, window_data as *mut _ as _).ok()? };
 
     let mut cursor_pos = PhysicalPosition::new(0.0, 0.0);
     let mut task_executor = TaskRunnerExecutor::default();

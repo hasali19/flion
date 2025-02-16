@@ -9,7 +9,7 @@ edition = "2021"
 members = ["flutter-codec", "flutter-embedder"]
 
 [dependencies]
-bitflags = "2.5.0"
+bitflags = "2.8.0"
 color-eyre = "0.6"
 flutter-codec = { path = "flutter-codec" }
 flutter-embedder = { path = "flutter-embedder" }
@@ -24,8 +24,9 @@ tracing-subscriber = "0.3"
 winit = "0.29"
 
 [dependencies.windows]
-version = "0.52"
+version = "0.59"
 features = [
+    "Foundation_Collections",
     "Foundation_Numerics",
     "Graphics_DirectX",
     "System",
@@ -35,6 +36,7 @@ features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
+    # "Win32_Graphics_DirectComposition",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",

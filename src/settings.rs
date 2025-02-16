@@ -19,7 +19,8 @@ pub fn send_to_engine(engine: &FlutterEngine) -> eyre::Result<()> {
             None,
             Some(&mut use_light_theme as *mut _ as _),
             Some(&mut use_light_theme_size),
-        )?;
+        )
+        .ok()?;
     }
 
     let message = json!({
