@@ -12,16 +12,18 @@ use flutter_embedder::{
 };
 use khronos_egl::{self as egl};
 use windows::core::ComInterface;
-use windows::Foundation::Numerics::Vector2;
+use windows::Foundation::Numerics::{Matrix4x4, Vector2, Vector3};
 use windows::Foundation::Size;
 use windows::Graphics::DirectX::{DirectXAlphaMode, DirectXPixelFormat};
-use windows::Win32::Foundation::POINT;
+use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::System::WinRT::Composition::{
-    ICompositionDrawingSurfaceInterop, ICompositorInterop,
+    ICompositionDrawingSurfaceInterop, ICompositorDesktopInterop, ICompositorInterop,
 };
+use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::UI::Composition::Core::CompositorController;
+use windows::UI::Composition::Desktop::DesktopWindowTarget;
 use windows::UI::Composition::{
     CompositionDrawingSurface, CompositionGraphicsDevice, ContainerVisual, SpriteVisual,
 };
@@ -32,6 +34,7 @@ use crate::resize_controller::ResizeController;
 pub struct Compositor {
     compositor_controller: CompositorController,
     composition_device: CompositionGraphicsDevice,
+    _composition_target: DesktopWindowTarget,
     egl_manager: Arc<EglManager>,
     resize_controller: Arc<ResizeController>,
     root_visual: ContainerVisual,
@@ -47,12 +50,46 @@ struct CompositorFlutterLayer {
 
 impl Compositor {
     pub fn new(
+        window: HWND,
         device: ID3D11Device,
-        compositor_controller: CompositorController,
         egl_manager: Arc<EglManager>,
         resize_controller: Arc<ResizeController>,
-        root_visual: ContainerVisual,
     ) -> eyre::Result<Compositor> {
+        let compositor_controller = CompositorController::new()?;
+        let composition_target = unsafe {
+            compositor_controller
+                .Compositor()?
+                .cast::<ICompositorDesktopInterop>()?
+                .CreateDesktopWindowTarget(window, false)?
+        };
+
+        let root = compositor_controller
+            .Compositor()?
+            .CreateContainerVisual()?;
+
+        let (width, height) = unsafe {
+            let mut rect = RECT::default();
+            GetClientRect(window, &mut rect)?;
+            (rect.right - rect.left, rect.bottom - rect.top)
+        };
+
+        root.SetSize(Vector2 {
+            X: width as f32,
+            Y: height as f32,
+        })?;
+
+        root.SetTransformMatrix(Matrix4x4 {
+            M11: 1.0,
+            M22: -1.0,
+            M33: 1.0,
+            M44: 1.0,
+            ..Default::default()
+        })?;
+
+        root.SetOffset(Vector3::new(0.0, height as f32, 0.0))?;
+
+        composition_target.SetRoot(&root)?;
+
         let composition_device = unsafe {
             compositor_controller
                 .Compositor()
@@ -83,9 +120,10 @@ impl Compositor {
         Ok(Compositor {
             compositor_controller,
             composition_device,
+            _composition_target: composition_target,
             egl_manager,
             resize_controller,
-            root_visual,
+            root_visual: root,
             layers: vec![],
         })
     }
@@ -283,9 +321,21 @@ impl Compositor {
         let commit_compositor = || self.compositor_controller.Commit().unwrap();
 
         if let Some(resize) = self.resize_controller.current_resize() {
+            let (width, height) = resize.size();
+
+            self.root_visual
+                .SetSize(Vector2::new(width as f32, height as f32))
+                .unwrap();
+
+            self.root_visual
+                .SetOffset(Vector3::new(0.0, height as f32, 0.0))
+                .unwrap();
+
             // Calling DwmFlush() seems to reduce glitches when resizing.
             unsafe { DwmFlush()? };
+
             commit_compositor();
+
             resize.complete();
         } else {
             commit_compositor();

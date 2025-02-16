@@ -6,7 +6,7 @@ New-Item -ItemType Directory -ErrorAction SilentlyContinue .\build
 New-Item -ItemType Directory -ErrorAction SilentlyContinue .\target
 New-Item -ItemType Directory -ErrorAction SilentlyContinue .\target\debug
 
-$flutter_engine_commit = "6b21b796cc9474e47862ef29d77953b268cc6711"
+$flutter_engine_commit = "c5ba240021b54d4284ec93ffb3365b7c754eddcc"
 
 if (!(Test-Path ".\build\windows-x64-embedder.zip")) {
     Invoke-WebRequest "https://storage.googleapis.com/flutter_infra_release/flutter/$flutter_engine_commit/windows-x64/windows-x64-embedder.zip" -OutFile ".\build\windows-x64-embedder.zip"
@@ -20,7 +20,7 @@ if (!(Test-Path ".\target\debug\flutter_engine.dll")) {
     Copy-Item ".\build\windows-x64-embedder\flutter_engine.dll" ".\target\debug\flutter_engine.dll"
 }
 
-$angle_version = "2023-04-01-23-12"
+$angle_version = "2024-10-05-23-15"
 $extract_angle = $false
 
 if (!(Test-Path ".\build\angle-win64-$angle_version.tar.gz")) {

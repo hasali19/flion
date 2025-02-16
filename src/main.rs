@@ -24,8 +24,6 @@ use color_eyre::Result;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use resize_controller::ResizeController;
 use task_runner::Task;
-use windows::core::ComInterface;
-use windows::Foundation::Numerics::{Matrix4x4, Vector2, Vector3};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
@@ -34,14 +32,11 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWM_SYSTEMBACKDROP_TYPE,
 };
-use windows::Win32::System::WinRT::Composition::ICompositorDesktopInterop;
 use windows::Win32::System::WinRT::{
     CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_ASTA, DQTYPE_THREAD_CURRENT,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::WM_NCCALCSIZE;
-use windows::UI::Composition::ContainerVisual;
-use windows::UI::Composition::Core::CompositorController;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoopBuilder};
@@ -61,7 +56,6 @@ struct WindowData {
     engine: *const engine::FlutterEngine,
     resize_controller: Arc<ResizeController>,
     scale_factor: Cell<f64>,
-    root_visual: ContainerVisual,
 }
 
 #[derive(Debug)]
@@ -114,35 +108,6 @@ fn main() -> Result<()> {
         })?
     };
 
-    let compositor_controller = CompositorController::new()?;
-    let composition_target = unsafe {
-        compositor_controller
-            .Compositor()?
-            .cast::<ICompositorDesktopInterop>()?
-            .CreateDesktopWindowTarget(hwnd, false)?
-    };
-
-    let root = compositor_controller
-        .Compositor()?
-        .CreateContainerVisual()?;
-
-    root.SetSize(Vector2 {
-        X: width as f32,
-        Y: height as f32,
-    })?;
-
-    root.SetTransformMatrix(Matrix4x4 {
-        M11: 1.0,
-        M22: -1.0,
-        M33: 1.0,
-        M44: 1.0,
-        ..Default::default()
-    })?;
-
-    root.SetOffset(Vector3::new(0.0, height as f32, 0.0))?;
-
-    composition_target.SetRoot(&root)?;
-
     let device = unsafe {
         let mut device = Default::default();
 
@@ -169,13 +134,7 @@ fn main() -> Result<()> {
 
     let engine = Rc::new(FlutterEngine::new(FlutterEngineConfig {
         egl_manager: egl_manager.clone(),
-        compositor: Compositor::new(
-            device,
-            compositor_controller,
-            egl_manager.clone(),
-            resize_controller.clone(),
-            root.clone(),
-        )?,
+        compositor: Compositor::new(hwnd, device, egl_manager.clone(), resize_controller.clone())?,
         platform_task_handler: Box::new({
             let event_loop = event_loop.create_proxy();
             move |task| {
@@ -204,7 +163,6 @@ fn main() -> Result<()> {
         engine: &*engine,
         resize_controller,
         scale_factor: Cell::new(window.scale_factor()),
-        root_visual: root,
     }));
 
     unsafe { SetWindowSubclass(hwnd, Some(wnd_proc), 696969, window_data as *mut _ as _) };
@@ -317,26 +275,19 @@ unsafe extern "system" fn wnd_proc(
             let rect = rect.as_ref().unwrap();
 
             if rect.right > rect.left && rect.bottom > rect.top {
-                data.resize_controller.begin_and_wait(|| {
-                    let width = rect.right - rect.left;
-                    let height = rect.bottom - rect.top;
+                let width = rect.right - rect.left;
+                let height = rect.bottom - rect.top;
 
-                    data.root_visual
-                        .SetSize(Vector2::new(width as f32, height as f32))
-                        .unwrap();
-
-                    data.root_visual
-                        .SetOffset(Vector3::new(0.0, height as f32, 0.0))
-                        .unwrap();
-
-                    (*data.engine)
-                        .send_window_metrics_event(
-                            width as usize,
-                            height as usize,
-                            data.scale_factor.get(),
-                        )
-                        .unwrap();
-                });
+                data.resize_controller
+                    .begin_and_wait(width as u32, height as u32, || {
+                        (*data.engine)
+                            .send_window_metrics_event(
+                                width as usize,
+                                height as usize,
+                                data.scale_factor.get(),
+                            )
+                            .unwrap();
+                    });
             }
         }
         _ => return DefSubclassProc(window, msg, wparam, lparam),

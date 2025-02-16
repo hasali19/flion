@@ -104,6 +104,7 @@ impl FlutterEngine {
                 struct_size: mem::size_of::<FlutterCustomTaskRunners>(),
                 platform_task_runner: &platform_task_runner,
                 render_task_runner: ptr::null(),
+                ui_task_runner: ptr::null(),
                 thread_priority_setter: Some(task_runner::set_thread_priority),
             },
             compositor: &FlutterCompositor {
@@ -116,6 +117,7 @@ impl FlutterEngine {
                 avoid_backing_store_cache: false,
             },
             platform_message_callback: Some(platform_message_callback),
+            // vsync_callback: Some(vsync_callback),
             ..Default::default()
         };
 
@@ -371,6 +373,7 @@ fn create_task_runner<F: Fn(Task) + 'static>(
         user_data: runner as *const TaskRunner<F> as *mut c_void,
         runs_task_on_current_thread_callback: Some(runs_tasks_on_current_thread::<F>),
         post_task_callback: Some(post_task_callback::<F>),
+        destruction_callback: None,
     }
 }
 
@@ -517,7 +520,7 @@ pub unsafe extern "C" fn compositor_create_backing_store(
     };
 
     if let Err(e) = compositor.create_backing_store(config, backing_store) {
-        tracing::error!("{e}");
+        tracing::error!("{e:?}");
         return false;
     }
 
@@ -539,7 +542,7 @@ pub unsafe extern "C" fn compositor_collect_backing_store(
     };
 
     if let Err(e) = compositor.collect_backing_store(backing_store) {
-        tracing::error!("{e}");
+        tracing::error!("{e:?}");
         return false;
     }
 
@@ -564,7 +567,7 @@ pub unsafe extern "C" fn compositor_present_layers(
     let layers = std::slice::from_raw_parts(layers.cast::<&FlutterLayer>(), layers_count);
 
     if let Err(e) = compositor.present_layers(layers) {
-        tracing::error!("{e}");
+        tracing::error!("{e:?}");
         return false;
     };
 

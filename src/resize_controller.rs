@@ -1,54 +1,56 @@
 use std::sync::{Condvar, Mutex, MutexGuard};
 
 pub struct ResizeController {
-    is_resizing: Mutex<bool>,
+    resize: Mutex<Option<(u32, u32)>>,
     condvar: Condvar,
 }
 
 impl ResizeController {
     pub fn new() -> ResizeController {
         ResizeController {
-            is_resizing: Mutex::new(false),
+            resize: Mutex::new(None),
             condvar: Condvar::new(),
         }
     }
 
-    pub fn begin_and_wait<T>(&self, block: impl FnOnce() -> T) -> T {
-        let mut is_resizing = self.is_resizing.lock().unwrap();
+    pub fn begin_and_wait<T>(&self, width: u32, height: u32, block: impl FnOnce() -> T) -> T {
+        let mut resize = self.resize.lock().unwrap();
 
-        *is_resizing = true;
+        *resize = Some((width, height));
 
         let res = block();
 
         let _unused = self
             .condvar
-            .wait_while(is_resizing, |is_resizing| *is_resizing)
+            .wait_while(resize, |resize| resize.is_some())
             .unwrap();
 
         res
     }
 
     pub fn current_resize(&self) -> Option<ResizeState> {
-        let value = self.is_resizing.lock().unwrap();
-        if *value {
-            Some(ResizeState {
-                value,
-                condvar: &self.condvar,
-            })
-        } else {
-            None
-        }
+        let value = self.resize.lock().unwrap();
+        value.map(|size| ResizeState {
+            size,
+            value,
+            condvar: &self.condvar,
+        })
     }
 }
 
 pub struct ResizeState<'a> {
-    value: MutexGuard<'a, bool>,
+    size: (u32, u32),
+    value: MutexGuard<'a, Option<(u32, u32)>>,
     condvar: &'a Condvar,
 }
 
 impl<'a> ResizeState<'a> {
+    pub fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
     pub fn complete(mut self) {
-        *self.value = false;
+        *self.value = None;
         self.condvar.notify_all();
     }
 }
