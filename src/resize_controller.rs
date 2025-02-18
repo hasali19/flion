@@ -44,7 +44,7 @@ pub struct ResizeState<'a> {
     condvar: &'a Condvar,
 }
 
-impl<'a> ResizeState<'a> {
+impl ResizeState<'_> {
     pub fn size(&self) -> (u32, u32) {
         self.size
     }

@@ -1,3 +1,5 @@
+mod renderer;
+
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::{mem, ptr};
@@ -11,12 +13,15 @@ use flutter_embedder::{
     FlutterOpenGLTargetType_kFlutterOpenGLTargetTypeSurface,
 };
 use khronos_egl::{self as egl};
+use renderer::Renderer;
 use windows::core::Interface;
-use windows::Foundation::Numerics::{Matrix4x4, Vector2, Vector3};
+use windows::Foundation::Numerics::Vector2;
 use windows::Foundation::Size;
 use windows::Graphics::DirectX::{DirectXAlphaMode, DirectXPixelFormat};
-use windows::Win32::Foundation::{HWND, POINT, RECT};
-use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
+use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Direct3D11::{
+    ID3D11Device, ID3D11ShaderResourceView, ID3D11Texture2D,
+};
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::System::WinRT::Composition::{
     ICompositionDrawingSurfaceInterop, ICompositorDesktopInterop, ICompositorInterop,
@@ -39,13 +44,15 @@ pub struct Compositor {
     resize_controller: Arc<ResizeController>,
     root_visual: ContainerVisual,
     layers: Vec<*const FlutterLayer>,
+    renderer: Renderer,
 }
 
 struct CompositorFlutterLayer {
     egl_manager: Arc<EglManager>,
     visual: SpriteVisual,
     composition_surface: CompositionDrawingSurface,
-    egl_surface: Option<egl::Surface>,
+    texture_resource_view: ID3D11ShaderResourceView,
+    egl_surface: egl::Surface,
 }
 
 impl Compositor {
@@ -77,16 +84,6 @@ impl Compositor {
             X: width as f32,
             Y: height as f32,
         })?;
-
-        root.SetTransformMatrix(Matrix4x4 {
-            M11: 1.0,
-            M22: -1.0,
-            M33: 1.0,
-            M44: 1.0,
-            ..Default::default()
-        })?;
-
-        root.SetOffset(Vector3::new(0.0, height as f32, 0.0))?;
 
         composition_target.SetRoot(&root)?;
 
@@ -125,6 +122,7 @@ impl Compositor {
             resize_controller,
             root_visual: root,
             layers: vec![],
+            renderer: Renderer::new(device)?,
         })
     }
 
@@ -161,11 +159,21 @@ impl Compositor {
 
         visual.SetBrush(&surface_brush)?;
 
+        let (render_texture, render_resource_view) = self
+            .renderer
+            .create_render_texture(size.width as u32, size.height as u32)?;
+
+        let egl_surface = self
+            .egl_manager
+            .create_surface_from_d3d11_texture(&render_texture, (0, 0))
+            .unwrap();
+
         let compositor_layer = Box::leak(Box::new(CompositorFlutterLayer {
             egl_manager: self.egl_manager.clone(),
             visual,
             composition_surface,
-            egl_surface: None,
+            texture_resource_view: render_resource_view,
+            egl_surface,
         }));
 
         extern "C" fn make_surface_current(
@@ -179,30 +187,9 @@ impl Compositor {
                     .expect("layer must not be null")
             };
 
-            let composition_surface_interop = layer
-                .composition_surface
-                .cast::<ICompositionDrawingSurfaceInterop>()
-                .unwrap();
-
-            let mut update_offset = POINT::default();
-            let texture: ID3D11Texture2D = unsafe {
-                composition_surface_interop
-                    .BeginDraw(None, &mut update_offset)
-                    .unwrap()
-            };
-
-            assert!(layer.egl_surface.is_none());
-
-            let egl_surface = layer.egl_surface.insert(
-                layer
-                    .egl_manager
-                    .create_surface_from_d3d11_texture(&texture, (update_offset.x, update_offset.y))
-                    .unwrap(),
-            );
-
             layer
                 .egl_manager
-                .make_surface_current(*egl_surface)
+                .make_surface_current(layer.egl_surface)
                 .unwrap();
 
             unsafe {
@@ -250,12 +237,11 @@ impl Compositor {
         &mut self,
         backing_store: &FlutterBackingStore,
     ) -> eyre::Result<()> {
-        let mut render_target =
+        let render_target =
             unsafe { Box::from_raw(backing_store.user_data.cast::<CompositorFlutterLayer>()) };
 
-        if let Some(egl_surface) = render_target.egl_surface.take() {
-            self.egl_manager.destroy_surface(egl_surface)?;
-        }
+        self.egl_manager
+            .destroy_surface(render_target.egl_surface)?;
 
         drop(render_target);
 
@@ -289,10 +275,19 @@ impl Compositor {
                 .composition_surface
                 .cast::<ICompositionDrawingSurfaceInterop>()?;
 
-            if let Some(egl_surface) = compositor_layer.egl_surface.take() {
-                unsafe { composition_surface_interop.EndDraw()? };
-                compositor_layer.egl_manager.destroy_surface(egl_surface)?;
-            }
+            let mut update_offset = Default::default();
+
+            let texture: ID3D11Texture2D =
+                unsafe { composition_surface_interop.BeginDraw(None, &mut update_offset) }?;
+
+            self.renderer.draw_flipped_texture(
+                &compositor_layer.texture_resource_view,
+                &texture,
+                (layer.size.width as u32, layer.size.height as u32),
+                (update_offset.x, update_offset.y),
+            )?;
+
+            unsafe { composition_surface_interop.EndDraw()? };
         }
 
         // Flutter layers have changed. We need to re-insert all layer visuals into the root visual in
@@ -325,10 +320,6 @@ impl Compositor {
 
             self.root_visual
                 .SetSize(Vector2::new(width as f32, height as f32))
-                .unwrap();
-
-            self.root_visual
-                .SetOffset(Vector3::new(0.0, height as f32, 0.0))
                 .unwrap();
 
             // Calling DwmFlush() seems to reduce glitches when resizing.
