@@ -18,33 +18,26 @@ use windows::core::Interface;
 use windows::Foundation::Numerics::Vector2;
 use windows::Foundation::Size;
 use windows::Graphics::DirectX::{DirectXAlphaMode, DirectXPixelFormat};
-use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11ShaderResourceView, ID3D11Texture2D,
 };
-use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::System::WinRT::Composition::{
-    ICompositionDrawingSurfaceInterop, ICompositorDesktopInterop, ICompositorInterop,
+    ICompositionDrawingSurfaceInterop, ICompositorInterop,
 };
-use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
-use windows::UI::Composition::Core::CompositorController;
-use windows::UI::Composition::Desktop::DesktopWindowTarget;
 use windows::UI::Composition::{
-    CompositionDrawingSurface, CompositionGraphicsDevice, ContainerVisual, SpriteVisual,
+    CompositionDrawingSurface, CompositionGraphicsDevice, Compositor, ContainerVisual, SpriteVisual,
 };
 
 use crate::egl_manager::EglManager;
-use crate::resize_controller::ResizeController;
 
-pub struct Compositor {
-    compositor_controller: CompositorController,
+pub struct FlutterCompositor {
+    compositor: Compositor,
     composition_device: CompositionGraphicsDevice,
-    _composition_target: DesktopWindowTarget,
-    egl_manager: Arc<EglManager>,
-    resize_controller: Arc<ResizeController>,
     root_visual: ContainerVisual,
+    egl_manager: Arc<EglManager>,
     layers: Vec<*const FlutterLayer>,
     renderer: Renderer,
+    present_callback: Box<dyn FnMut() -> eyre::Result<()>>,
 }
 
 struct CompositorFlutterLayer {
@@ -55,42 +48,17 @@ struct CompositorFlutterLayer {
     egl_surface: egl::Surface,
 }
 
-impl Compositor {
+impl FlutterCompositor {
     pub fn new(
-        window: HWND,
+        visual: ContainerVisual,
         device: ID3D11Device,
         egl_manager: Arc<EglManager>,
-        resize_controller: Arc<ResizeController>,
-    ) -> eyre::Result<Compositor> {
-        let compositor_controller = CompositorController::new()?;
-        let composition_target = unsafe {
-            compositor_controller
-                .Compositor()?
-                .cast::<ICompositorDesktopInterop>()?
-                .CreateDesktopWindowTarget(window, false)?
-        };
-
-        let root = compositor_controller
-            .Compositor()?
-            .CreateContainerVisual()?;
-
-        let (width, height) = unsafe {
-            let mut rect = RECT::default();
-            GetClientRect(window, &mut rect)?;
-            (rect.right - rect.left, rect.bottom - rect.top)
-        };
-
-        root.SetSize(Vector2 {
-            X: width as f32,
-            Y: height as f32,
-        })?;
-
-        composition_target.SetRoot(&root)?;
+        present_callback: Box<dyn FnMut() -> eyre::Result<()>>,
+    ) -> eyre::Result<FlutterCompositor> {
+        let compositor = visual.Compositor()?;
 
         let composition_device = unsafe {
-            compositor_controller
-                .Compositor()
-                .unwrap()
+            compositor
                 .cast::<ICompositorInterop>()?
                 .CreateGraphicsDevice(&device)?
         };
@@ -114,16 +82,19 @@ impl Compositor {
             DeleteFramebuffers
         );
 
-        Ok(Compositor {
-            compositor_controller,
+        Ok(FlutterCompositor {
+            compositor,
             composition_device,
-            _composition_target: composition_target,
             egl_manager,
-            resize_controller,
-            root_visual: root,
+            root_visual: visual,
             layers: vec![],
             renderer: Renderer::new(device)?,
+            present_callback,
         })
+    }
+
+    pub fn root_visual(&self) -> &ContainerVisual {
+        &self.root_visual
     }
 
     pub fn create_backing_store(
@@ -133,10 +104,7 @@ impl Compositor {
     ) -> eyre::Result<()> {
         let size = config.size;
 
-        let visual = self
-            .compositor_controller
-            .Compositor()?
-            .CreateSpriteVisual()?;
+        let visual = self.compositor.CreateSpriteVisual()?;
 
         visual.SetSize(Vector2::new(size.width as f32, size.height as f32))?;
 
@@ -153,8 +121,7 @@ impl Compositor {
             .unwrap();
 
         let surface_brush = self
-            .compositor_controller
-            .Compositor()?
+            .compositor
             .CreateSurfaceBrushWithSurface(&composition_surface)?;
 
         visual.SetBrush(&surface_brush)?;
@@ -313,25 +280,6 @@ impl Compositor {
             }
         }
 
-        let commit_compositor = || self.compositor_controller.Commit().unwrap();
-
-        if let Some(resize) = self.resize_controller.current_resize() {
-            let (width, height) = resize.size();
-
-            self.root_visual
-                .SetSize(Vector2::new(width as f32, height as f32))
-                .unwrap();
-
-            // Calling DwmFlush() seems to reduce glitches when resizing.
-            unsafe { DwmFlush()? };
-
-            commit_compositor();
-
-            resize.complete();
-        } else {
-            commit_compositor();
-        }
-
-        Ok(())
+        (self.present_callback)()
     }
 }

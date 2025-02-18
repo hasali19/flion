@@ -22,26 +22,31 @@ use color_eyre::Result;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use resize_controller::ResizeController;
 use task_runner::Task;
+use windows::core::Interface;
+use windows::Foundation::Numerics::Vector2;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION,
 };
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWM_SYSTEMBACKDROP_TYPE,
+    DwmFlush, DwmSetWindowAttribute, DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
+    DWM_SYSTEMBACKDROP_TYPE,
 };
+use windows::Win32::System::WinRT::Composition::ICompositorDesktopInterop;
 use windows::Win32::System::WinRT::{
     CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_ASTA, DQTYPE_THREAD_CURRENT,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::WM_NCCALCSIZE;
+use windows::UI::Composition::Core::CompositorController;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoopBuilder};
 use winit::platform::windows::WindowBuilderExtWindows;
 use winit::window::WindowBuilder;
 
-use crate::compositor::Compositor;
+use crate::compositor::FlutterCompositor;
 use crate::egl_manager::EglManager;
 use crate::engine::{FlutterEngine, FlutterEngineConfig, PointerPhase};
 use crate::error_utils::ResultExt;
@@ -124,15 +129,60 @@ fn main() -> Result<()> {
         device.ok_or_eyre("failed to create D3D11 device")?
     };
 
+    let compositor_controller = CompositorController::new()?;
+    let composition_target = unsafe {
+        compositor_controller
+            .Compositor()?
+            .cast::<ICompositorDesktopInterop>()?
+            .CreateDesktopWindowTarget(hwnd, false)?
+    };
+
     let egl_manager = EglManager::create(&device)?;
     let resize_controller = Arc::new(ResizeController::new());
 
     let window = Rc::new(window);
     let text_input = Rc::new(RefCell::new(TextInputState::new()));
 
+    let root_visual = compositor_controller
+        .Compositor()?
+        .CreateContainerVisual()?;
+
+    let compositor = FlutterCompositor::new(
+        root_visual.clone(),
+        device,
+        egl_manager.clone(),
+        Box::new({
+            let resize_controller = resize_controller.clone();
+            move || {
+                let commit_compositor = || compositor_controller.Commit();
+
+                if let Some(resize) = resize_controller.current_resize() {
+                    let (width, height) = resize.size();
+
+                    root_visual
+                        .SetSize(Vector2::new(width as f32, height as f32))
+                        .unwrap();
+
+                    // Calling DwmFlush() seems to reduce glitches when resizing.
+                    unsafe { DwmFlush()? };
+
+                    commit_compositor()?;
+
+                    resize.complete();
+                } else {
+                    commit_compositor()?;
+                }
+
+                Ok(())
+            }
+        }),
+    )?;
+
+    composition_target.SetRoot(compositor.root_visual())?;
+
     let engine = Rc::new(FlutterEngine::new(FlutterEngineConfig {
         egl_manager: egl_manager.clone(),
-        compositor: Compositor::new(hwnd, device, egl_manager.clone(), resize_controller.clone())?,
+        compositor,
         platform_task_handler: Box::new({
             let event_loop = event_loop.create_proxy();
             move |task| {

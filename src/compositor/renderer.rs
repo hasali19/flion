@@ -30,6 +30,24 @@ pub struct Renderer {
     sampler_state: ID3D11SamplerState,
 }
 
+#[repr(C)]
+struct Vertex(f32, f32, f32, f32, f32);
+
+const _: () = {
+    assert!(mem::size_of::<Vertex>() == 5 * 4);
+};
+
+static VERTEX_DATA: [Vertex; 6] = [
+    // Top left triangle
+    Vertex(-1.0, 1.0, 0.0, 0.0, 0.0),
+    Vertex(1.0, 1.0, 0.0, 1.0, 0.0),
+    Vertex(-1.0, -1.0, 0.0, 0.0, 1.0),
+    // Bottom right triangle
+    Vertex(1.0, 1.0, 0.0, 1.0, 0.0),
+    Vertex(1.0, -1.0, 0.0, 1.0, 1.0),
+    Vertex(-1.0, -1.0, 0.0, 0.0, 1.0),
+];
+
 impl Renderer {
     pub fn new(device: ID3D11Device) -> eyre::Result<Renderer> {
         let shader_source = include_bytes!("shaders.hlsl");
@@ -121,30 +139,16 @@ impl Renderer {
             input_layout.unwrap()
         };
 
-        #[repr(C)]
-        struct Vertex(f32, f32, f32, f32, f32);
-
-        let vertex_data = [
-            // Top left triangle
-            Vertex(-1.0, 1.0, 0.0, 0.0, 0.0),
-            Vertex(1.0, 1.0, 0.0, 1.0, 0.0),
-            Vertex(-1.0, -1.0, 0.0, 0.0, 1.0),
-            // Bottom right triangle
-            Vertex(1.0, 1.0, 0.0, 1.0, 0.0),
-            Vertex(1.0, -1.0, 0.0, 1.0, 1.0),
-            Vertex(-1.0, -1.0, 0.0, 0.0, 1.0),
-        ];
-
         let vertex_buffer = unsafe {
             let desc = D3D11_BUFFER_DESC {
-                ByteWidth: mem::size_of_val(&vertex_data) as u32,
+                ByteWidth: mem::size_of_val(&VERTEX_DATA) as u32,
                 Usage: D3D11_USAGE_IMMUTABLE,
                 BindFlags: D3D11_BIND_VERTEX_BUFFER.0 as u32,
                 ..Default::default()
             };
 
             let sr_data = D3D11_SUBRESOURCE_DATA {
-                pSysMem: vertex_data.as_ptr().cast(),
+                pSysMem: VERTEX_DATA.as_ptr().cast(),
                 ..Default::default()
             };
 
@@ -269,7 +273,7 @@ impl Renderer {
                 0,
                 1,
                 Some(&Some(self.vertex_buffer.clone())),
-                Some(&(5 * mem::size_of::<f32>() as u32)),
+                Some(&(mem::size_of::<Vertex>() as u32)),
                 Some(&0),
             );
 
@@ -282,7 +286,7 @@ impl Renderer {
             self.context
                 .PSSetSamplers(0, Some(&[Some(self.sampler_state.clone())]));
 
-            self.context.Draw(6, 0);
+            self.context.Draw(VERTEX_DATA.len() as u32, 0);
         }
 
         Ok(())

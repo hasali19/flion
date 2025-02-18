@@ -5,7 +5,7 @@ use std::{mem, ptr};
 
 use color_eyre::eyre::{self, bail};
 use flutter_embedder::{
-    FlutterBackingStore, FlutterBackingStoreConfig, FlutterCompositor, FlutterCustomTaskRunners,
+    FlutterBackingStore, FlutterBackingStoreConfig, FlutterCustomTaskRunners,
     FlutterEngineGetCurrentTime, FlutterEngineInitialize, FlutterEngineResult_kSuccess,
     FlutterEngineRunInitialized, FlutterEngineRunTask, FlutterEngineSendKeyEvent,
     FlutterEngineSendPlatformMessage, FlutterEngineSendPlatformMessageResponse,
@@ -23,13 +23,13 @@ use flutter_embedder::{
 };
 use smol_str::SmolStr;
 
-use crate::compositor::Compositor;
+use crate::compositor::FlutterCompositor;
 use crate::egl_manager::EglManager;
 use crate::task_runner::{self, Task, TaskRunner};
 
 pub struct FlutterEngineConfig<'a> {
     pub egl_manager: Arc<EglManager>,
-    pub compositor: Compositor,
+    pub compositor: FlutterCompositor,
     pub platform_task_handler: Box<dyn Fn(Task)>,
     pub platform_message_handlers: Vec<(&'a str, Box<dyn BinaryMessageHandler + 'static>)>,
 }
@@ -107,13 +107,13 @@ impl FlutterEngine {
                 ui_task_runner: ptr::null(),
                 thread_priority_setter: Some(task_runner::set_thread_priority),
             },
-            compositor: &FlutterCompositor {
+            compositor: &flutter_embedder::FlutterCompositor {
                 struct_size: mem::size_of::<FlutterCompositor>(),
                 create_backing_store_callback: Some(compositor_create_backing_store),
                 collect_backing_store_callback: Some(compositor_collect_backing_store),
                 present_layers_callback: Some(compositor_present_layers),
                 present_view_callback: None,
-                user_data: Box::leak(Box::new(config.compositor)) as *mut Compositor as *mut c_void,
+                user_data: &raw mut *Box::leak(Box::new(config.compositor)) as *mut c_void,
                 avoid_backing_store_cache: false,
             },
             platform_message_callback: Some(platform_message_callback),
@@ -504,7 +504,7 @@ pub unsafe extern "C" fn compositor_create_backing_store(
     out: *mut FlutterBackingStore,
     user_data: *mut c_void,
 ) -> bool {
-    let Some(compositor) = user_data.cast::<Compositor>().as_mut() else {
+    let Some(compositor) = user_data.cast::<FlutterCompositor>().as_mut() else {
         tracing::error!("user_data is null");
         return false;
     };
@@ -531,7 +531,7 @@ pub unsafe extern "C" fn compositor_collect_backing_store(
     backing_store: *const FlutterBackingStore,
     user_data: *mut c_void,
 ) -> bool {
-    let Some(compositor) = user_data.cast::<Compositor>().as_mut() else {
+    let Some(compositor) = user_data.cast::<FlutterCompositor>().as_mut() else {
         tracing::error!("user_data is null");
         return false;
     };
@@ -554,7 +554,7 @@ pub unsafe extern "C" fn compositor_present_layers(
     layers_count: usize,
     user_data: *mut c_void,
 ) -> bool {
-    let Some(compositor) = user_data.cast::<Compositor>().as_mut() else {
+    let Some(compositor) = user_data.cast::<FlutterCompositor>().as_mut() else {
         tracing::error!("user_data is null");
         return false;
     };
