@@ -1,0 +1,16 @@
+[package]
+name = "fluyt-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cargo_metadata = "0.19.1"
+clap = { version = "4.5.30", features = ["derive"] }
+color-eyre = "0.6.3"
+duct = "0.13.7"
+eyre = "0.6.12"
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
+ureq = "3.0.6"
+which = "7.0.2"
+zip = "2.2.2"

@@ -1,0 +1,2 @@
+[alias]
+fluyt = "run --package fluyt-cli"

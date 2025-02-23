@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [workspace]
-members = ["example", "flutter-codec", "flutter-embedder"]
+members = ["cli", "example", "flutter-codec", "flutter-embedder"]
 
 [dependencies]
 bitflags = "2.8.0"
