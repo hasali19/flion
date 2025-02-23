@@ -38,6 +38,7 @@ use windows::Win32::System::WinRT::{
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::WM_NCCALCSIZE;
+use windows::UI::Composition::ContainerVisual;
 use windows::UI::Composition::Core::CompositorController;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Event, WindowEvent};
@@ -134,38 +135,23 @@ pub fn run(assets_path: &str) -> eyre::Result<()> {
         .Compositor()?
         .CreateContainerVisual()?;
 
+    root_visual.SetSize(Vector2 {
+        X: width as f32,
+        Y: height as f32,
+    })?;
+
+    composition_target.SetRoot(&root_visual)?;
+
     let compositor = FlutterCompositor::new(
         root_visual.clone(),
         device,
         egl_manager.clone(),
-        Box::new({
-            let resize_controller = resize_controller.clone();
-            move || {
-                let commit_compositor = || compositor_controller.Commit();
-
-                if let Some(resize) = resize_controller.current_resize() {
-                    let (width, height) = resize.size();
-
-                    root_visual
-                        .SetSize(Vector2::new(width as f32, height as f32))
-                        .unwrap();
-
-                    // Calling DwmFlush() seems to reduce glitches when resizing.
-                    unsafe { DwmFlush()? };
-
-                    commit_compositor()?;
-
-                    resize.complete();
-                } else {
-                    commit_compositor()?;
-                }
-
-                Ok(())
-            }
+        Box::new(CompositionHandler {
+            compositor_controller,
+            resize_controller: resize_controller.clone(),
+            root_visual,
         }),
     )?;
-
-    composition_target.SetRoot(compositor.root_visual())?;
 
     let engine = Rc::new(FlutterEngine::new(FlutterEngineConfig {
         assets_path,
@@ -330,4 +316,44 @@ unsafe extern "system" fn wnd_proc(
     }
 
     LRESULT(0)
+}
+
+struct CompositionHandler {
+    compositor_controller: CompositorController,
+    resize_controller: Arc<ResizeController>,
+    root_visual: ContainerVisual,
+}
+
+impl compositor::CompositionHandler for CompositionHandler {
+    fn get_surface_size(&mut self) -> eyre::Result<(u32, u32)> {
+        if let Some(resize) = self.resize_controller.current_resize() {
+            Ok(resize.size())
+        } else {
+            let size = self.root_visual.Size()?;
+            Ok((size.X as u32, size.Y as u32))
+        }
+    }
+
+    fn present(&mut self) -> eyre::Result<()> {
+        let commit_compositor = || self.compositor_controller.Commit();
+
+        if let Some(resize) = self.resize_controller.current_resize() {
+            let (width, height) = resize.size();
+
+            self.root_visual
+                .SetSize(Vector2::new(width as f32, height as f32))
+                .unwrap();
+
+            // Calling DwmFlush() seems to reduce glitches when resizing.
+            unsafe { DwmFlush()? };
+
+            commit_compositor()?;
+
+            resize.complete();
+        } else {
+            commit_compositor()?;
+        }
+
+        Ok(())
+    }
 }

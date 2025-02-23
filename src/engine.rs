@@ -19,7 +19,7 @@ use flutter_embedder::{
     FlutterPointerEvent, FlutterPointerPhase, FlutterPointerPhase_kAdd, FlutterPointerPhase_kDown,
     FlutterPointerPhase_kHover, FlutterPointerPhase_kMove, FlutterPointerPhase_kRemove,
     FlutterPointerPhase_kUp, FlutterProjectArgs, FlutterRendererConfig,
-    FlutterRendererType_kOpenGL, FlutterTask, FlutterTaskRunnerDescription,
+    FlutterRendererType_kOpenGL, FlutterTask, FlutterTaskRunnerDescription, FlutterTransformation,
     FlutterWindowMetricsEvent, FLUTTER_ENGINE_VERSION,
 };
 use smol_str::SmolStr;
@@ -43,6 +43,7 @@ pub struct FlutterEngine {
 struct FlutterEngineInner {
     handle: flutter_embedder::FlutterEngine,
     egl_manager: Arc<EglManager>,
+    compositor: *mut FlutterCompositor,
     platform_message_handlers: BTreeMap<String, Box<dyn BinaryMessageHandler + 'static>>,
 }
 
@@ -93,12 +94,15 @@ impl FlutterEngine {
                     fbo_callback: Some(gl_fbo_callback),
                     fbo_reset_after_present: true,
                     gl_proc_resolver: Some(gl_get_proc_address),
+                    surface_transformation: Some(gl_get_surface_transformation),
                     ..Default::default()
                 },
             },
         };
 
         let assets_path = CString::from_str(config.assets_path)?;
+
+        let compositor = &raw mut *Box::leak(Box::new(config.compositor));
 
         let project_args = FlutterProjectArgs {
             struct_size: mem::size_of::<FlutterProjectArgs>(),
@@ -117,7 +121,7 @@ impl FlutterEngine {
                 collect_backing_store_callback: Some(compositor_collect_backing_store),
                 present_layers_callback: Some(compositor_present_layers),
                 present_view_callback: None,
-                user_data: &raw mut *Box::leak(Box::new(config.compositor)) as *mut c_void,
+                user_data: compositor.cast(),
                 avoid_backing_store_cache: false,
             },
             platform_message_callback: Some(platform_message_callback),
@@ -134,6 +138,7 @@ impl FlutterEngine {
                     .into_iter()
                     .map(|(channel, handler)| (channel.to_owned(), handler)),
             ),
+            compositor,
         }));
 
         let engine_handle = unsafe {
@@ -501,6 +506,25 @@ unsafe extern "C" fn gl_get_proc_address(
         .egl_manager
         .get_proc_address(name.to_str().unwrap())
         .unwrap_or(ptr::null_mut())
+}
+
+unsafe extern "C" fn gl_get_surface_transformation(
+    user_data: *mut c_void,
+) -> FlutterTransformation {
+    let engine = user_data.cast::<FlutterEngineInner>().as_ref().unwrap();
+    let compositor = engine.compositor.as_mut().unwrap();
+    match compositor.get_surface_transformation() {
+        Ok(transformation) => transformation,
+        Err(e) => {
+            tracing::error!("failed to get surface transformation: {e:?}");
+            FlutterTransformation {
+                scaleX: 1.0,
+                scaleY: 1.0,
+                pers2: 1.0,
+                ..Default::default()
+            }
+        }
+    }
 }
 
 pub unsafe extern "C" fn compositor_create_backing_store(
