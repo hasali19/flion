@@ -7,9 +7,11 @@ mod keymap;
 mod mouse_cursor;
 mod resize_controller;
 mod settings;
-mod standard_method_channel;
 mod task_runner;
 mod text_input;
+
+pub mod codec;
+pub mod standard_method_channel;
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
@@ -55,6 +57,8 @@ use crate::mouse_cursor::MouseCursorHandler;
 use crate::task_runner::TaskRunnerExecutor;
 use crate::text_input::{TextInputHandler, TextInputState};
 
+pub use crate::engine::{BinaryMessageHandler, BinaryMessageReply};
+
 struct WindowData {
     engine: *const engine::FlutterEngine,
     resize_controller: Arc<ResizeController>,
@@ -66,106 +70,123 @@ enum PlatformEvent {
     PostFlutterTask(Task),
 }
 
-pub fn run(assets_path: &str) -> eyre::Result<()> {
-    let event_loop = EventLoopBuilder::<PlatformEvent>::with_user_event().build()?;
-    let window = WindowBuilder::new()
-        .with_inner_size(LogicalSize::new(800, 600))
-        .with_no_redirection_bitmap(true)
-        .build(&event_loop)?;
+pub struct FluytEngine<'a> {
+    assets_path: &'a str,
+    plugin_initializers: &'a [unsafe extern "C" fn(*mut c_void)],
+    platform_message_handlers: Vec<(&'a str, Box<dyn BinaryMessageHandler>)>,
+}
 
-    let hwnd = match window.window_handle()?.as_raw() {
-        RawWindowHandle::Win32(handle) => HWND(handle.hwnd.get() as _),
-        _ => unreachable!(),
-    };
+impl<'a> FluytEngine<'a> {
+    pub fn new(assets_path: &str) -> FluytEngine {
+        FluytEngine {
+            assets_path,
+            plugin_initializers: &[],
+            platform_message_handlers: vec![],
+        }
+    }
 
-    unsafe {
-        DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_SYSTEMBACKDROP_TYPE,
-            &DWMSBT_MAINWINDOW as *const DWM_SYSTEMBACKDROP_TYPE as *const c_void,
-            mem::size_of::<DWM_SYSTEMBACKDROP_TYPE>() as u32,
-        )
-    }?;
+    pub fn with_plugins(mut self, plugins: &'a [unsafe extern "C" fn(*mut c_void)]) -> Self {
+        self.plugin_initializers = plugins;
+        self
+    }
 
-    let PhysicalSize { width, height } = window.inner_size();
+    pub fn with_platform_message_handler(
+        mut self,
+        name: &'a str,
+        handler: Box<dyn BinaryMessageHandler>,
+    ) -> Self {
+        self.platform_message_handlers.push((name, handler));
+        self
+    }
 
-    tracing::info!(width, height);
+    pub fn run(self) -> eyre::Result<()> {
+        let event_loop = EventLoopBuilder::<PlatformEvent>::with_user_event().build()?;
+        let window = WindowBuilder::new()
+            .with_inner_size(LogicalSize::new(800, 600))
+            .with_no_redirection_bitmap(true)
+            .build(&event_loop)?;
 
-    let _dispatcher_queue_controller = unsafe {
-        CreateDispatcherQueueController(DispatcherQueueOptions {
-            dwSize: mem::size_of::<DispatcherQueueOptions>() as u32,
-            threadType: DQTYPE_THREAD_CURRENT,
-            apartmentType: DQTAT_COM_ASTA,
-        })?
-    };
+        let hwnd = match window.window_handle()?.as_raw() {
+            RawWindowHandle::Win32(handle) => HWND(handle.hwnd.get() as _),
+            _ => unreachable!(),
+        };
 
-    let device = unsafe {
-        let mut device = Default::default();
+        unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_SYSTEMBACKDROP_TYPE,
+                &DWMSBT_MAINWINDOW as *const DWM_SYSTEMBACKDROP_TYPE as *const c_void,
+                mem::size_of::<DWM_SYSTEMBACKDROP_TYPE>() as u32,
+            )
+        }?;
 
-        D3D11CreateDevice(
-            None,
-            D3D_DRIVER_TYPE_HARDWARE,
-            Default::default(),
-            D3D11_CREATE_DEVICE_FLAG::default(),
-            None,
-            D3D11_SDK_VERSION,
-            Some(&mut device),
-            None,
-            None,
+        let PhysicalSize { width, height } = window.inner_size();
+
+        tracing::info!(width, height);
+
+        let _dispatcher_queue_controller = unsafe {
+            CreateDispatcherQueueController(DispatcherQueueOptions {
+                dwSize: mem::size_of::<DispatcherQueueOptions>() as u32,
+                threadType: DQTYPE_THREAD_CURRENT,
+                apartmentType: DQTAT_COM_ASTA,
+            })?
+        };
+
+        let device = unsafe {
+            let mut device = Default::default();
+
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                Default::default(),
+                D3D11_CREATE_DEVICE_FLAG::default(),
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                None,
+            )?;
+
+            device.ok_or_eyre("failed to create D3D11 device")?
+        };
+
+        let compositor_controller = CompositorController::new()?;
+        let composition_target = unsafe {
+            compositor_controller
+                .Compositor()?
+                .cast::<ICompositorDesktopInterop>()?
+                .CreateDesktopWindowTarget(hwnd, false)?
+        };
+
+        let egl_manager = EglManager::create(&device)?;
+        let resize_controller = Arc::new(ResizeController::new());
+
+        let window = Rc::new(window);
+        let text_input = Rc::new(RefCell::new(TextInputState::new()));
+
+        let root_visual = compositor_controller
+            .Compositor()?
+            .CreateContainerVisual()?;
+
+        root_visual.SetSize(Vector2 {
+            X: width as f32,
+            Y: height as f32,
+        })?;
+
+        composition_target.SetRoot(&root_visual)?;
+
+        let compositor = FlutterCompositor::new(
+            root_visual.clone(),
+            device,
+            egl_manager.clone(),
+            Box::new(CompositionHandler {
+                compositor_controller,
+                resize_controller: resize_controller.clone(),
+                root_visual,
+            }),
         )?;
 
-        device.ok_or_eyre("failed to create D3D11 device")?
-    };
-
-    let compositor_controller = CompositorController::new()?;
-    let composition_target = unsafe {
-        compositor_controller
-            .Compositor()?
-            .cast::<ICompositorDesktopInterop>()?
-            .CreateDesktopWindowTarget(hwnd, false)?
-    };
-
-    let egl_manager = EglManager::create(&device)?;
-    let resize_controller = Arc::new(ResizeController::new());
-
-    let window = Rc::new(window);
-    let text_input = Rc::new(RefCell::new(TextInputState::new()));
-
-    let root_visual = compositor_controller
-        .Compositor()?
-        .CreateContainerVisual()?;
-
-    root_visual.SetSize(Vector2 {
-        X: width as f32,
-        Y: height as f32,
-    })?;
-
-    composition_target.SetRoot(&root_visual)?;
-
-    let compositor = FlutterCompositor::new(
-        root_visual.clone(),
-        device,
-        egl_manager.clone(),
-        Box::new(CompositionHandler {
-            compositor_controller,
-            resize_controller: resize_controller.clone(),
-            root_visual,
-        }),
-    )?;
-
-    let engine = Rc::new(FlutterEngine::new(FlutterEngineConfig {
-        assets_path,
-        egl_manager: egl_manager.clone(),
-        compositor,
-        platform_task_handler: Box::new({
-            let event_loop = event_loop.create_proxy();
-            move |task| {
-                if let Err(e) = event_loop.send_event(PlatformEvent::PostFlutterTask(task)) {
-                    tracing::error!("{e}");
-                }
-            }
-        }),
-        platform_message_handlers: vec![
+        let mut platform_message_handlers: Vec<(&str, Box<dyn BinaryMessageHandler>)> = vec![
             (
                 "flutter/mousecursor",
                 Box::new(MouseCursorHandler::new(window.clone())),
@@ -174,110 +195,129 @@ pub fn run(assets_path: &str) -> eyre::Result<()> {
                 "flutter/textinput",
                 Box::new(TextInputHandler::new(text_input.clone())),
             ),
-        ],
-    })?);
+        ];
 
-    engine.send_window_metrics_event(width as usize, height as usize, window.scale_factor())?;
+        platform_message_handlers.extend(self.platform_message_handlers);
 
-    settings::send_to_engine(&engine)?;
-
-    let window_data = Box::leak(Box::new(WindowData {
-        engine: &*engine,
-        resize_controller,
-        scale_factor: Cell::new(window.scale_factor()),
-    }));
-
-    unsafe { SetWindowSubclass(hwnd, Some(wnd_proc), 696969, window_data as *mut _ as _).ok()? };
-
-    let mut cursor_pos = PhysicalPosition::new(0.0, 0.0);
-    let mut task_executor = TaskRunnerExecutor::default();
-    let mut keyboard = Keyboard::new(engine.clone(), text_input);
-
-    let mut pointer_is_down = false;
-
-    event_loop.run(move |event, target| {
-        match event {
-            Event::UserEvent(event) => match event {
-                PlatformEvent::PostFlutterTask(task) => {
-                    task_executor.enqueue(task);
+        let engine = Rc::new(FlutterEngine::new(FlutterEngineConfig {
+            assets_path: self.assets_path,
+            egl_manager: egl_manager.clone(),
+            compositor,
+            platform_task_handler: Box::new({
+                let event_loop = event_loop.create_proxy();
+                move |task| {
+                    if let Err(e) = event_loop.send_event(PlatformEvent::PostFlutterTask(task)) {
+                        tracing::error!("{e}");
+                    }
                 }
-            },
-            Event::WindowEvent { event, .. } => match event {
-                WindowEvent::CloseRequested => {
-                    target.exit();
-                }
-                WindowEvent::ScaleFactorChanged {
-                    scale_factor,
-                    inner_size_writer: _,
-                } => {
-                    window_data.scale_factor.set(scale_factor);
-                }
-                WindowEvent::CursorMoved { position, .. } => {
-                    cursor_pos = position;
+            }),
+            platform_message_handlers,
+        })?);
 
-                    let phase = if pointer_is_down {
-                        PointerPhase::Move
-                    } else {
-                        PointerPhase::Hover
-                    };
+        engine.send_window_metrics_event(width as usize, height as usize, window.scale_factor())?;
 
-                    engine
-                        .send_pointer_event(phase, position.x, position.y)
-                        .unwrap();
-                }
-                WindowEvent::CursorEntered { .. } => {
-                    engine
-                        .send_pointer_event(PointerPhase::Add, cursor_pos.x, cursor_pos.y)
-                        .unwrap();
-                }
-                WindowEvent::CursorLeft { .. } => {
-                    engine
-                        .send_pointer_event(PointerPhase::Remove, cursor_pos.x, cursor_pos.y)
-                        .unwrap();
-                }
-                WindowEvent::MouseInput { state, .. } => {
-                    let phase = match state {
-                        ElementState::Pressed => PointerPhase::Down,
-                        ElementState::Released => PointerPhase::Up,
-                    };
+        settings::send_to_engine(&engine)?;
 
-                    pointer_is_down = state == ElementState::Pressed;
+        let window_data = Box::leak(Box::new(WindowData {
+            engine: &*engine,
+            resize_controller,
+            scale_factor: Cell::new(window.scale_factor()),
+        }));
 
-                    engine
-                        .send_pointer_event(phase, cursor_pos.x, cursor_pos.y)
-                        .unwrap();
-                }
-                WindowEvent::ModifiersChanged(modifiers) => {
-                    let _ = keyboard.handle_modifiers_changed(modifiers).trace_err();
-                }
-                WindowEvent::KeyboardInput {
-                    device_id: _,
-                    event,
-                    is_synthetic,
-                } => {
-                    tracing::debug!(
-                        key = ?event.logical_key,
-                        state = ?event.state,
+        unsafe {
+            SetWindowSubclass(hwnd, Some(wnd_proc), 696969, window_data as *mut _ as _).ok()?
+        };
+
+        let mut cursor_pos = PhysicalPosition::new(0.0, 0.0);
+        let mut task_executor = TaskRunnerExecutor::default();
+        let mut keyboard = Keyboard::new(engine.clone(), text_input);
+
+        let mut pointer_is_down = false;
+
+        event_loop.run(move |event, target| {
+            match event {
+                Event::UserEvent(event) => match event {
+                    PlatformEvent::PostFlutterTask(task) => {
+                        task_executor.enqueue(task);
+                    }
+                },
+                Event::WindowEvent { event, .. } => match event {
+                    WindowEvent::CloseRequested => {
+                        target.exit();
+                    }
+                    WindowEvent::ScaleFactorChanged {
+                        scale_factor,
+                        inner_size_writer: _,
+                    } => {
+                        window_data.scale_factor.set(scale_factor);
+                    }
+                    WindowEvent::CursorMoved { position, .. } => {
+                        cursor_pos = position;
+
+                        let phase = if pointer_is_down {
+                            PointerPhase::Move
+                        } else {
+                            PointerPhase::Hover
+                        };
+
+                        engine
+                            .send_pointer_event(phase, position.x, position.y)
+                            .unwrap();
+                    }
+                    WindowEvent::CursorEntered { .. } => {
+                        engine
+                            .send_pointer_event(PointerPhase::Add, cursor_pos.x, cursor_pos.y)
+                            .unwrap();
+                    }
+                    WindowEvent::CursorLeft { .. } => {
+                        engine
+                            .send_pointer_event(PointerPhase::Remove, cursor_pos.x, cursor_pos.y)
+                            .unwrap();
+                    }
+                    WindowEvent::MouseInput { state, .. } => {
+                        let phase = match state {
+                            ElementState::Pressed => PointerPhase::Down,
+                            ElementState::Released => PointerPhase::Up,
+                        };
+
+                        pointer_is_down = state == ElementState::Pressed;
+
+                        engine
+                            .send_pointer_event(phase, cursor_pos.x, cursor_pos.y)
+                            .unwrap();
+                    }
+                    WindowEvent::ModifiersChanged(modifiers) => {
+                        let _ = keyboard.handle_modifiers_changed(modifiers).trace_err();
+                    }
+                    WindowEvent::KeyboardInput {
+                        device_id: _,
+                        event,
                         is_synthetic,
-                        "keyboard event"
-                    );
+                    } => {
+                        tracing::debug!(
+                            key = ?event.logical_key,
+                            state = ?event.state,
+                            is_synthetic,
+                            "keyboard event"
+                        );
 
-                    let _ = keyboard
-                        .handle_keyboard_input(event, is_synthetic)
-                        .trace_err();
-                }
-                _ => {}
-            },
+                        let _ = keyboard
+                            .handle_keyboard_input(event, is_synthetic)
+                            .trace_err();
+                    }
+                    _ => {}
+                },
 
-            _ => (),
-        }
+                _ => (),
+            }
 
-        if let Some(next_task_target_time) = task_executor.process_all(&engine) {
-            target.set_control_flow(ControlFlow::WaitUntil(next_task_target_time));
-        }
-    })?;
+            if let Some(next_task_target_time) = task_executor.process_all(&engine) {
+                target.set_control_flow(ControlFlow::WaitUntil(next_task_target_time));
+            }
+        })?;
 
-    Ok(())
+        Ok(())
+    }
 }
 
 unsafe extern "system" fn wnd_proc(

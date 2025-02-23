@@ -1,10 +1,19 @@
+#![feature(let_chains)]
+
+use std::fmt::Write;
+use std::fs::File;
+use std::io::{self, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::{env, fs, process};
 
 use clap::Parser;
 use duct::cmd;
 use eyre::{Context, OptionExt, bail, eyre};
+use saphyr::Yaml;
 use which::which;
+use zip::ZipArchive;
+
+static PLUGINS_SHIM_SOURCE: &str = include_str!("../../plugins-compat/src/lib.rs");
 
 #[derive(clap::Parser)]
 enum Command {
@@ -33,15 +42,34 @@ fn main() -> eyre::Result<()> {
 
             let cargo_metadata = get_cargo_metadata(&cargo_manifest)?;
 
-            build_flutter_assets(&flutter_program)?;
-
-            copy_native_libraries(
+            download_engine_artifacts(
                 &flutter_program,
-                flutter_project_dir,
-                &cargo_metadata.target_directory.as_std_path().join("debug"),
+                &flutter_project_dir.join("build").join("fluyt"),
             )?;
 
-            let out = cmd!("cargo", "run").run()?;
+            build_flutter_assets(&flutter_program)?;
+
+            let fluyt_build_dir = flutter_project_dir.join("build").join("fluyt");
+            let target_dir = cargo_metadata.target_directory.as_std_path().join("debug");
+
+            if !target_dir.exists() {
+                fs::create_dir_all(&target_dir)?;
+            }
+
+            copy_native_libraries(&flutter_program, flutter_project_dir, &target_dir)?;
+
+            compile_plugins_shim(&fluyt_build_dir.join("plugins"), &target_dir)?;
+
+            process_plugins(&flutter_program, flutter_project_dir, &target_dir)?;
+
+            let embedder_path = get_engine_artifacts_dir(&flutter_program, &fluyt_build_dir)?
+                .join("windows-x64-embedder");
+            let angle_path = fluyt_build_dir.join("angle-win64");
+
+            let out = cmd!("cargo", "run")
+                .env("FLUTTER_EMBEDDER_PATH", embedder_path)
+                .env("ANGLE_PATH", angle_path)
+                .run()?;
 
             if let Some(code) = out.status.code() {
                 process::exit(code);
@@ -84,23 +112,7 @@ fn get_cargo_metadata(manifest: &Path) -> eyre::Result<cargo_metadata::Metadata>
     Ok(metadata)
 }
 
-#[cfg(target_os = "windows")]
-fn copy_native_libraries(
-    flutter_path: &Path,
-    flutter_project_dir: &Path,
-    out_dir: &Path,
-) -> eyre::Result<()> {
-    use std::fs::{self, File};
-    use std::io::{self, BufReader, BufWriter};
-
-    use eyre::{Context, eyre};
-    use zip::ZipArchive;
-
-    let build_dir = flutter_project_dir.join("build").join("fluyt");
-    if !build_dir.is_dir() {
-        fs::create_dir_all(&build_dir)?;
-    }
-
+fn get_engine_artifacts_dir(flutter_path: &Path, build_dir: &Path) -> eyre::Result<PathBuf> {
     let flutter_bin_dir = flutter_path.parent().unwrap();
     let engine_version_path = flutter_bin_dir.join("internal").join("engine.version");
 
@@ -109,57 +121,122 @@ fn copy_native_libraries(
     })?;
 
     let engine_commit = engine_commit.trim();
+    let engine_artifacts_dir = build_dir.join(engine_commit);
 
-    let embedder_archive_path = build_dir
-        .join(engine_commit)
-        .join("windows-x64-embedder.zip");
+    Ok(engine_artifacts_dir)
+}
 
-    let embedder_extract_path = build_dir.join(engine_commit).join("windows-x64-embedder");
+const FLUTTER_ENGINE_ARTIFACTS: &[(&str, &str)] = &[
+    ("artifacts", "windows-x64/artifacts.zip"),
+    (
+        "windows-x64-embedder",
+        "windows-x64/windows-x64-embedder.zip",
+    ),
+    (
+        "windows-x64-flutter",
+        // TODO: Should this use windows-x64-release instead? Does it matter?
+        "windows-x64-debug/windows-x64-flutter.zip",
+    ),
+    (
+        "flutter-cpp-client-wrapper",
+        "windows-x64/flutter-cpp-client-wrapper.zip",
+    ),
+];
 
-    if !embedder_archive_path.exists() {
-        let url = format!(
-            "https://storage.googleapis.com/flutter_infra_release/flutter/{engine_commit}/windows-x64/windows-x64-embedder.zip"
-        );
+fn download_engine_artifacts(flutter_path: &Path, build_dir: &Path) -> eyre::Result<()> {
+    let flutter_bin_dir = flutter_path.parent().unwrap();
+    let engine_version_path = flutter_bin_dir.join("internal").join("engine.version");
 
-        tracing::info!("downloading flutter engine from {url}");
+    let engine_commit = fs::read_to_string(&engine_version_path).wrap_err_with(|| {
+        eyre!("failed to read flutter engine version from {engine_version_path:?}")
+    })?;
 
-        let res = ureq::get(&url).call()?;
-        if !res.status().is_success() {
-            bail!(
-                "downloading flutter engine failed with status {}",
-                res.status()
-            );
+    let engine_commit = engine_commit.trim();
+    let out_dir = build_dir.join(engine_commit);
+
+    for (name, archive_name) in FLUTTER_ENGINE_ARTIFACTS {
+        let path = out_dir.join(name);
+        if !path.exists() {
+            download_flutter_engine_artifact(engine_commit, name, archive_name, &out_dir)?;
         }
-
-        fs::create_dir_all(embedder_archive_path.parent().unwrap())?;
-
-        let body = res.into_body();
-        let out_file = File::create(&embedder_archive_path)?;
-
-        io::copy(&mut body.into_reader(), &mut BufWriter::new(out_file))?;
-
-        if embedder_extract_path.exists() {
-            fs::remove_dir_all(&embedder_extract_path)?
-        }
-
-        tracing::info!("unpacking flutter engine to {embedder_extract_path:?}");
-
-        ZipArchive::new(BufReader::new(File::open(&embedder_archive_path)?))?
-            .extract(&embedder_extract_path)?;
     }
 
+    Ok(())
+}
+
+fn download_flutter_engine_artifact(
+    engine_commit: &str,
+    name: &str,
+    archive_name: &str,
+    out_dir: &Path,
+) -> eyre::Result<()> {
+    let url = format!(
+        "https://storage.googleapis.com/flutter_infra_release/flutter/{engine_commit}/{archive_name}"
+    );
+
+    tracing::info!("downloading {name} from {url}");
+
+    let res = ureq::get(&url).call()?;
+    if !res.status().is_success() {
+        bail!("downloading {name} failed with: {}", res.status());
+    }
+
+    fs::create_dir_all(out_dir)?;
+
+    let extract_path = out_dir.join(name);
+    let archive_path = extract_path.with_extension("zip");
+
+    {
+        let body = res.into_body();
+        let out_file = File::create(&archive_path)
+            .wrap_err_with(|| eyre!("failed to create file: {}", archive_path.display()))?;
+
+        io::copy(&mut body.into_reader(), &mut BufWriter::new(out_file))?;
+    }
+
+    let archive = File::open(&archive_path)
+        .wrap_err_with(|| eyre!("failed to open file: {}", archive_path.display()))?;
+
+    tracing::info!("unpacking {name} to {}", extract_path.display());
+
+    ZipArchive::new(BufReader::new(archive))?.extract(extract_path)?;
+
+    Ok(())
+}
+
+fn build_flutter_assets(flutter_path: &Path) -> eyre::Result<()> {
+    tracing::info!("running flutter build");
+
+    let out = cmd!(flutter_path, "build", "bundle").run()?;
+
+    if !out.status.success() {
+        bail!("flutter build failed with status {}", out.status);
+    }
+
+    Ok(())
+}
+
+fn copy_native_libraries(
+    flutter_path: &Path,
+    flutter_project_dir: &Path,
+    out_dir: &Path,
+) -> eyre::Result<()> {
+    let build_dir = flutter_project_dir.join("build").join("fluyt");
+    if !build_dir.is_dir() {
+        fs::create_dir_all(&build_dir)?;
+    }
+
+    let engine_artifacts_dir = get_engine_artifacts_dir(flutter_path, &build_dir)?;
+
     copy_if_newer(
-        &embedder_extract_path.join("flutter_engine.dll"),
+        &engine_artifacts_dir
+            .join("windows-x64-embedder")
+            .join("flutter_engine.dll"),
         &out_dir.join("flutter_engine.dll"),
     )?;
 
     copy_if_newer(
-        &flutter_bin_dir
-            .join("cache")
-            .join("artifacts")
-            .join("engine")
-            .join("windows-x64")
-            .join("icudtl.dat"),
+        &engine_artifacts_dir.join("artifacts").join("icudtl.dat"),
         &out_dir.join("icudtl.dat"),
     )?;
 
@@ -203,6 +280,148 @@ fn copy_native_libraries(
     Ok(())
 }
 
+fn compile_plugins_shim(build_dir: &Path, out_dir: &Path) -> eyre::Result<()> {
+    fs::create_dir_all(build_dir)?;
+
+    let lib_path = build_dir.join("fluyt_plugins_shim.dll");
+
+    if !lib_path.exists() {
+        cmd!(
+            "rustc",
+            "-",
+            "--crate-type",
+            "cdylib",
+            "--crate-name",
+            "plugins_shim",
+            "-o",
+            &lib_path,
+        )
+        .stdin_bytes(PLUGINS_SHIM_SOURCE)
+        .run()?;
+    }
+
+    copy_if_newer(&lib_path, &out_dir.join("fluyt_plugins_shim.dll"))?;
+
+    Ok(())
+}
+
+fn process_plugins(
+    flutter_path: &Path,
+    flutter_project_dir: &Path,
+    out_dir: &Path,
+) -> eyre::Result<()> {
+    let plugins_path = flutter_project_dir.join(".flutter-plugins-dependencies");
+    if !plugins_path.exists() {
+        return Ok(());
+    }
+
+    let plugins: serde_json::Value = serde_json::from_str(&fs::read_to_string(&plugins_path)?)?;
+    let plugins = plugins["plugins"]["windows"]
+        .as_array()
+        .into_iter()
+        .flatten();
+
+    let plugins_build_dir = flutter_project_dir
+        .join("build")
+        .join("fluyt")
+        .join("plugins");
+
+    if !plugins_build_dir.is_dir() {
+        fs::create_dir_all(&plugins_build_dir)?;
+    }
+
+    let flutter_bin_dir = flutter_path.parent().unwrap();
+    let engine_version_path = flutter_bin_dir.join("internal").join("engine.version");
+
+    let engine_commit = fs::read_to_string(&engine_version_path).wrap_err_with(|| {
+        eyre!("failed to read flutter engine version from {engine_version_path:?}")
+    })?;
+
+    let engine_commit = engine_commit.trim();
+    let engine_artifacts_dir = flutter_project_dir
+        .join("build")
+        .join("fluyt")
+        .join(engine_commit);
+
+    let flutter_engine_artifacts_link = plugins_build_dir.join("flutter");
+    if !flutter_engine_artifacts_link.exists() {
+        std::os::windows::fs::symlink_dir(&engine_artifacts_dir, &flutter_engine_artifacts_link)?;
+    }
+
+    let mut plugin_names = vec![];
+    let mut plugins_list = String::new();
+
+    for plugin in plugins {
+        let name = plugin["name"].as_str().unwrap();
+        let path = plugin["path"].as_str().unwrap();
+
+        let plugin_pubspec = fs::read_to_string(Path::new(path).join("pubspec.yaml"))?;
+        let plugin_pubspec = Yaml::load_from_str(&plugin_pubspec)?;
+        let plugin_pubspec = &plugin_pubspec[0];
+
+        let platforms = &plugin_pubspec["flutter"]["plugin"]["platforms"];
+
+        if let Some(platforms) = platforms.as_hash()
+            && let Some(platform) = platforms.get(&Yaml::from_str("windows"))
+        {
+            if platforms.contains_key(&Yaml::from_str("fluyt")) {
+                // TODO: Figure out fluyt plugins
+                continue;
+            }
+
+            let plugin_class = platform["pluginClass"].as_str();
+            let ffi_plugin = platform["ffiPlugin"].as_bool().unwrap_or(false);
+
+            if plugin_class.is_some() || ffi_plugin {
+                tracing::info!("processing plugin: {name} {path}");
+
+                let link_path = plugins_build_dir.join(name);
+                if !link_path.exists() {
+                    std::os::windows::fs::symlink_dir(path, &link_path)?;
+                }
+
+                plugin_names.push(name);
+
+                // writeln!(cmake, "add_subdirectory(\"{name}/windows\")")?;
+
+                if let Some(plugin_class) = plugin_class {
+                    writeln!(plugins_list, "{name},{plugin_class}")?;
+                }
+            }
+        }
+    }
+
+    fs::write(
+        plugins_build_dir.join("CMakeLists.txt"),
+        include_str!("CMakeLists.txt"),
+    )?;
+
+    fs::write(plugins_build_dir.join("plugins.txt"), plugins_list)?;
+
+    cmake::Config::new(&plugins_build_dir)
+        .host("x86_64-pc-windows-msvc")
+        .target("x86_64-pc-windows-msvc")
+        .profile("Debug") // TODO: Release mode
+        .no_build_target(true)
+        .out_dir(&plugins_build_dir)
+        .define("FLUTTER_PLUGINS", plugin_names.join(";"))
+        .build();
+
+    // TODO: Release mode
+    cmd!("cmake", "--install", ".", "--config", "Debug")
+        .dir(plugins_build_dir.join("build"))
+        .run()?;
+
+    for lib in std::fs::read_dir(plugins_build_dir.join("bin"))? {
+        let lib = lib?;
+        let src = lib.path();
+        let dest = out_dir.join(lib.file_name());
+        copy_if_newer(&src, &dest)?;
+    }
+
+    Ok(())
+}
+
 fn copy_if_newer(src: &Path, dst: &Path) -> eyre::Result<()> {
     if dst.exists() {
         let src_metadata = src.metadata()?;
@@ -216,18 +435,6 @@ fn copy_if_newer(src: &Path, dst: &Path) -> eyre::Result<()> {
 
     fs::copy(src, dst)
         .wrap_err_with(|| eyre!("failed to copy {} to {}", src.display(), dst.display()))?;
-
-    Ok(())
-}
-
-fn build_flutter_assets(flutter_path: &Path) -> eyre::Result<()> {
-    tracing::info!("running flutter build");
-
-    let out = cmd!(flutter_path, "build", "bundle").run()?;
-
-    if !out.status.success() {
-        bail!("flutter build failed with status {}", out.status);
-    }
 
     Ok(())
 }

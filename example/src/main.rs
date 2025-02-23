@@ -1,5 +1,7 @@
 use std::error::Error;
 
+use fluyt::FluytEngine;
+
 fn main() -> Result<(), Box<dyn Error>> {
     #[cfg(debug_assertions)]
     {
@@ -11,7 +13,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .init();
     }
 
-    fluyt::run("build/flutter_assets")?;
+    FluytEngine::new("build/flutter_assets").run()?;
 
     Ok(())
 }

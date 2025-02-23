@@ -10,9 +10,12 @@ path = "src/main.rs"
 [dependencies]
 cargo_metadata = "0.19.1"
 clap = { version = "4.5.30", features = ["derive"] }
+cmake = "0.1.54"
 color-eyre = "0.6.3"
 duct = "0.13.7"
 eyre = "0.6.12"
+saphyr = "0.0.3"
+serde_json = "1.0.139"
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 ureq = "3.0.6"

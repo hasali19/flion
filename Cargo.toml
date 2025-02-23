@@ -6,12 +6,12 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [workspace]
-members = ["cli", "example", "flutter-codec", "flutter-embedder"]
+members = ["cli", "example", "flutter-embedder", "plugins-compat"]
 
 [dependencies]
 bitflags = "2.8.0"
+byteorder = "1.5.0"
 eyre = "0.6"
-flutter-codec = { path = "flutter-codec" }
 flutter-embedder = { path = "flutter-embedder" }
 gl = "0.14"
 khronos-egl = { version = "6.0", features = ["static", "no-pkg-config"] }
@@ -34,12 +34,10 @@ features = [
     "UI_Composition_Desktop",
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
-    "Win32_Graphics_Direct3D_Fxc",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
-    "Win32_Graphics_Hlsl",
     "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_System_WinRT",

@@ -9,4 +9,3 @@ edition = "2021"
 
 [build-dependencies]
 bindgen = "0.64"
-dunce = "1.0"

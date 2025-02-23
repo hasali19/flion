@@ -1,8 +1,8 @@
 use std::rc::Rc;
 
-use flutter_codec::EncodableValue;
 use winit::window::{CursorIcon, Window};
 
+use crate::codec::EncodableValue;
 use crate::standard_method_channel::{StandardMethodHandler, StandardMethodReply};
 
 pub struct MouseCursorHandler {

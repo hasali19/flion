@@ -1,7 +1,6 @@
 use std::io::{Cursor, Write};
 
-use flutter_codec::EncodableValue;
-
+use crate::codec::{self, EncodableValue};
 use crate::engine::{BinaryMessageHandler, BinaryMessageReply};
 
 pub trait StandardMethodHandler {
@@ -14,8 +13,8 @@ impl<T: StandardMethodHandler> BinaryMessageHandler for T {
 
         let mut cursor = Cursor::new(message);
 
-        let method_name = flutter_codec::read_value(&mut cursor).unwrap();
-        let method_args = flutter_codec::read_value(&mut cursor).unwrap();
+        let method_name = codec::read_value(&mut cursor).unwrap();
+        let method_args = codec::read_value(&mut cursor).unwrap();
 
         let EncodableValue::Str(method_name) = method_name else {
             tracing::error!("invalid method name: {method_name:?}");
@@ -34,7 +33,7 @@ impl StandardMethodReply {
         let mut bytes = vec![];
         let mut cursor = Cursor::new(&mut bytes);
         cursor.write_all(&[0]).unwrap();
-        flutter_codec::write_value(&mut cursor, value).unwrap();
+        codec::write_value(&mut cursor, value).unwrap();
         self.0.send(&bytes);
     }
 
