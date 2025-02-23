@@ -1,6 +1,5 @@
 use std::mem;
 
-use color_eyre::eyre;
 use windows::core::{s, Interface};
 use windows::Win32::Graphics::Direct3D::Fxc::{D3DCompile, D3DCOMPILE_ENABLE_STRICTNESS};
 use windows::Win32::Graphics::Direct3D::{ID3DInclude, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST};

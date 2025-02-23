@@ -6,11 +6,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [workspace]
-members = ["flutter-codec", "flutter-embedder"]
+members = ["example", "flutter-codec", "flutter-embedder"]
 
 [dependencies]
 bitflags = "2.8.0"
-color-eyre = "0.6"
+eyre = "0.6"
 flutter-codec = { path = "flutter-codec" }
 flutter-embedder = { path = "flutter-embedder" }
 gl = "0.14"
@@ -20,7 +20,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 smol_str = "0.2.2"
 tracing = "0.1"
-tracing-subscriber = "0.3"
 winit = "0.29"
 
 [dependencies.windows]

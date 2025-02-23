@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::{c_char, c_void, CStr, CString};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::{mem, ptr};
 
-use color_eyre::eyre::{self, bail};
+use eyre::bail;
 use flutter_embedder::{
     FlutterBackingStore, FlutterBackingStoreConfig, FlutterCustomTaskRunners,
     FlutterEngineGetCurrentTime, FlutterEngineInitialize, FlutterEngineResult_kSuccess,
@@ -28,6 +29,7 @@ use crate::egl_manager::EglManager;
 use crate::task_runner::{self, Task, TaskRunner};
 
 pub struct FlutterEngineConfig<'a> {
+    pub assets_path: &'a str,
     pub egl_manager: Arc<EglManager>,
     pub compositor: FlutterCompositor,
     pub platform_task_handler: Box<dyn Fn(Task)>,
@@ -96,9 +98,11 @@ impl FlutterEngine {
             },
         };
 
+        let assets_path = CString::from_str(config.assets_path)?;
+
         let project_args = FlutterProjectArgs {
             struct_size: mem::size_of::<FlutterProjectArgs>(),
-            assets_path: c"example/build/flutter_assets".as_ptr(),
+            assets_path: assets_path.as_ptr(),
             icu_data_path: c"icudtl.dat".as_ptr(),
             custom_task_runners: &FlutterCustomTaskRunners {
                 struct_size: mem::size_of::<FlutterCustomTaskRunners>(),

@@ -17,8 +17,7 @@ use std::mem;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use color_eyre::eyre::OptionExt;
-use color_eyre::Result;
+use eyre::OptionExt;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use resize_controller::ResizeController;
 use task_runner::Task;
@@ -66,19 +65,7 @@ enum PlatformEvent {
     PostFlutterTask(Task),
 }
 
-fn main() -> Result<()> {
-    color_eyre::install()?;
-
-    #[cfg(debug_assertions)]
-    {
-        use tracing_subscriber::fmt::format::FmtSpan;
-        tracing_subscriber::fmt()
-            .with_span_events(FmtSpan::ENTER)
-            .with_thread_names(true)
-            .with_max_level(tracing::Level::DEBUG)
-            .init();
-    }
-
+pub fn run(assets_path: &str) -> eyre::Result<()> {
     let event_loop = EventLoopBuilder::<PlatformEvent>::with_user_event().build()?;
     let window = WindowBuilder::new()
         .with_inner_size(LogicalSize::new(800, 600))
@@ -181,6 +168,7 @@ fn main() -> Result<()> {
     composition_target.SetRoot(compositor.root_visual())?;
 
     let engine = Rc::new(FlutterEngine::new(FlutterEngineConfig {
+        assets_path,
         egl_manager: egl_manager.clone(),
         compositor,
         platform_task_handler: Box::new({

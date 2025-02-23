@@ -1,6 +1,5 @@
 use std::mem;
 
-use color_eyre::eyre;
 use serde_json::json;
 use windows::core::w;
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};

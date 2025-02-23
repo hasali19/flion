@@ -2,8 +2,8 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::Arc;
 
-use color_eyre::eyre::{self, bail};
 use egl::ClientBuffer;
+use eyre::bail;
 use khronos_egl as egl;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};

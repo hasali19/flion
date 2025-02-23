@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use color_eyre::eyre;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use winit::event::KeyEvent;

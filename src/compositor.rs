@@ -4,7 +4,6 @@ use std::ffi::c_void;
 use std::sync::Arc;
 use std::{mem, ptr};
 
-use color_eyre::eyre;
 use flutter_embedder::{
     FlutterBackingStore, FlutterBackingStoreConfig,
     FlutterBackingStoreType_kFlutterBackingStoreTypeOpenGL, FlutterBackingStore__bindgen_ty_1,

@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use bitflags::bitflags;
-use color_eyre::eyre::{self, Context};
+use eyre::Context;
 use serde::{Deserialize, Serialize};
 use winit::event::{ElementState, Modifiers};
 use winit::keyboard::{Key, NamedKey};
