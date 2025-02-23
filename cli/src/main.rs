@@ -33,10 +33,7 @@ fn main() -> eyre::Result<()> {
 
             let cargo_metadata = get_cargo_metadata(&cargo_manifest)?;
 
-            let out = cmd!(&flutter_program, "build", "bundle").run()?;
-            if !out.status.success() {
-                bail!("flutter build failed with status {}", out.status);
-            }
+            build_flutter_assets(&flutter_program)?;
 
             copy_native_libraries(
                 &flutter_program,
@@ -219,6 +216,18 @@ fn copy_if_newer(src: &Path, dst: &Path) -> eyre::Result<()> {
 
     fs::copy(src, dst)
         .wrap_err_with(|| eyre!("failed to copy {} to {}", src.display(), dst.display()))?;
+
+    Ok(())
+}
+
+fn build_flutter_assets(flutter_path: &Path) -> eyre::Result<()> {
+    tracing::info!("running flutter build");
+
+    let out = cmd!(flutter_path, "build", "bundle").run()?;
+
+    if !out.status.success() {
+        bail!("flutter build failed with status {}", out.status);
+    }
 
     Ok(())
 }
