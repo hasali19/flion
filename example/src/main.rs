@@ -1,6 +1,6 @@
 use std::error::Error;
 
-use fluyt::FluytEngine;
+use flion::FlionEngine;
 
 fn main() -> Result<(), Box<dyn Error>> {
     #[cfg(debug_assertions)]
@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .init();
     }
 
-    FluytEngine::new("build/flutter_assets").run()?;
+    FlionEngine::new("build/flutter_assets").run()?;
 
     Ok(())
 }

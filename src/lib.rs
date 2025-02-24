@@ -70,15 +70,15 @@ enum PlatformEvent {
     PostFlutterTask(Task),
 }
 
-pub struct FluytEngine<'a> {
+pub struct FlionEngine<'a> {
     assets_path: &'a str,
     plugin_initializers: &'a [unsafe extern "C" fn(*mut c_void)],
     platform_message_handlers: Vec<(&'a str, Box<dyn BinaryMessageHandler>)>,
 }
 
-impl<'a> FluytEngine<'a> {
-    pub fn new(assets_path: &str) -> FluytEngine {
-        FluytEngine {
+impl<'a> FlionEngine<'a> {
+    pub fn new(assets_path: &str) -> FlionEngine {
+        FlionEngine {
             assets_path,
             plugin_initializers: &[],
             platform_message_handlers: vec![],

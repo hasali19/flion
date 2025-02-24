@@ -17,7 +17,7 @@ static PLUGINS_SHIM_SOURCE: &str = include_str!("../../plugins-compat/src/lib.rs
 
 #[derive(clap::Parser)]
 enum Command {
-    /// Run a fluyt application
+    /// Run a flion application
     Run,
 }
 
@@ -44,12 +44,12 @@ fn main() -> eyre::Result<()> {
 
             download_engine_artifacts(
                 &flutter_program,
-                &flutter_project_dir.join("build").join("fluyt"),
+                &flutter_project_dir.join("build").join("flion"),
             )?;
 
             build_flutter_assets(&flutter_program)?;
 
-            let fluyt_build_dir = flutter_project_dir.join("build").join("fluyt");
+            let flion_build_dir = flutter_project_dir.join("build").join("flion");
             let target_dir = cargo_metadata.target_directory.as_std_path().join("debug");
 
             if !target_dir.exists() {
@@ -58,13 +58,13 @@ fn main() -> eyre::Result<()> {
 
             copy_native_libraries(&flutter_program, flutter_project_dir, &target_dir)?;
 
-            compile_plugins_shim(&fluyt_build_dir.join("plugins"), &target_dir)?;
+            compile_plugins_shim(&flion_build_dir.join("plugins"), &target_dir)?;
 
             process_plugins(&flutter_program, flutter_project_dir, &target_dir)?;
 
-            let embedder_path = get_engine_artifacts_dir(&flutter_program, &fluyt_build_dir)?
+            let embedder_path = get_engine_artifacts_dir(&flutter_program, &flion_build_dir)?
                 .join("windows-x64-embedder");
-            let angle_path = fluyt_build_dir.join("angle-win64");
+            let angle_path = flion_build_dir.join("angle-win64");
 
             let out = cmd!("cargo", "run")
                 .env("FLUTTER_EMBEDDER_PATH", embedder_path)
@@ -221,7 +221,7 @@ fn copy_native_libraries(
     flutter_project_dir: &Path,
     out_dir: &Path,
 ) -> eyre::Result<()> {
-    let build_dir = flutter_project_dir.join("build").join("fluyt");
+    let build_dir = flutter_project_dir.join("build").join("flion");
     if !build_dir.is_dir() {
         fs::create_dir_all(&build_dir)?;
     }
@@ -283,7 +283,7 @@ fn copy_native_libraries(
 fn compile_plugins_shim(build_dir: &Path, out_dir: &Path) -> eyre::Result<()> {
     fs::create_dir_all(build_dir)?;
 
-    let lib_path = build_dir.join("fluyt_plugins_shim.dll");
+    let lib_path = build_dir.join("flion_plugins_shim.dll");
 
     if !lib_path.exists() {
         cmd!(
@@ -300,7 +300,7 @@ fn compile_plugins_shim(build_dir: &Path, out_dir: &Path) -> eyre::Result<()> {
         .run()?;
     }
 
-    copy_if_newer(&lib_path, &out_dir.join("fluyt_plugins_shim.dll"))?;
+    copy_if_newer(&lib_path, &out_dir.join("flion_plugins_shim.dll"))?;
 
     Ok(())
 }
@@ -323,7 +323,7 @@ fn process_plugins(
 
     let plugins_build_dir = flutter_project_dir
         .join("build")
-        .join("fluyt")
+        .join("flion")
         .join("plugins");
 
     if !plugins_build_dir.is_dir() {
@@ -340,7 +340,7 @@ fn process_plugins(
     let engine_commit = engine_commit.trim();
     let engine_artifacts_dir = flutter_project_dir
         .join("build")
-        .join("fluyt")
+        .join("flion")
         .join(engine_commit);
 
     let flutter_engine_artifacts_link = plugins_build_dir.join("flutter");
@@ -364,8 +364,8 @@ fn process_plugins(
         if let Some(platforms) = platforms.as_hash()
             && let Some(platform) = platforms.get(&Yaml::from_str("windows"))
         {
-            if platforms.contains_key(&Yaml::from_str("fluyt")) {
-                // TODO: Figure out fluyt plugins
+            if platforms.contains_key(&Yaml::from_str("flion")) {
+                // TODO: Figure out flion plugins
                 continue;
             }
 

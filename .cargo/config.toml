@@ -1,2 +1,2 @@
 [alias]
-fluyt = "run --package fluyt-cli"
+flion = "run --package flion-cli"

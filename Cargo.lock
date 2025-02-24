@@ -725,7 +725,7 @@ name = "example"
 version = "0.1.0"
 dependencies = [
  "color-eyre",
- "fluyt",
+ "flion",
  "tracing",
  "tracing-subscriber",
 ]
@@ -751,11 +751,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "flutter-embedder"
-version = "0.1.0"
-
-[[package]]
-name = "fluyt"
+name = "flion"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.8.0",
@@ -775,7 +771,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "fluyt-cli"
+name = "flion-cli"
 version = "0.1.0"
 dependencies = [
  "cargo_metadata",
@@ -792,6 +788,10 @@ dependencies = [
  "which",
  "zip",
 ]
+
+[[package]]
+name = "flutter-embedder"
+version = "0.1.0"
 
 [[package]]
 name = "fnv"

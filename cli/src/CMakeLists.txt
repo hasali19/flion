@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.14)
 
-project(FluytFlutterPlugins)
+project(FlionFlutterPlugins)
 
 # Compilation settings that should be applied to most targets.
 function(APPLY_STANDARD_SETTINGS TARGET)
@@ -29,7 +29,7 @@ target_include_directories(flutter INTERFACE
     "${CMAKE_CURRENT_SOURCE_DIR}/flutter/windows-x64-flutter"
     "${CMAKE_CURRENT_SOURCE_DIR}/flutter/flutter-cpp-client-wrapper/cpp_client_wrapper/include")
 
-target_link_libraries(flutter INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/fluyt_plugins_shim.dll.lib")
+target_link_libraries(flutter INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/flion_plugins_shim.dll.lib")
 
 foreach(plugin ${FLUTTER_PLUGINS})
     add_subdirectory("${plugin}/windows" "plugins/${plugin}")
