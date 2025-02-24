@@ -125,6 +125,7 @@ impl FlutterEngine {
                 avoid_backing_store_cache: false,
             },
             platform_message_callback: Some(platform_message_callback),
+            log_message_callback: Some(log_message),
             // vsync_callback: Some(vsync_callback),
             ..Default::default()
         };
@@ -600,4 +601,10 @@ pub unsafe extern "C" fn compositor_present_layers(
     };
 
     true
+}
+
+unsafe extern "C" fn log_message(tag: *const c_char, message: *const c_char, _: *mut c_void) {
+    let tag = CStr::from_ptr(tag).to_string_lossy();
+    let message = CStr::from_ptr(message).to_string_lossy();
+    eprintln!("{tag}: {message}");
 }
