@@ -1,0 +1,4 @@
+set shell := ["powershell.exe", "-c"]
+
+gen path:
+    bindgen {{ path }} -o src/bindings.rs --with-derive-default
