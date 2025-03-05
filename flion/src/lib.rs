@@ -5,6 +5,7 @@ mod error_utils;
 mod keyboard;
 mod keymap;
 mod mouse_cursor;
+mod plugins_shim;
 mod resize_controller;
 mod settings;
 mod task_runner;
@@ -58,6 +59,13 @@ use crate::task_runner::TaskRunnerExecutor;
 use crate::text_input::{TextInputHandler, TextInputState};
 
 pub use crate::engine::{BinaryMessageHandler, BinaryMessageReply};
+
+#[macro_export]
+macro_rules! include_plugins {
+    () => {
+        include!(concat!(env!("OUT_DIR"), "/plugin_registrant.rs"));
+    };
+}
 
 struct WindowData {
     engine: *const engine::FlutterEngine,
@@ -213,6 +221,12 @@ impl<'a> FlionEngine<'a> {
             }),
             platform_message_handlers,
         })?);
+
+        for init in self.plugin_initializers {
+            unsafe {
+                (init)(&raw const *engine as *mut c_void);
+            }
+        }
 
         engine.send_window_metrics_event(width as usize, height as usize, window.scale_factor())?;
 

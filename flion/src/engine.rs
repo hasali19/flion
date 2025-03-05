@@ -22,6 +22,7 @@ use flutter_embedder::{
     FlutterRendererType_kOpenGL, FlutterTask, FlutterTaskRunnerDescription, FlutterTransformation,
     FlutterWindowMetricsEvent, FLUTTER_ENGINE_VERSION,
 };
+use parking_lot::Mutex;
 use smol_str::SmolStr;
 
 use crate::compositor::FlutterCompositor;
@@ -44,7 +45,7 @@ struct FlutterEngineInner {
     handle: flutter_embedder::FlutterEngine,
     egl_manager: Arc<EglManager>,
     compositor: *mut FlutterCompositor,
-    platform_message_handlers: BTreeMap<String, Box<dyn BinaryMessageHandler + 'static>>,
+    platform_message_handlers: Mutex<BTreeMap<String, Box<dyn BinaryMessageHandler + 'static>>>,
 }
 
 #[repr(i32)]
@@ -133,12 +134,12 @@ impl FlutterEngine {
         let engine = Box::leak(Box::new(FlutterEngineInner {
             handle: ptr::null_mut(),
             egl_manager: config.egl_manager,
-            platform_message_handlers: BTreeMap::from_iter(
+            platform_message_handlers: Mutex::new(BTreeMap::from_iter(
                 config
                     .platform_message_handlers
                     .into_iter()
                     .map(|(channel, handler)| (channel.to_owned(), handler)),
-            ),
+            )),
             compositor,
         }));
 
@@ -167,6 +168,10 @@ impl FlutterEngine {
         }
 
         Ok(FlutterEngine { inner: engine })
+    }
+
+    pub(crate) fn as_raw(&self) -> flutter_embedder::FlutterEngine {
+        self.inner.handle
     }
 
     pub fn send_window_metrics_event(
@@ -354,6 +359,17 @@ impl FlutterEngine {
             Ok(())
         }
     }
+
+    pub fn set_platform_message_handler(
+        &self,
+        name: impl Into<String>,
+        handler: impl BinaryMessageHandler + 'static,
+    ) {
+        self.inner
+            .platform_message_handlers
+            .lock()
+            .insert(name.into(), Box::new(handler));
+    }
 }
 
 fn create_task_runner<F: Fn(Task) + 'static>(
@@ -397,6 +413,16 @@ pub struct BinaryMessageReply {
 }
 
 impl BinaryMessageReply {
+    pub(crate) fn new(
+        engine: flutter_embedder::FlutterEngine,
+        response_handle: *const FlutterPlatformMessageResponseHandle,
+    ) -> BinaryMessageReply {
+        BinaryMessageReply {
+            engine,
+            response_handle,
+        }
+    }
+
     pub fn send(self, message: &[u8]) {
         unsafe {
             FlutterEngineSendPlatformMessageResponse(
@@ -417,6 +443,10 @@ impl BinaryMessageReply {
                 0,
             );
         }
+    }
+
+    pub(crate) fn into_raw(self) -> *const FlutterPlatformMessageResponseHandle {
+        self.response_handle
     }
 }
 
@@ -439,7 +469,8 @@ unsafe extern "C" fn platform_message_callback(
         return;
     };
 
-    let Some(handler) = engine.platform_message_handlers.get(channel) else {
+    let handlers = engine.platform_message_handlers.lock();
+    let Some(handler) = handlers.get(channel) else {
         tracing::warn!(channel, "unimplemented");
         reply.not_implemented();
         return;

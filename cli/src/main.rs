@@ -289,10 +289,15 @@ fn compile_plugins_shim(build_dir: &Path, out_dir: &Path) -> eyre::Result<()> {
         cmd!(
             "rustc",
             "-",
+            "--crate-name",
+            "flion_plugins_shim",
             "--crate-type",
             "cdylib",
-            "--crate-name",
-            "plugins_shim",
+            "--edition=2024",
+            "--cfg",
+            "cdylib",
+            "-C",
+            "target-feature=+crt-static",
             "-o",
             &lib_path,
         )
@@ -396,19 +401,22 @@ fn process_plugins(
         include_str!("CMakeLists.txt"),
     )?;
 
-    fs::write(plugins_build_dir.join("plugins.txt"), plugins_list)?;
+    if fs::read_to_string(plugins_build_dir.join("plugins.txt")).unwrap_or_default() != plugins_list
+    {
+        tracing::info!("plugins list has changed");
+        fs::write(plugins_build_dir.join("plugins.txt"), plugins_list)?;
+    }
 
     cmake::Config::new(&plugins_build_dir)
         .host("x86_64-pc-windows-msvc")
         .target("x86_64-pc-windows-msvc")
-        .profile("Debug") // TODO: Release mode
+        .profile("Release")
         .no_build_target(true)
         .out_dir(&plugins_build_dir)
         .define("FLUTTER_PLUGINS", plugin_names.join(";"))
         .build();
 
-    // TODO: Release mode
-    cmd!("cmake", "--install", ".", "--config", "Debug")
+    cmd!("cmake", "--install", ".", "--config", "Release")
         .dir(plugins_build_dir.join("build"))
         .run()?;
 

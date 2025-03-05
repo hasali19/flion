@@ -1,6 +1,9 @@
 use std::error::Error;
+use std::ffi::c_void;
 
-use flion::FlionEngine;
+use flion::{FlionEngine, include_plugins};
+
+include_plugins!();
 
 fn main() -> Result<(), Box<dyn Error>> {
     #[cfg(debug_assertions)]
@@ -13,7 +16,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             .init();
     }
 
-    FlionEngine::new("build/flutter_assets").run()?;
+    FlionEngine::new("build/flutter_assets")
+        .with_plugins(PLUGINS)
+        .run()?;
 
     Ok(())
 }
