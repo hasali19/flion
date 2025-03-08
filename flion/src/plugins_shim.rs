@@ -2,9 +2,46 @@ use std::ffi::{c_char, c_void, CStr};
 use std::mem;
 
 use flutter_embedder::FlutterPlatformMessageResponseHandle;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use windows::Win32::Foundation::HWND;
+use winit::event_loop::EventLoopWindowTarget;
+use winit::window::{Window, WindowBuilder};
 
 use crate::engine::FlutterEngine;
 use crate::{BinaryMessageHandler, BinaryMessageReply};
+
+pub struct FlutterPluginsEngine {
+    engine: &'static FlutterEngine,
+    child_window: HWND,
+}
+
+impl FlutterPluginsEngine {
+    pub fn new<T: 'static>(
+        engine: &FlutterEngine,
+        window: &Window,
+        event_loop: &EventLoopWindowTarget<T>,
+    ) -> eyre::Result<*mut FlutterPluginsEngine> {
+        let child_window = unsafe {
+            WindowBuilder::new()
+                .with_parent_window(Some(window.window_handle()?.as_raw()))
+                .with_visible(false)
+                .build(event_loop)?
+        };
+
+        let RawWindowHandle::Win32(child_handle) = child_window.window_handle()?.as_raw() else {
+            unreachable!()
+        };
+
+        // TODO: Don't leak this
+        mem::forget(child_window);
+
+        Ok(Box::leak(Box::new(FlutterPluginsEngine {
+            // TODO: Handle engine lifetime properly
+            engine: unsafe { mem::transmute::<&FlutterEngine, &'static FlutterEngine>(engine) },
+            child_window: HWND(child_handle.hwnd.get() as *mut c_void),
+        })))
+    }
+}
 
 #[link(name = "flion_plugins_shim.dll")]
 unsafe extern "C" {
@@ -29,6 +66,7 @@ fn init_plugins_shim() {
             FlutterDesktopMessengerUnlock: flutter_desktop_messenger_unlock,
             FlutterDesktopMessengerIsAvailable: flutter_desktop_messenger_is_available,
             FlutterDesktopMessengerSendResponse: flutter_dsktop_messenger_send_response,
+            FlutterDesktopViewGetHWND: flutter_desktop_view_get_hwnd,
             ..Default::default()
         });
     }
@@ -37,7 +75,7 @@ fn init_plugins_shim() {
 unsafe extern "C" fn flutter_desktop_plugin_registrar_get_messenger(
     registrar: *mut c_void,
 ) -> *mut c_void {
-    // `registrar` is a pointer to `FlutterEngine`
+    // `registrar` is a pointer to `FlutterPluginsEngine`
     registrar
 }
 
@@ -48,9 +86,10 @@ unsafe extern "C" fn flutter_desktop_plugin_registrar_get_texture_registrar(
 }
 
 unsafe extern "C" fn flutter_desktop_plugin_registrar_get_view(
-    _registrar: *mut c_void,
+    registrar: *mut c_void,
 ) -> *mut c_void {
-    std::ptr::null_mut()
+    // `registrar` is a pointer to `FlutterPluginsEngine`
+    registrar
 }
 
 unsafe extern "C" fn flutter_desktop_plugin_registrar_set_destruction_handler(
@@ -66,7 +105,7 @@ unsafe extern "C" fn flutter_desktop_messenger_set_callback(
     callback: plugins_compat::FlutterDesktopMessageCallback,
     user_data: *mut c_void,
 ) {
-    let engine = &*messenger.cast::<FlutterEngine>();
+    let engine = &mut *messenger.cast::<FlutterPluginsEngine>();
 
     let channel = CStr::from_ptr(channel);
     let channel = channel.to_str().unwrap();
@@ -74,7 +113,7 @@ unsafe extern "C" fn flutter_desktop_messenger_set_callback(
     tracing::debug!("setting callback for platform channel: {channel:?}");
 
     struct Handler {
-        engine: *const FlutterEngine,
+        engine: *mut FlutterPluginsEngine,
         callback: plugins_compat::FlutterDesktopMessageCallback,
         user_data: *mut c_void,
     }
@@ -83,7 +122,7 @@ unsafe extern "C" fn flutter_desktop_messenger_set_callback(
         fn handle(&self, message: &[u8], reply: BinaryMessageReply) {
             unsafe {
                 (self.callback)(
-                    self.engine.cast_mut().cast(),
+                    self.engine.cast(),
                     &plugins_compat::FlutterDesktopMessage {
                         channel: std::ptr::null(),
                         message: message.as_ptr(),
@@ -103,7 +142,7 @@ unsafe extern "C" fn flutter_desktop_messenger_set_callback(
         user_data,
     };
 
-    engine.set_platform_message_handler(channel, handler);
+    engine.engine.set_platform_message_handler(channel, handler);
 }
 
 unsafe extern "C" fn flutter_desktop_messenger_add_ref(messenger: *mut c_void) -> *mut c_void {
@@ -135,13 +174,18 @@ unsafe extern "C" fn flutter_dsktop_messenger_send_response(
     data: *const u8,
     data_length: usize,
 ) {
-    let engine = &*messenger.cast::<FlutterEngine>();
+    let engine = &*messenger.cast::<FlutterPluginsEngine>();
     let response_handle = handle.cast::<FlutterPlatformMessageResponseHandle>();
 
-    let reply = BinaryMessageReply::new(engine.as_raw(), response_handle);
+    let reply = BinaryMessageReply::new(engine.engine.as_raw(), response_handle);
     if data.is_null() {
         reply.not_implemented();
     } else {
         reply.send(std::slice::from_raw_parts(data, data_length));
     }
+}
+
+unsafe extern "C" fn flutter_desktop_view_get_hwnd(view: *mut c_void) -> *mut c_void {
+    let engine = &*view.cast::<FlutterPluginsEngine>();
+    engine.child_window.0
 }

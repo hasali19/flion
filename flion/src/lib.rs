@@ -21,6 +21,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use eyre::OptionExt;
+use plugins_shim::FlutterPluginsEngine;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use resize_controller::ResizeController;
 use task_runner::Task;
@@ -222,9 +223,11 @@ impl<'a> FlionEngine<'a> {
             platform_message_handlers,
         })?);
 
+        let plugins_engine = FlutterPluginsEngine::new(&engine, &window, &event_loop)?;
+
         for init in self.plugin_initializers {
             unsafe {
-                (init)(&raw const *engine as *mut c_void);
+                (init)(plugins_engine.cast());
             }
         }
 

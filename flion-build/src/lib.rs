@@ -35,7 +35,7 @@ pub fn generate_plugins_registrant(project_dir: &Path) -> Result<(), Box<dyn Err
             "\
 #[link(name = \"{name}_plugin\")]
 unsafe extern \"C\" {{
-    fn {class_name}RegisterWithRegistrar(registrar: *mut c_void);
+    fn {class_name}RegisterWithRegistrar(registrar: *mut std::ffi::c_void);
 }}"
         )?;
 
