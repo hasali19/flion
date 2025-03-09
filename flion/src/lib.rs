@@ -41,11 +41,14 @@ use windows::Win32::System::WinRT::{
     CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_ASTA, DQTYPE_THREAD_CURRENT,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
-use windows::Win32::UI::WindowsAndMessaging::WM_NCCALCSIZE;
+use windows::Win32::UI::WindowsAndMessaging::{
+    SystemParametersInfoW, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    WM_NCCALCSIZE,
+};
 use windows::UI::Composition::ContainerVisual;
 use windows::UI::Composition::Core::CompositorController;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, Event, WindowEvent};
+use winit::event::{ElementState, Event, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoopBuilder};
 use winit::platform::windows::WindowBuilderExtWindows;
 use winit::window::WindowBuilder;
@@ -322,6 +325,32 @@ impl<'a> FlionEngine<'a> {
                             .handle_keyboard_input(event, is_synthetic)
                             .trace_err();
                     }
+                    WindowEvent::MouseWheel { delta, .. } => match delta {
+                        MouseScrollDelta::LineDelta(x, y) => {
+                            let mut lines_per_scroll = 3u32;
+                            unsafe {
+                                SystemParametersInfoW(
+                                    SPI_GETWHEELSCROLLLINES,
+                                    0,
+                                    Some(&raw mut lines_per_scroll as *mut c_void),
+                                    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS::default(),
+                                )
+                                .unwrap();
+                            }
+
+                            let scroll_multiplier = f64::from(lines_per_scroll) * 100.0 / 3.0;
+
+                            let x = f64::from(x) * scroll_multiplier;
+                            let y = -f64::from(y) * scroll_multiplier;
+
+                            let _ = engine
+                                .send_scroll_event(cursor_pos.x, cursor_pos.y, x, y)
+                                .trace_err();
+                        }
+                        MouseScrollDelta::PixelDelta(physical_position) => {
+                            tracing::debug!(?physical_position, "pixel scroll");
+                        }
+                    },
                     _ => {}
                 },
 

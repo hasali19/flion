@@ -18,9 +18,10 @@ use flutter_embedder::{
     FlutterPlatformMessageReleaseResponseHandle, FlutterPlatformMessageResponseHandle,
     FlutterPointerEvent, FlutterPointerPhase, FlutterPointerPhase_kAdd, FlutterPointerPhase_kDown,
     FlutterPointerPhase_kHover, FlutterPointerPhase_kMove, FlutterPointerPhase_kRemove,
-    FlutterPointerPhase_kUp, FlutterProjectArgs, FlutterRendererConfig,
-    FlutterRendererType_kOpenGL, FlutterTask, FlutterTaskRunnerDescription, FlutterTransformation,
-    FlutterWindowMetricsEvent, FLUTTER_ENGINE_VERSION,
+    FlutterPointerPhase_kUp, FlutterPointerSignalKind_kFlutterPointerSignalKindScroll,
+    FlutterProjectArgs, FlutterRendererConfig, FlutterRendererType_kOpenGL, FlutterTask,
+    FlutterTaskRunnerDescription, FlutterTransformation, FlutterWindowMetricsEvent,
+    FLUTTER_ENGINE_VERSION,
 };
 use parking_lot::Mutex;
 use smol_str::SmolStr;
@@ -227,7 +228,38 @@ impl FlutterEngine {
         };
 
         if result != FlutterEngineResult_kSuccess {
-            bail!("failed to run task: {result}");
+            bail!("failed to send pointer event: {result}");
+        }
+
+        Ok(())
+    }
+
+    pub fn send_scroll_event(
+        &self,
+        x: f64,
+        y: f64,
+        scroll_delta_x: f64,
+        scroll_delta_y: f64,
+    ) -> eyre::Result<()> {
+        let result = unsafe {
+            FlutterEngineSendPointerEvent(
+                self.inner.handle,
+                &FlutterPointerEvent {
+                    struct_size: mem::size_of::<FlutterPointerEvent>(),
+                    signal_kind: FlutterPointerSignalKind_kFlutterPointerSignalKindScroll,
+                    x,
+                    y,
+                    scroll_delta_x,
+                    scroll_delta_y,
+                    timestamp: FlutterEngineGetCurrentTime() as usize,
+                    ..Default::default()
+                },
+                1,
+            )
+        };
+
+        if result != FlutterEngineResult_kSuccess {
+            bail!("failed to send pointer event: {result}");
         }
 
         Ok(())
