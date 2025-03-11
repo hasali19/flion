@@ -12,16 +12,18 @@ use flutter_embedder::{
 use khronos_egl::{self as egl};
 use windows::core::Interface;
 use windows::Foundation::Numerics::Vector2;
-use windows::Foundation::Size;
-use windows::Graphics::DirectX::{DirectXAlphaMode, DirectXPixelFormat};
-use windows::Win32::Foundation::POINT;
+use windows::Win32::Foundation::BOOL;
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
-use windows::Win32::System::WinRT::Composition::{
-    ICompositionDrawingSurfaceInterop, ICompositorInterop,
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
 };
-use windows::UI::Composition::{
-    CompositionDrawingSurface, CompositionGraphicsDevice, Compositor, ContainerVisual, SpriteVisual,
+use windows::Win32::Graphics::Dxgi::{
+    IDXGIDevice, IDXGIDevice2, IDXGIFactory2, IDXGISwapChain1, DXGI_PRESENT, DXGI_SCALING_STRETCH,
+    DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
+use windows::Win32::System::WinRT::Composition::ICompositorInterop;
+use windows::UI::Composition::{Compositor, ContainerVisual, SpriteVisual};
 
 use crate::egl_manager::EglManager;
 
@@ -35,19 +37,20 @@ pub trait CompositionHandler: Send {
 }
 
 pub struct FlutterCompositor {
+    device: ID3D11Device,
     compositor: Compositor,
-    composition_device: CompositionGraphicsDevice,
     root_visual: ContainerVisual,
     egl_manager: Arc<EglManager>,
-    layers: Vec<*const FlutterLayer>,
+    layers: Vec<*const CompositorFlutterLayer>,
     handler: Box<dyn CompositionHandler>,
 }
 
 struct CompositorFlutterLayer {
     egl_manager: Arc<EglManager>,
     visual: SpriteVisual,
-    composition_surface: CompositionDrawingSurface,
-    egl_surface: Option<egl::Surface>,
+    swapchain: IDXGISwapChain1,
+    egl_surface: egl::Surface,
+    is_first_present: bool,
 }
 
 impl FlutterCompositor {
@@ -59,15 +62,9 @@ impl FlutterCompositor {
     ) -> eyre::Result<FlutterCompositor> {
         let compositor = visual.Compositor()?;
 
-        let composition_device = unsafe {
-            compositor
-                .cast::<ICompositorInterop>()?
-                .CreateGraphicsDevice(&device)?
-        };
-
         Ok(FlutterCompositor {
+            device,
             compositor,
-            composition_device,
             egl_manager,
             root_visual: visual,
             layers: vec![],
@@ -100,17 +97,43 @@ impl FlutterCompositor {
 
         visual.SetSize(Vector2::new(size.width as f32, size.height as f32))?;
 
-        let composition_surface = self
-            .composition_device
-            .CreateDrawingSurface(
-                Size {
-                    Width: size.width as f32,
-                    Height: size.height as f32,
+        let dxgi_device: IDXGIDevice = self.device.cast()?;
+        let dxgi_factory: IDXGIFactory2 = unsafe { dxgi_device.GetAdapter()?.GetParent()? };
+
+        let swapchain = unsafe {
+            dxgi_factory.CreateSwapChainForComposition(
+                &self.device,
+                &DXGI_SWAP_CHAIN_DESC1 {
+                    Width: size.width as u32,
+                    Height: size.height as u32,
+                    Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    Stereo: BOOL::from(false),
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                    BufferCount: 2,
+                    Scaling: DXGI_SCALING_STRETCH,
+                    SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+                    AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
+                    Flags: 0,
                 },
-                DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                DirectXAlphaMode::Premultiplied,
-            )
-            .unwrap();
+                None,
+            )?
+        };
+
+        let back_buffer: ID3D11Texture2D = unsafe { swapchain.GetBuffer(0)? };
+
+        let egl_surface = self
+            .egl_manager
+            .create_surface_from_d3d11_texture(&back_buffer, (0, 0))?;
+
+        let composition_surface = unsafe {
+            self.compositor
+                .cast::<ICompositorInterop>()?
+                .CreateCompositionSurfaceForSwapChain(&swapchain)?
+        };
 
         let surface_brush = self
             .compositor
@@ -121,8 +144,9 @@ impl FlutterCompositor {
         let compositor_layer = Box::leak(Box::new(CompositorFlutterLayer {
             egl_manager: self.egl_manager.clone(),
             visual,
-            composition_surface,
-            egl_surface: None,
+            egl_surface,
+            swapchain,
+            is_first_present: true,
         }));
 
         extern "C" fn make_surface_current(
@@ -133,34 +157,13 @@ impl FlutterCompositor {
                 user_data
                     .cast::<CompositorFlutterLayer>()
                     .as_mut()
-                    .expect("layer must not be null")
+                    .expect("layer is not null")
             };
 
-            let composition_surface_interop = layer
-                .composition_surface
-                .cast::<ICompositionDrawingSurfaceInterop>()
-                .unwrap();
-
-            let mut update_offset = POINT::default();
-            let texture: ID3D11Texture2D = unsafe {
-                composition_surface_interop
-                    .BeginDraw(None, &mut update_offset)
-                    .unwrap()
+            if let Err(e) = layer.egl_manager.make_surface_current(layer.egl_surface) {
+                tracing::error!("{e:?}");
+                return false;
             };
-
-            assert!(layer.egl_surface.is_none());
-
-            let egl_surface = layer.egl_surface.insert(
-                layer
-                    .egl_manager
-                    .create_surface_from_d3d11_texture(&texture, (update_offset.x, update_offset.y))
-                    .unwrap(),
-            );
-
-            layer
-                .egl_manager
-                .make_surface_current(*egl_surface)
-                .unwrap();
 
             unsafe {
                 *gl_state_changed = false;
@@ -174,13 +177,18 @@ impl FlutterCompositor {
                 user_data
                     .cast::<CompositorFlutterLayer>()
                     .as_mut()
-                    .expect("layer must not be null")
+                    .expect("layer is not null")
             };
 
-            layer.egl_manager.clear_current().unwrap();
+            if let Err(e) = layer.egl_manager.clear_current() {
+                tracing::error!("{e:?}");
+                return false;
+            }
 
             true
         }
+
+        const GL_BGRA8_EXT: u32 = 0x93A1;
 
         out.type_ = FlutterBackingStoreType_kFlutterBackingStoreTypeOpenGL;
         out.user_data = (compositor_layer as *mut CompositorFlutterLayer).cast();
@@ -190,7 +198,7 @@ impl FlutterCompositor {
                 __bindgen_anon_1: FlutterOpenGLBackingStore__bindgen_ty_1 {
                     surface: FlutterOpenGLSurface {
                         struct_size: mem::size_of::<FlutterOpenGLSurface>(),
-                        format: /* GL_BGRA8_EXT */ 0x93A1,
+                        format: GL_BGRA8_EXT,
                         make_current_callback: Some(make_surface_current),
                         clear_current_callback: Some(clear_current_surface),
                         destruction_callback: None,
@@ -207,14 +215,10 @@ impl FlutterCompositor {
         &mut self,
         backing_store: &FlutterBackingStore,
     ) -> eyre::Result<()> {
-        let mut render_target =
+        let layer =
             unsafe { Box::from_raw(backing_store.user_data.cast::<CompositorFlutterLayer>()) };
 
-        if let Some(egl_surface) = render_target.egl_surface.take() {
-            self.egl_manager.destroy_surface(egl_surface)?;
-        }
-
-        drop(render_target);
+        self.egl_manager.destroy_surface(layer.egl_surface)?;
 
         Ok(())
     }
@@ -222,12 +226,9 @@ impl FlutterCompositor {
     pub fn present_layers(&mut self, layers: &[&FlutterLayer]) -> eyre::Result<()> {
         // Composition layers need to be updated if flutter layers are added or removed.
         let mut should_update_composition_layers = self.layers.len() != layers.len();
+        let mut should_flush_rendering = false;
 
         for (i, &layer) in layers.iter().enumerate() {
-            // Composition layers need to be updated if flutter layers have been reordered.
-            should_update_composition_layers =
-                should_update_composition_layers || self.layers[i] != layer;
-
             // TODO: Support platform views
             assert_eq!(
                 layer.type_,
@@ -242,13 +243,32 @@ impl FlutterCompositor {
                     .unwrap()
             };
 
-            let composition_surface_interop = compositor_layer
-                .composition_surface
-                .cast::<ICompositionDrawingSurfaceInterop>()?;
+            // Composition layers need to be updated if flutter layers have been reordered.
+            should_update_composition_layers =
+                should_update_composition_layers || self.layers[i] != compositor_layer;
 
-            if let Some(egl_surface) = compositor_layer.egl_surface.take() {
-                unsafe { composition_surface_interop.EndDraw()? };
-                compositor_layer.egl_manager.destroy_surface(egl_surface)?;
+            unsafe {
+                compositor_layer
+                    .swapchain
+                    .Present(0, DXGI_PRESENT::default())
+                    .ok()?;
+            }
+
+            should_flush_rendering = should_flush_rendering || compositor_layer.is_first_present;
+
+            compositor_layer.is_first_present = false;
+        }
+
+        if should_flush_rendering {
+            unsafe {
+                // Flush outstanding rendering commands if this is the first present. This is taken from Chromium:
+                // https://github.com/chromium/chromium/blob/2764576ca3ae948e9274da637b535b4113f421f2/ui/gl/swap_chain_presenter.cc#L1702-L1710.
+                // Seems to help avoid some flickering when the swapchain gets recreating while resizing.
+                // Interestingly the buffer copying Chromium uses in addition to this doesn't seem necessary here.
+                let event = CreateEventW(None, false, false, None)?;
+                let dxgi_device = self.device.cast::<IDXGIDevice2>()?;
+                dxgi_device.EnqueueSetEvent(event)?;
+                WaitForSingleObject(event, INFINITE);
             }
         }
 
@@ -271,7 +291,7 @@ impl FlutterCompositor {
                     .Children()?
                     .InsertAtTop(&compositor_layer.visual)?;
 
-                self.layers.push(layer);
+                self.layers.push(compositor_layer);
             }
         }
 
