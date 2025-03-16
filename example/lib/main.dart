@@ -1,5 +1,6 @@
 import 'package:dynamic_system_colors/dynamic_system_colors.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 
 void main() {
   runApp(const MyApp());
@@ -109,6 +110,9 @@ class _MyHomePageState extends State<MyHomePage> {
               '$_counter',
               style: Theme.of(context).textTheme.headlineMedium,
             ),
+            const Flexible(
+              child: FlionPlatformView(),
+            ),
           ],
         ),
       ),
@@ -118,5 +122,36 @@ class _MyHomePageState extends State<MyHomePage> {
         child: const Icon(Icons.add),
       ), // This trailing comma makes auto-formatting nicer for build methods.
     );
+  }
+}
+
+class FlionPlatformView extends LeafRenderObjectWidget {
+  const FlionPlatformView({super.key});
+
+  @override
+  RenderObject createRenderObject(BuildContext context) {
+    return PlatformViewRenderBox();
+  }
+}
+
+class PlatformViewRenderBox extends RenderBox {
+  @override
+  bool get sizedByParent => true;
+
+  @override
+  bool get alwaysNeedsCompositing => true;
+
+  @override
+  bool get isRepaintBoundary => true;
+
+  @override
+  @protected
+  Size computeDryLayout(covariant BoxConstraints constraints) {
+    return constraints.biggest;
+  }
+
+  @override
+  void paint(PaintingContext context, Offset offset) {
+    context.addLayer(PlatformViewLayer(rect: offset & size, viewId: 1));
   }
 }

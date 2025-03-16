@@ -1,3 +1,10 @@
 [workspace]
-members = ["cli", "example", "flion", "flion-build", "flutter-embedder", "plugins-compat"]
+members = [
+    "cli",
+    "example",
+    "flion",
+    "flion-build",
+    "flutter-embedder",
+    "plugins-compat",
+]
 resolver = "3"

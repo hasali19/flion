@@ -5,6 +5,7 @@ mod error_utils;
 mod keyboard;
 mod keymap;
 mod mouse_cursor;
+mod platform_views;
 mod plugins_shim;
 mod resize_controller;
 mod settings;
@@ -18,15 +19,22 @@ use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::mem;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 
 use eyre::OptionExt;
+use platform_views::PlatformView;
 use plugins_shim::FlutterPluginsEngine;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use resize_controller::ResizeController;
 use task_runner::Task;
-use windows::core::Interface;
-use windows::Foundation::Numerics::Vector2;
+use webview2_com::Microsoft::Web::WebView2::Win32::{
+    CreateCoreWebView2Environment, ICoreWebView2Controller, ICoreWebView2Environment3,
+};
+use webview2_com::{
+    CreateCoreWebView2CompositionControllerCompletedHandler,
+    CreateCoreWebView2EnvironmentCompletedHandler,
+};
+use windows::core::{w, Interface};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
@@ -47,6 +55,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::UI::Composition::ContainerVisual;
 use windows::UI::Composition::Core::CompositorController;
+use windows_numerics::{Vector2, Vector3};
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Event, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoopBuilder};
@@ -77,9 +86,9 @@ struct WindowData {
     scale_factor: Cell<f64>,
 }
 
-#[derive(Debug)]
 enum PlatformEvent {
     PostFlutterTask(Task),
+    ResizeWebView(u32, u32),
 }
 
 pub struct FlionEngine<'a> {
@@ -192,11 +201,120 @@ impl<'a> FlionEngine<'a> {
             device,
             egl_manager.clone(),
             Box::new(CompositionHandler {
-                compositor_controller,
+                compositor_controller: compositor_controller.clone(),
                 resize_controller: resize_controller.clone(),
                 root_visual,
             }),
         )?;
+
+        let platform_views = compositor.platform_views();
+
+        let environment = {
+            let (tx, rx) = mpsc::channel();
+
+            CreateCoreWebView2EnvironmentCompletedHandler::wait_for_async_operation(
+                Box::new(|handler| unsafe {
+                    CreateCoreWebView2Environment(&handler)
+                        .map_err(webview2_com::Error::WindowsError)
+                }),
+                Box::new(move |error_code, environment| {
+                    error_code?;
+
+                    tx.send(environment.unwrap()).unwrap();
+
+                    Ok(())
+                }),
+            )
+            .unwrap();
+
+            rx.recv().unwrap()
+        };
+
+        let environment = environment.cast::<ICoreWebView2Environment3>()?;
+
+        let controller = {
+            let (tx, rx) = mpsc::channel();
+
+            CreateCoreWebView2CompositionControllerCompletedHandler::wait_for_async_operation(
+                Box::new(move |handler| unsafe {
+                    environment
+                        .CreateCoreWebView2CompositionController(hwnd, &handler)
+                        .unwrap();
+                    Ok(())
+                }),
+                Box::new(move |error_code, controller| {
+                    error_code?;
+
+                    tx.send(controller.unwrap()).unwrap();
+
+                    Ok(())
+                }),
+            )
+            .unwrap();
+
+            rx.recv().unwrap()
+        };
+
+        let webview = unsafe {
+            let controller = controller.cast::<ICoreWebView2Controller>()?;
+            controller.SetBounds(RECT {
+                top: 0,
+                bottom: 450,
+                left: 0,
+                right: 1200,
+            })?;
+            controller.SetIsVisible(true)?;
+            controller.CoreWebView2()?
+        };
+
+        unsafe {
+            webview.Navigate(w!("https://github.com"))?;
+        }
+
+        let visual = compositor_controller
+            .Compositor()?
+            .CreateContainerVisual()?;
+
+        unsafe {
+            controller.SetRootVisualTarget(&visual)?;
+        }
+
+        let mut last_size = (0.0, 0.0);
+
+        platform_views.register(
+            1,
+            PlatformView {
+                visual: visual.cast()?,
+                on_update: Box::new({
+                    let event_loop = event_loop.create_proxy();
+                    move |args| {
+                        if (args.width, args.height) != last_size {
+                            let _ = event_loop.send_event(PlatformEvent::ResizeWebView(
+                                args.width as u32,
+                                args.height as u32,
+                            ));
+
+                            last_size = (args.width, args.height);
+                        }
+
+                        visual
+                            .SetSize(Vector2 {
+                                X: args.width as f32,
+                                Y: args.height as f32,
+                            })
+                            .unwrap();
+
+                        visual
+                            .SetOffset(Vector3 {
+                                X: args.x as f32,
+                                Y: args.y as f32,
+                                Z: 0.0,
+                            })
+                            .unwrap();
+                    }
+                }),
+            },
+        );
 
         let mut platform_message_handlers: Vec<(&str, Box<dyn BinaryMessageHandler>)> = vec![
             (
@@ -260,6 +378,18 @@ impl<'a> FlionEngine<'a> {
                     PlatformEvent::PostFlutterTask(task) => {
                         task_executor.enqueue(task);
                     }
+                    PlatformEvent::ResizeWebView(width, height) => unsafe {
+                        controller
+                            .cast::<ICoreWebView2Controller>()
+                            .unwrap()
+                            .SetBounds(RECT {
+                                left: 0,
+                                right: width as i32,
+                                top: 0,
+                                bottom: height as i32,
+                            })
+                            .unwrap();
+                    },
                 },
                 Event::WindowEvent { event, .. } => match event {
                     WindowEvent::CloseRequested => {
