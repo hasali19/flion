@@ -20,6 +20,7 @@ use std::mem;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use engine::PointerDeviceKind;
 use eyre::OptionExt;
 use plugins_shim::FlutterPluginsEngine;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -48,7 +49,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::UI::Composition::ContainerVisual;
 use windows::UI::Composition::Core::CompositorController;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, Event, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Event, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoopBuilder};
 use winit::platform::windows::WindowBuilderExtWindows;
 use winit::window::WindowBuilder;
@@ -248,6 +249,8 @@ impl<'a> FlionEngine<'a> {
             SetWindowSubclass(hwnd, Some(wnd_proc), 696969, window_data as *mut _ as _).ok()?
         };
 
+        // let mut pointer_states = HashMap::new();
+
         let mut cursor_pos = PhysicalPosition::new(0.0, 0.0);
         let mut task_executor = TaskRunnerExecutor::default();
         let mut keyboard = Keyboard::new(engine.clone(), text_input);
@@ -280,19 +283,37 @@ impl<'a> FlionEngine<'a> {
                             PointerPhase::Hover
                         };
 
-                        engine
-                            .send_pointer_event(phase, position.x, position.y)
-                            .unwrap();
+                        let _ = engine
+                            .send_pointer_event(
+                                PointerDeviceKind::Mouse,
+                                0,
+                                phase,
+                                position.x,
+                                position.y,
+                            )
+                            .trace_err();
                     }
                     WindowEvent::CursorEntered { .. } => {
-                        engine
-                            .send_pointer_event(PointerPhase::Add, cursor_pos.x, cursor_pos.y)
-                            .unwrap();
+                        let _ = engine
+                            .send_pointer_event(
+                                PointerDeviceKind::Mouse,
+                                0,
+                                PointerPhase::Add,
+                                cursor_pos.x,
+                                cursor_pos.y,
+                            )
+                            .trace_err();
                     }
                     WindowEvent::CursorLeft { .. } => {
-                        engine
-                            .send_pointer_event(PointerPhase::Remove, cursor_pos.x, cursor_pos.y)
-                            .unwrap();
+                        let _ = engine
+                            .send_pointer_event(
+                                PointerDeviceKind::Mouse,
+                                0,
+                                PointerPhase::Remove,
+                                cursor_pos.x,
+                                cursor_pos.y,
+                            )
+                            .trace_err();
                     }
                     WindowEvent::MouseInput { state, .. } => {
                         let phase = match state {
@@ -302,9 +323,15 @@ impl<'a> FlionEngine<'a> {
 
                         pointer_is_down = state == ElementState::Pressed;
 
-                        engine
-                            .send_pointer_event(phase, cursor_pos.x, cursor_pos.y)
-                            .unwrap();
+                        let _ = engine
+                            .send_pointer_event(
+                                PointerDeviceKind::Mouse,
+                                0,
+                                phase,
+                                cursor_pos.x,
+                                cursor_pos.y,
+                            )
+                            .trace_err();
                     }
                     WindowEvent::ModifiersChanged(modifiers) => {
                         let _ = keyboard.handle_modifiers_changed(modifiers).trace_err();
@@ -351,6 +378,26 @@ impl<'a> FlionEngine<'a> {
                             tracing::debug!(?physical_position, "pixel scroll");
                         }
                     },
+                    WindowEvent::Touch(touch) => {
+                        let phases: &[PointerPhase] = match touch.phase {
+                            TouchPhase::Started => &[PointerPhase::Add, PointerPhase::Down],
+                            TouchPhase::Moved => &[PointerPhase::Move],
+                            TouchPhase::Ended => &[PointerPhase::Up, PointerPhase::Remove],
+                            TouchPhase::Cancelled => todo!(),
+                        };
+
+                        for &phase in phases {
+                            let _ = engine
+                                .send_pointer_event(
+                                    PointerDeviceKind::Touch,
+                                    touch.id as i32,
+                                    phase,
+                                    touch.location.x,
+                                    touch.location.y,
+                                )
+                                .trace_err();
+                        }
+                    }
                     _ => {}
                 },
 

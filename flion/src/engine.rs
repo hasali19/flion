@@ -16,7 +16,11 @@ use flutter_embedder::{
     FlutterKeyEventType_kFlutterKeyEventTypeUp, FlutterLayer, FlutterOpenGLRendererConfig,
     FlutterPlatformMessage, FlutterPlatformMessageCreateResponseHandle,
     FlutterPlatformMessageReleaseResponseHandle, FlutterPlatformMessageResponseHandle,
-    FlutterPointerEvent, FlutterPointerPhase, FlutterPointerPhase_kAdd, FlutterPointerPhase_kDown,
+    FlutterPointerDeviceKind, FlutterPointerDeviceKind_kFlutterPointerDeviceKindMouse,
+    FlutterPointerDeviceKind_kFlutterPointerDeviceKindStylus,
+    FlutterPointerDeviceKind_kFlutterPointerDeviceKindTouch,
+    FlutterPointerDeviceKind_kFlutterPointerDeviceKindTrackpad, FlutterPointerEvent,
+    FlutterPointerPhase, FlutterPointerPhase_kAdd, FlutterPointerPhase_kDown,
     FlutterPointerPhase_kHover, FlutterPointerPhase_kMove, FlutterPointerPhase_kRemove,
     FlutterPointerPhase_kUp, FlutterPointerSignalKind_kFlutterPointerSignalKindScroll,
     FlutterProjectArgs, FlutterRendererConfig, FlutterRendererType_kOpenGL, FlutterTask,
@@ -49,6 +53,15 @@ struct FlutterEngineInner {
     platform_message_handlers: Mutex<BTreeMap<String, Box<dyn BinaryMessageHandler + 'static>>>,
 }
 
+#[repr(i32)]
+pub enum PointerDeviceKind {
+    Mouse = FlutterPointerDeviceKind_kFlutterPointerDeviceKindMouse,
+    Touch = FlutterPointerDeviceKind_kFlutterPointerDeviceKindTouch,
+    Stylus = FlutterPointerDeviceKind_kFlutterPointerDeviceKindStylus,
+    Trackpad = FlutterPointerDeviceKind_kFlutterPointerDeviceKindTrackpad,
+}
+
+#[derive(Clone, Copy)]
 #[repr(i32)]
 pub enum PointerPhase {
     Up = FlutterPointerPhase_kUp,
@@ -211,12 +224,21 @@ impl FlutterEngine {
         Ok(())
     }
 
-    pub fn send_pointer_event(&self, phase: PointerPhase, x: f64, y: f64) -> eyre::Result<()> {
+    pub fn send_pointer_event(
+        &self,
+        device_kind: PointerDeviceKind,
+        device_id: i32,
+        phase: PointerPhase,
+        x: f64,
+        y: f64,
+    ) -> eyre::Result<()> {
         let result = unsafe {
             FlutterEngineSendPointerEvent(
                 self.inner.handle,
                 &FlutterPointerEvent {
                     struct_size: mem::size_of::<FlutterPointerEvent>(),
+                    device_kind: device_kind as FlutterPointerDeviceKind,
+                    device: device_id,
                     phase: phase as FlutterPointerPhase,
                     x,
                     y,
