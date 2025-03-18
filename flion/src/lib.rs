@@ -1,5 +1,5 @@
 mod compositor;
-mod egl_manager;
+mod egl;
 mod engine;
 mod error_utils;
 mod keyboard;
@@ -55,7 +55,7 @@ use winit::platform::windows::WindowBuilderExtWindows;
 use winit::window::WindowBuilder;
 
 use crate::compositor::FlutterCompositor;
-use crate::egl_manager::EglManager;
+use crate::egl::EglDevice;
 use crate::engine::{FlutterEngine, FlutterEngineConfig, PointerPhase};
 use crate::error_utils::ResultExt;
 use crate::keyboard::Keyboard;
@@ -171,7 +171,7 @@ impl<'a> FlionEngine<'a> {
                 .CreateDesktopWindowTarget(hwnd, false)?
         };
 
-        let egl_manager = EglManager::create(&device)?;
+        let egl = EglDevice::create(&device)?;
         let resize_controller = Arc::new(ResizeController::new());
 
         let window = Rc::new(window);
@@ -191,7 +191,7 @@ impl<'a> FlionEngine<'a> {
         let compositor = FlutterCompositor::new(
             root_visual.clone(),
             device,
-            egl_manager.clone(),
+            egl.clone(),
             Box::new(CompositionHandler {
                 compositor_controller,
                 resize_controller: resize_controller.clone(),
@@ -214,7 +214,7 @@ impl<'a> FlionEngine<'a> {
 
         let engine = Rc::new(FlutterEngine::new(FlutterEngineConfig {
             assets_path: self.assets_path,
-            egl_manager: egl_manager.clone(),
+            egl: egl.clone(),
             compositor,
             platform_task_handler: Box::new({
                 let event_loop = event_loop.create_proxy();

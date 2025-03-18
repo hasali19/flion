@@ -25,7 +25,7 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFIN
 use windows::Win32::System::WinRT::Composition::ICompositorInterop;
 use windows::UI::Composition::{Compositor, ContainerVisual, SpriteVisual};
 
-use crate::egl_manager::EglManager;
+use crate::egl::EglDevice;
 
 pub trait CompositionHandler: Send {
     /// Returns the current size of the rendering area.
@@ -40,13 +40,13 @@ pub struct FlutterCompositor {
     device: ID3D11Device,
     compositor: Compositor,
     root_visual: ContainerVisual,
-    egl_manager: Arc<EglManager>,
+    egl: Arc<EglDevice>,
     layers: Vec<*const CompositorFlutterLayer>,
     handler: Box<dyn CompositionHandler>,
 }
 
 struct CompositorFlutterLayer {
-    egl_manager: Arc<EglManager>,
+    egl: Arc<EglDevice>,
     visual: SpriteVisual,
     swapchain: IDXGISwapChain1,
     egl_surface: egl::Surface,
@@ -57,7 +57,7 @@ impl FlutterCompositor {
     pub fn new(
         visual: ContainerVisual,
         device: ID3D11Device,
-        egl_manager: Arc<EglManager>,
+        egl: Arc<EglDevice>,
         handler: Box<dyn CompositionHandler>,
     ) -> eyre::Result<FlutterCompositor> {
         let compositor = visual.Compositor()?;
@@ -65,7 +65,7 @@ impl FlutterCompositor {
         Ok(FlutterCompositor {
             device,
             compositor,
-            egl_manager,
+            egl,
             root_visual: visual,
             layers: vec![],
             handler,
@@ -126,7 +126,7 @@ impl FlutterCompositor {
         let back_buffer: ID3D11Texture2D = unsafe { swapchain.GetBuffer(0)? };
 
         let egl_surface = self
-            .egl_manager
+            .egl
             .create_surface_from_d3d11_texture(&back_buffer, (0, 0))?;
 
         let composition_surface = unsafe {
@@ -143,7 +143,7 @@ impl FlutterCompositor {
 
         // This is freed when collect_backing_store is called.
         let compositor_layer = Box::into_raw(Box::new(CompositorFlutterLayer {
-            egl_manager: self.egl_manager.clone(),
+            egl: self.egl.clone(),
             visual,
             egl_surface,
             swapchain,
@@ -161,7 +161,7 @@ impl FlutterCompositor {
                     .expect("layer is not null")
             };
 
-            if let Err(e) = layer.egl_manager.make_surface_current(layer.egl_surface) {
+            if let Err(e) = layer.egl.make_surface_current(layer.egl_surface) {
                 tracing::error!("{e:?}");
                 return false;
             };
@@ -181,7 +181,7 @@ impl FlutterCompositor {
                     .expect("layer is not null")
             };
 
-            if let Err(e) = layer.egl_manager.clear_current() {
+            if let Err(e) = layer.egl.clear_current() {
                 tracing::error!("{e:?}");
                 return false;
             }
@@ -219,7 +219,7 @@ impl FlutterCompositor {
         let layer =
             unsafe { Box::from_raw(backing_store.user_data.cast::<CompositorFlutterLayer>()) };
 
-        self.egl_manager.destroy_surface(layer.egl_surface)?;
+        self.egl.destroy_surface(layer.egl_surface)?;
 
         Ok(())
     }

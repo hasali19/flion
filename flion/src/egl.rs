@@ -1,5 +1,4 @@
 use std::ffi::c_void;
-use std::ptr;
 use std::sync::Arc;
 
 use egl::ClientBuffer;
@@ -16,7 +15,7 @@ const EGL_D3D_TEXTURE_ANGLE: egl::Enum = 0x33A3;
 const EGL_TEXTURE_OFFSET_X_ANGLE: i32 = 0x3490;
 const EGL_TEXTURE_OFFSET_Y_ANGLE: i32 = 0x3491;
 
-pub struct EglManager {
+pub struct EglDevice {
     egl: egl::Instance<egl::Static>,
     angle_device: *mut c_void,
     display: egl::Display,
@@ -25,11 +24,11 @@ pub struct EglManager {
     resource_context: egl::Context,
 }
 
-unsafe impl Send for EglManager {}
-unsafe impl Sync for EglManager {}
+unsafe impl Send for EglDevice {}
+unsafe impl Sync for EglDevice {}
 
-impl EglManager {
-    pub fn create(device: &ID3D11Device) -> eyre::Result<Arc<EglManager>> {
+impl EglDevice {
+    pub fn create(device: &ID3D11Device) -> eyre::Result<Arc<EglDevice>> {
         let egl = egl::Instance::new(egl::Static);
 
         let angle_device = unsafe {
@@ -75,9 +74,9 @@ impl EglManager {
         let resource_context =
             egl.create_context(display, config, Some(context), &context_attribs)?;
 
-        Ok(Arc::new(EglManager {
+        Ok(Arc::new(EglDevice {
             egl,
-            angle_device: ptr::null_mut(),
+            angle_device,
             display,
             config,
             context,
@@ -149,7 +148,7 @@ impl EglManager {
     }
 }
 
-impl Drop for EglManager {
+impl Drop for EglDevice {
     fn drop(&mut self) {
         unsafe { eglReleaseDeviceANGLE(self.angle_device) }
 
@@ -166,12 +165,12 @@ impl Drop for EglManager {
 extern "C" {
     // fn eglDebugMessageControlKHR(
     //     callback: extern "C" fn(
-    //         egl::Enum,
-    //         *const c_char,
-    //         egl::Int,
-    //         *const c_void,
-    //         *const c_void,
-    //         *const c_char,
+    //         error: egl::Enum,
+    //         command: *const std::ffi::c_char,
+    //         message_type: egl::Int,
+    //         thread_label: *const c_void,
+    //         object_label: *const c_void,
+    //         message: *const std::ffi::c_char,
     //     ),
     //     attribs: *const egl::Attrib,
     // ) -> egl::Int;
@@ -184,3 +183,17 @@ extern "C" {
 
     fn eglReleaseDeviceANGLE(device: *mut c_void);
 }
+
+// extern "C" fn debug_callback(
+//     error: egl::Enum,
+//     command: *const std::ffi::c_char,
+//     message_type: egl::Int,
+//     thread_label: *const c_void,
+//     object_label: *const c_void,
+//     message: *const std::ffi::c_char,
+// ) {
+//     use std::ffi::CStr;
+//     let message = unsafe { CStr::from_ptr(message) };
+//     let message = message.to_str().unwrap_or("invalid");
+//     tracing::debug!("{message}");
+// }

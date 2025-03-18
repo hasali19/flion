@@ -37,12 +37,12 @@ use parking_lot::Mutex;
 use smol_str::SmolStr;
 
 use crate::compositor::FlutterCompositor;
-use crate::egl_manager::EglManager;
+use crate::egl::EglDevice;
 use crate::task_runner::{self, Task, TaskRunner};
 
 pub struct FlutterEngineConfig<'a> {
     pub assets_path: &'a str,
-    pub egl_manager: Arc<EglManager>,
+    pub egl: Arc<EglDevice>,
     pub compositor: FlutterCompositor,
     pub platform_task_handler: Box<dyn Fn(Task)>,
     pub platform_message_handlers: Vec<(&'a str, Box<dyn BinaryMessageHandler + 'static>)>,
@@ -59,7 +59,7 @@ pub struct FlutterEngine {
 struct FlutterEngineInner {
     handle: flutter_embedder::FlutterEngine,
     is_running: Arc<Mutex<bool>>,
-    egl_manager: Arc<EglManager>,
+    egl: Arc<EglDevice>,
     compositor: *mut FlutterCompositor,
     platform_message_handlers: Mutex<BTreeMap<String, Box<dyn BinaryMessageHandler + 'static>>>,
 }
@@ -193,7 +193,7 @@ impl FlutterEngine {
         let engine = Box::leak(Box::new(FlutterEngineInner {
             handle: ptr::null_mut(),
             is_running: Arc::new(Mutex::new(false)),
-            egl_manager: config.egl_manager,
+            egl: config.egl,
             platform_message_handlers: Mutex::new(platform_message_handlers),
             compositor,
         }));
@@ -624,7 +624,7 @@ unsafe extern "C" fn platform_message_callback(
 unsafe extern "C" fn gl_make_current(user_data: *mut c_void) -> bool {
     let engine = user_data.cast::<FlutterEngineInner>().as_ref().unwrap();
 
-    if let Err(e) = engine.egl_manager.make_context_current() {
+    if let Err(e) = engine.egl.make_context_current() {
         tracing::error!("failed to make context current: {e}");
         return false;
     }
@@ -635,7 +635,7 @@ unsafe extern "C" fn gl_make_current(user_data: *mut c_void) -> bool {
 unsafe extern "C" fn gl_make_resource_current(user_data: *mut c_void) -> bool {
     let engine = user_data.cast::<FlutterEngineInner>().as_ref().unwrap();
 
-    if let Err(e) = engine.egl_manager.make_resource_context_current() {
+    if let Err(e) = engine.egl.make_resource_context_current() {
         tracing::error!("failed to make resource context current: {e}");
         return false;
     }
@@ -646,7 +646,7 @@ unsafe extern "C" fn gl_make_resource_current(user_data: *mut c_void) -> bool {
 unsafe extern "C" fn gl_clear_current(user_data: *mut c_void) -> bool {
     let engine = user_data.cast::<FlutterEngineInner>().as_ref().unwrap();
 
-    if let Err(e) = engine.egl_manager.clear_current() {
+    if let Err(e) = engine.egl.clear_current() {
         tracing::error!("failed to clear context: {e}");
         return false;
     }
@@ -669,7 +669,7 @@ unsafe extern "C" fn gl_get_proc_address(
     let engine = user_data.cast::<FlutterEngineInner>().as_ref().unwrap();
     let name = CStr::from_ptr(name);
     engine
-        .egl_manager
+        .egl
         .get_proc_address(name.to_str().unwrap())
         .unwrap_or(ptr::null_mut())
 }
