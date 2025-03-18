@@ -4,6 +4,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::{mem, ptr};
 
+use bitflags::bitflags;
 use eyre::bail;
 use flutter_embedder::{
     FlutterBackingStore, FlutterBackingStoreConfig, FlutterCustomTaskRunners,
@@ -20,12 +21,16 @@ use flutter_embedder::{
     FlutterPointerDeviceKind_kFlutterPointerDeviceKindStylus,
     FlutterPointerDeviceKind_kFlutterPointerDeviceKindTouch,
     FlutterPointerDeviceKind_kFlutterPointerDeviceKindTrackpad, FlutterPointerEvent,
-    FlutterPointerPhase, FlutterPointerPhase_kAdd, FlutterPointerPhase_kDown,
-    FlutterPointerPhase_kHover, FlutterPointerPhase_kMove, FlutterPointerPhase_kRemove,
-    FlutterPointerPhase_kUp, FlutterPointerSignalKind_kFlutterPointerSignalKindScroll,
-    FlutterProjectArgs, FlutterRendererConfig, FlutterRendererType_kOpenGL, FlutterTask,
-    FlutterTaskRunnerDescription, FlutterTransformation, FlutterWindowMetricsEvent,
-    FLUTTER_ENGINE_VERSION,
+    FlutterPointerMouseButtons, FlutterPointerMouseButtons_kFlutterPointerButtonMouseBack,
+    FlutterPointerMouseButtons_kFlutterPointerButtonMouseForward,
+    FlutterPointerMouseButtons_kFlutterPointerButtonMouseMiddle,
+    FlutterPointerMouseButtons_kFlutterPointerButtonMousePrimary,
+    FlutterPointerMouseButtons_kFlutterPointerButtonMouseSecondary, FlutterPointerPhase,
+    FlutterPointerPhase_kAdd, FlutterPointerPhase_kDown, FlutterPointerPhase_kHover,
+    FlutterPointerPhase_kMove, FlutterPointerPhase_kRemove, FlutterPointerPhase_kUp,
+    FlutterPointerSignalKind_kFlutterPointerSignalKindScroll, FlutterProjectArgs,
+    FlutterRendererConfig, FlutterRendererType_kOpenGL, FlutterTask, FlutterTaskRunnerDescription,
+    FlutterTransformation, FlutterWindowMetricsEvent, FLUTTER_ENGINE_VERSION,
 };
 use parking_lot::Mutex;
 use smol_str::SmolStr;
@@ -53,23 +58,51 @@ struct FlutterEngineInner {
     platform_message_handlers: Mutex<BTreeMap<String, Box<dyn BinaryMessageHandler + 'static>>>,
 }
 
+#[derive(Clone, Copy, Default)]
 #[repr(i32)]
 pub enum PointerDeviceKind {
+    #[default]
+    Unknown = 0,
     Mouse = FlutterPointerDeviceKind_kFlutterPointerDeviceKindMouse,
     Touch = FlutterPointerDeviceKind_kFlutterPointerDeviceKindTouch,
+    #[expect(unused)]
     Stylus = FlutterPointerDeviceKind_kFlutterPointerDeviceKindStylus,
+    #[expect(unused)]
     Trackpad = FlutterPointerDeviceKind_kFlutterPointerDeviceKindTrackpad,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 #[repr(i32)]
 pub enum PointerPhase {
+    #[default]
+    Unknown = 0,
     Up = FlutterPointerPhase_kUp,
     Down = FlutterPointerPhase_kDown,
     Add = FlutterPointerPhase_kAdd,
     Remove = FlutterPointerPhase_kRemove,
     Hover = FlutterPointerPhase_kHover,
     Move = FlutterPointerPhase_kMove,
+}
+
+bitflags! {
+    #[derive(Clone, Copy, Default)]
+    pub struct PointerButtons: FlutterPointerMouseButtons {
+        const PRIMARY = FlutterPointerMouseButtons_kFlutterPointerButtonMousePrimary;
+        const SECONDARY = FlutterPointerMouseButtons_kFlutterPointerButtonMouseSecondary;
+        const MIDDLE = FlutterPointerMouseButtons_kFlutterPointerButtonMouseMiddle;
+        const BACK = FlutterPointerMouseButtons_kFlutterPointerButtonMouseBack;
+        const FORWARD = FlutterPointerMouseButtons_kFlutterPointerButtonMouseForward;
+    }
+}
+
+#[derive(Default)]
+pub struct PointerEvent {
+    pub device_kind: PointerDeviceKind,
+    pub device_id: i32,
+    pub phase: PointerPhase,
+    pub x: f64,
+    pub y: f64,
+    pub buttons: PointerButtons,
 }
 
 #[repr(i32)]
@@ -224,24 +257,18 @@ impl FlutterEngine {
         Ok(())
     }
 
-    pub fn send_pointer_event(
-        &self,
-        device_kind: PointerDeviceKind,
-        device_id: i32,
-        phase: PointerPhase,
-        x: f64,
-        y: f64,
-    ) -> eyre::Result<()> {
+    pub fn send_pointer_event(&self, event: &PointerEvent) -> eyre::Result<()> {
         let result = unsafe {
             FlutterEngineSendPointerEvent(
                 self.inner.handle,
                 &FlutterPointerEvent {
                     struct_size: mem::size_of::<FlutterPointerEvent>(),
-                    device_kind: device_kind as FlutterPointerDeviceKind,
-                    device: device_id,
-                    phase: phase as FlutterPointerPhase,
-                    x,
-                    y,
+                    device_kind: event.device_kind as FlutterPointerDeviceKind,
+                    device: event.device_id,
+                    phase: event.phase as FlutterPointerPhase,
+                    x: event.x,
+                    y: event.y,
+                    buttons: event.buttons.bits() as i64,
                     timestamp: FlutterEngineGetCurrentTime() as usize,
                     ..Default::default()
                 },
