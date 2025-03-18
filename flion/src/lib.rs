@@ -227,11 +227,12 @@ impl<'a> FlionEngine<'a> {
             platform_message_handlers,
         })?);
 
-        let plugins_engine = FlutterPluginsEngine::new(&engine, &window, &event_loop)?;
+        let mut plugins_engine =
+            Box::new(FlutterPluginsEngine::new(&engine, &window, &event_loop)?);
 
         for init in self.plugin_initializers {
             unsafe {
-                (init)(plugins_engine.cast());
+                (init)(&raw mut *plugins_engine as *mut c_void);
             }
         }
 

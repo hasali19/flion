@@ -141,7 +141,8 @@ impl FlutterCompositor {
 
         visual.SetBrush(&surface_brush)?;
 
-        let compositor_layer = Box::leak(Box::new(CompositorFlutterLayer {
+        // This is freed when collect_backing_store is called.
+        let compositor_layer = Box::into_raw(Box::new(CompositorFlutterLayer {
             egl_manager: self.egl_manager.clone(),
             visual,
             egl_surface,
@@ -191,7 +192,7 @@ impl FlutterCompositor {
         const GL_BGRA8_EXT: u32 = 0x93A1;
 
         out.type_ = FlutterBackingStoreType_kFlutterBackingStoreTypeOpenGL;
-        out.user_data = (compositor_layer as *mut CompositorFlutterLayer).cast();
+        out.user_data = compositor_layer.cast();
         out.__bindgen_anon_1 = FlutterBackingStore__bindgen_ty_1 {
             open_gl: FlutterOpenGLBackingStore {
                 type_: FlutterOpenGLTargetType_kFlutterOpenGLTargetTypeSurface,

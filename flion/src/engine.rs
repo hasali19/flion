@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::{c_char, c_void, CStr, CString};
+use std::marker::PhantomData;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::{mem, ptr};
@@ -11,8 +12,8 @@ use flutter_embedder::{
     FlutterEngineGetCurrentTime, FlutterEngineInitialize, FlutterEngineResult_kSuccess,
     FlutterEngineRunInitialized, FlutterEngineRunTask, FlutterEngineSendKeyEvent,
     FlutterEngineSendPlatformMessage, FlutterEngineSendPlatformMessageResponse,
-    FlutterEngineSendPointerEvent, FlutterEngineSendWindowMetricsEvent, FlutterKeyEvent,
-    FlutterKeyEventDeviceType_kFlutterKeyEventDeviceTypeKeyboard,
+    FlutterEngineSendPointerEvent, FlutterEngineSendWindowMetricsEvent, FlutterEngineShutdown,
+    FlutterKeyEvent, FlutterKeyEventDeviceType_kFlutterKeyEventDeviceTypeKeyboard,
     FlutterKeyEventType_kFlutterKeyEventTypeDown, FlutterKeyEventType_kFlutterKeyEventTypeRepeat,
     FlutterKeyEventType_kFlutterKeyEventTypeUp, FlutterLayer, FlutterOpenGLRendererConfig,
     FlutterPlatformMessage, FlutterPlatformMessageCreateResponseHandle,
@@ -48,11 +49,16 @@ pub struct FlutterEngineConfig<'a> {
 }
 
 pub struct FlutterEngine {
+    // The 'static lifetime should be fine since this reference is valid as long as the outer
+    // FlutterEngine is valid. We should not leak the reference out of this module.
     inner: &'static FlutterEngineInner,
+    // Engine should not be sent across threads.
+    _not_send: PhantomData<*const ()>,
 }
 
 struct FlutterEngineInner {
     handle: flutter_embedder::FlutterEngine,
+    is_running: Arc<Mutex<bool>>,
     egl_manager: Arc<EglManager>,
     compositor: *mut FlutterCompositor,
     platform_message_handlers: Mutex<BTreeMap<String, Box<dyn BinaryMessageHandler + 'static>>>,
@@ -124,10 +130,7 @@ impl FlutterEngine {
     pub fn new(config: FlutterEngineConfig) -> eyre::Result<FlutterEngine> {
         let platform_task_runner = create_task_runner(
             1,
-            // TODO: Cleanup task runner on engine shutdown
-            Box::leak(Box::new(TaskRunner::new(move |task| {
-                (config.platform_task_handler)(task);
-            }))),
+            TaskRunner::new(move |task| (config.platform_task_handler)(task)),
         );
 
         let renderer_config = FlutterRendererConfig {
@@ -150,7 +153,8 @@ impl FlutterEngine {
 
         let assets_path = CString::from_str(config.assets_path)?;
 
-        let compositor = &raw mut *Box::leak(Box::new(config.compositor));
+        // This is freed when the FlutterEngine is dropped.
+        let compositor = Box::into_raw(Box::new(config.compositor));
 
         let project_args = FlutterProjectArgs {
             struct_size: mem::size_of::<FlutterProjectArgs>(),
@@ -178,15 +182,19 @@ impl FlutterEngine {
             ..Default::default()
         };
 
+        let platform_message_handlers = BTreeMap::from_iter(
+            config
+                .platform_message_handlers
+                .into_iter()
+                .map(|(channel, handler)| (channel.to_owned(), handler)),
+        );
+
+        // This is freed when the FlutterEngine is dropped.
         let engine = Box::leak(Box::new(FlutterEngineInner {
             handle: ptr::null_mut(),
+            is_running: Arc::new(Mutex::new(false)),
             egl_manager: config.egl_manager,
-            platform_message_handlers: Mutex::new(BTreeMap::from_iter(
-                config
-                    .platform_message_handlers
-                    .into_iter()
-                    .map(|(channel, handler)| (channel.to_owned(), handler)),
-            )),
+            platform_message_handlers: Mutex::new(platform_message_handlers),
             compositor,
         }));
 
@@ -210,15 +218,16 @@ impl FlutterEngine {
 
         engine.handle = engine_handle;
 
+        *engine.is_running.lock() = true;
+
         unsafe {
             FlutterEngineRunInitialized(engine_handle);
         }
 
-        Ok(FlutterEngine { inner: engine })
-    }
-
-    pub(crate) fn as_raw(&self) -> flutter_embedder::FlutterEngine {
-        self.inner.handle
+        Ok(FlutterEngine {
+            inner: engine,
+            _not_send: PhantomData,
+        })
     }
 
     pub fn send_window_metrics_event(
@@ -325,7 +334,8 @@ impl FlutterEngine {
             Box::from_raw(user_data.cast::<F>())(handled);
         }
 
-        let reply = Box::leak(Box::new(callback));
+        // This is freed above when the calback invoked.
+        let reply = Box::into_raw(Box::new(callback));
 
         let event = FlutterKeyEvent {
             struct_size: mem::size_of::<FlutterKeyEvent>(),
@@ -346,7 +356,7 @@ impl FlutterEngine {
                 self.inner.handle,
                 &event,
                 Some(_callback::<F>),
-                reply as *mut F as _,
+                reply.cast(),
             );
 
             if result != FlutterEngineResult_kSuccess {
@@ -403,11 +413,12 @@ impl FlutterEngine {
         unsafe {
             let mut response_handle = ptr::null_mut();
 
-            let reply = Box::leak(Box::new(reply_handler));
+            // This is freed by the callback above, when invoked.
+            let reply = Box::into_raw(Box::new(reply_handler));
             let result = FlutterPlatformMessageCreateResponseHandle(
                 self.inner.handle,
                 Some(callback::<F>),
-                reply as *mut F as _,
+                reply.cast(),
                 &mut response_handle,
             );
 
@@ -453,9 +464,27 @@ impl FlutterEngine {
     }
 }
 
+impl Drop for FlutterEngine {
+    fn drop(&mut self) {
+        unsafe {
+            tracing::debug!("shutting down engine");
+
+            *self.inner.is_running.lock() = false;
+
+            FlutterEngineShutdown(self.inner.handle);
+
+            drop(Box::from_raw(self.inner.compositor));
+
+            drop(Box::from_raw(
+                &raw const *self.inner as *mut FlutterEngineInner,
+            ));
+        }
+    }
+}
+
 fn create_task_runner<F: Fn(Task) + 'static>(
     id: usize,
-    runner: &'static TaskRunner<F>,
+    runner: TaskRunner<F>,
 ) -> FlutterTaskRunnerDescription {
     unsafe extern "C" fn runs_tasks_on_current_thread<F>(task_runner: *mut c_void) -> bool {
         task_runner
@@ -474,13 +503,21 @@ fn create_task_runner<F: Fn(Task) + 'static>(
         (*runner).post_task(task, target_time_nanos);
     }
 
+    unsafe extern "C" fn destruction_callback<F: Fn(Task)>(user_data: *mut c_void) {
+        tracing::debug!("destroying task runner");
+        drop(Box::from_raw(user_data.cast::<TaskRunner<F>>()));
+    }
+
+    // This is freed by the above destruction_callback.
+    let runner = Box::into_raw(Box::new(runner));
+
     FlutterTaskRunnerDescription {
         struct_size: mem::size_of::<FlutterTaskRunnerDescription>(),
         identifier: id,
-        user_data: runner as *const TaskRunner<F> as *mut c_void,
+        user_data: runner.cast(),
         runs_task_on_current_thread_callback: Some(runs_tasks_on_current_thread::<F>),
         post_task_callback: Some(post_task_callback::<F>),
-        destruction_callback: None,
+        destruction_callback: Some(destruction_callback::<F>),
     }
 }
 
@@ -490,39 +527,54 @@ pub trait BinaryMessageHandler {
 
 pub struct BinaryMessageReply {
     engine: flutter_embedder::FlutterEngine,
+    engine_is_running: Arc<Mutex<bool>>,
     response_handle: *const FlutterPlatformMessageResponseHandle,
 }
 
 impl BinaryMessageReply {
     pub(crate) fn new(
         engine: flutter_embedder::FlutterEngine,
+        engine_is_running: Arc<Mutex<bool>>,
         response_handle: *const FlutterPlatformMessageResponseHandle,
     ) -> BinaryMessageReply {
         BinaryMessageReply {
             engine,
+            engine_is_running,
             response_handle,
         }
     }
 
+    pub(crate) fn for_engine(
+        engine: &FlutterEngine,
+        response_handle: *const FlutterPlatformMessageResponseHandle,
+    ) -> BinaryMessageReply {
+        BinaryMessageReply::new(
+            engine.inner.handle,
+            engine.inner.is_running.clone(),
+            response_handle,
+        )
+    }
+
     pub fn send(self, message: &[u8]) {
-        unsafe {
-            FlutterEngineSendPlatformMessageResponse(
-                self.engine,
-                self.response_handle,
-                message.as_ptr(),
-                message.len(),
-            );
-        }
+        self.send_raw(message.as_ptr(), message.len());
     }
 
     pub fn not_implemented(self) {
-        unsafe {
-            FlutterEngineSendPlatformMessageResponse(
-                self.engine,
-                self.response_handle,
-                std::ptr::null(),
-                0,
-            );
+        self.send_raw(ptr::null(), 0);
+    }
+
+    fn send_raw(self, data: *const u8, length: usize) {
+        if *self.engine_is_running.lock() {
+            unsafe {
+                FlutterEngineSendPlatformMessageResponse(
+                    self.engine,
+                    self.response_handle,
+                    data,
+                    length,
+                );
+            }
+        } else {
+            tracing::error!("send called on a stopped engine");
         }
     }
 
@@ -538,10 +590,11 @@ unsafe extern "C" fn platform_message_callback(
     let engine = user_data.cast::<FlutterEngineInner>().as_ref().unwrap();
     let message = message.as_ref().unwrap();
 
-    let reply = BinaryMessageReply {
-        engine: engine.handle,
-        response_handle: message.response_handle,
-    };
+    let reply = BinaryMessageReply::new(
+        engine.handle,
+        engine.is_running.clone(),
+        message.response_handle,
+    );
 
     let channel = CStr::from_ptr(message.channel);
     let Ok(channel) = channel.to_str() else {
