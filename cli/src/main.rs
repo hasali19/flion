@@ -18,7 +18,32 @@ static PLUGINS_SHIM_SOURCE: &str = include_str!("../../plugins-compat/src/lib.rs
 #[derive(clap::Parser)]
 enum Command {
     /// Run a flion application
-    Run,
+    Run {
+        #[arg(long)]
+        release: bool,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BuildMode {
+    Debug,
+    Release,
+}
+
+impl BuildMode {
+    fn name(&self) -> &str {
+        match self {
+            BuildMode::Debug => "debug",
+            BuildMode::Release => "release",
+        }
+    }
+
+    fn cargo_profile(&self) -> &str {
+        match self {
+            BuildMode::Debug => "dev",
+            BuildMode::Release => "release",
+        }
+    }
 }
 
 fn main() -> eyre::Result<()> {
@@ -28,7 +53,7 @@ fn main() -> eyre::Result<()> {
     let command = Command::parse();
 
     match command {
-        Command::Run => {
+        Command::Run { release } => {
             #[cfg(target_os = "windows")]
             let flutter_program = "flutter.bat";
 
@@ -47,28 +72,57 @@ fn main() -> eyre::Result<()> {
                 &flutter_project_dir.join("build").join("flion"),
             )?;
 
-            build_flutter_assets(&flutter_program)?;
+            let build_mode = if release {
+                BuildMode::Release
+            } else {
+                BuildMode::Debug
+            };
 
             let flion_build_dir = flutter_project_dir.join("build").join("flion");
-            let target_dir = cargo_metadata.target_directory.as_std_path().join("debug");
+            let target_dir = cargo_metadata
+                .target_directory
+                .as_std_path()
+                .join(build_mode.name());
 
             if !target_dir.exists() {
                 fs::create_dir_all(&target_dir)?;
             }
 
-            copy_native_libraries(&flutter_program, flutter_project_dir, &target_dir)?;
+            flutter_assemble(&flutter_program, &flion_build_dir, build_mode)?;
+
+            copy_native_libraries(
+                &flutter_program,
+                flutter_project_dir,
+                build_mode,
+                &target_dir,
+            )?;
 
             compile_plugins_shim(&flion_build_dir.join("plugins"), &target_dir)?;
 
             process_plugins(&flutter_program, flutter_project_dir, &target_dir)?;
 
-            let embedder_path = get_engine_artifacts_dir(&flutter_program, &flion_build_dir)?
-                .join("windows-x64-embedder");
+            let embedder_path = get_engine_artifacts_dir(&flutter_program, &flion_build_dir)?.join(
+                match build_mode {
+                    BuildMode::Debug => "windows-x64-embedder",
+                    BuildMode::Release => "windows-x64-embedder-release",
+                },
+            );
+
             let angle_path = flion_build_dir.join("angle-win64");
 
-            let out = cmd!("cargo", "run")
+            let flutter_bundle_dir = flion_build_dir.join("out").join(build_mode.name());
+
+            let out = cmd!("cargo", "run", "--profile", build_mode.cargo_profile())
                 .env("FLUTTER_EMBEDDER_PATH", embedder_path)
                 .env("ANGLE_PATH", angle_path)
+                .env(
+                    "FLION_ASSETS_PATH",
+                    flutter_bundle_dir.join("flutter_assets"),
+                )
+                .env(
+                    "FLION_AOT_LIBRARY_PATH",
+                    flutter_bundle_dir.join("windows").join("app.so"),
+                )
                 .run()?;
 
             if let Some(code) = out.status.code() {
@@ -157,14 +211,26 @@ fn download_engine_artifacts(flutter_path: &Path, build_dir: &Path) -> eyre::Res
     for (name, archive_name) in FLUTTER_ENGINE_ARTIFACTS {
         let path = out_dir.join(name);
         if !path.exists() {
-            download_flutter_engine_artifact(engine_commit, name, archive_name, &out_dir)?;
+            download_google_engine_artifact(engine_commit, name, archive_name, &out_dir)?;
         }
+    }
+
+    let release_engine_url = format!(
+        "https://github.com/hasali19/flutter-engine-build/releases/download/build-{engine_commit}/windows-x64-embedder-release.zip"
+    );
+
+    if !out_dir.join("windows-x64-embedder-release").exists() {
+        download_engine_artifact(
+            "windows-x64-embedder-release",
+            &release_engine_url,
+            &out_dir,
+        )?;
     }
 
     Ok(())
 }
 
-fn download_flutter_engine_artifact(
+fn download_google_engine_artifact(
     engine_commit: &str,
     name: &str,
     archive_name: &str,
@@ -174,9 +240,16 @@ fn download_flutter_engine_artifact(
         "https://storage.googleapis.com/flutter_infra_release/flutter/{engine_commit}/{archive_name}"
     );
 
+    download_engine_artifact(name, &url, out_dir)
+}
+
+fn download_engine_artifact(name: &str, url: &str, out_dir: &Path) -> eyre::Result<()> {
     tracing::info!("downloading {name} from {url}");
 
-    let res = ureq::get(&url).call()?;
+    let res = ureq::get(url)
+        .call()
+        .wrap_err_with(|| eyre!("failed to download {name} from {url}"))?;
+
     if !res.status().is_success() {
         bail!("downloading {name} failed with: {}", res.status());
     }
@@ -204,10 +277,31 @@ fn download_flutter_engine_artifact(
     Ok(())
 }
 
-fn build_flutter_assets(flutter_path: &Path) -> eyre::Result<()> {
+fn flutter_assemble(
+    flutter_path: &Path,
+    build_dir: &Path,
+    build_mode: BuildMode,
+) -> eyre::Result<()> {
     tracing::info!("running flutter build");
 
-    let out = cmd!(flutter_path, "build", "bundle").run()?;
+    let mode = match build_mode {
+        BuildMode::Debug => "debug",
+        BuildMode::Release => "release",
+    };
+
+    let output = format!("--output={}", build_dir.join("out").join(mode).display());
+
+    let out = cmd!(
+        flutter_path,
+        "assemble",
+        output,
+        format!("--define=BuildMode={mode}"),
+        "--define=TargetPlatform=windows-x64",
+        "--define=TargetFile=lib/main.dart",
+        format!("{mode}_bundle_windows-x64_assets"),
+        "-v",
+    )
+    .run()?;
 
     if !out.status.success() {
         bail!("flutter build failed with status {}", out.status);
@@ -219,6 +313,7 @@ fn build_flutter_assets(flutter_path: &Path) -> eyre::Result<()> {
 fn copy_native_libraries(
     flutter_path: &Path,
     flutter_project_dir: &Path,
+    build_mode: BuildMode,
     out_dir: &Path,
 ) -> eyre::Result<()> {
     let build_dir = flutter_project_dir.join("build").join("flion");
@@ -228,9 +323,14 @@ fn copy_native_libraries(
 
     let engine_artifacts_dir = get_engine_artifacts_dir(flutter_path, &build_dir)?;
 
+    let mode_suffix = match build_mode {
+        BuildMode::Debug => "",
+        BuildMode::Release => "-release",
+    };
+
     copy_if_newer(
         &engine_artifacts_dir
-            .join("windows-x64-embedder")
+            .join(format!("windows-x64-embedder{mode_suffix}"))
             .join("flutter_engine.dll"),
         &out_dir.join("flutter_engine.dll"),
     )?;

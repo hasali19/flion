@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::marker::PhantomData;
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::{mem, ptr};
@@ -8,12 +9,16 @@ use std::{mem, ptr};
 use bitflags::bitflags;
 use eyre::bail;
 use flutter_embedder::{
-    FlutterBackingStore, FlutterBackingStoreConfig, FlutterCustomTaskRunners,
+    FlutterBackingStore, FlutterBackingStoreConfig, FlutterCustomTaskRunners, FlutterEngineAOTData,
+    FlutterEngineAOTDataSource,
+    FlutterEngineAOTDataSourceType_kFlutterEngineAOTDataSourceTypeElfPath,
+    FlutterEngineAOTDataSource__bindgen_ty_1, FlutterEngineCreateAOTData,
     FlutterEngineGetCurrentTime, FlutterEngineInitialize, FlutterEngineResult_kSuccess,
-    FlutterEngineRunInitialized, FlutterEngineRunTask, FlutterEngineSendKeyEvent,
-    FlutterEngineSendPlatformMessage, FlutterEngineSendPlatformMessageResponse,
-    FlutterEngineSendPointerEvent, FlutterEngineSendWindowMetricsEvent, FlutterEngineShutdown,
-    FlutterKeyEvent, FlutterKeyEventDeviceType_kFlutterKeyEventDeviceTypeKeyboard,
+    FlutterEngineRunInitialized, FlutterEngineRunTask, FlutterEngineRunsAOTCompiledDartCode,
+    FlutterEngineSendKeyEvent, FlutterEngineSendPlatformMessage,
+    FlutterEngineSendPlatformMessageResponse, FlutterEngineSendPointerEvent,
+    FlutterEngineSendWindowMetricsEvent, FlutterEngineShutdown, FlutterKeyEvent,
+    FlutterKeyEventDeviceType_kFlutterKeyEventDeviceTypeKeyboard,
     FlutterKeyEventType_kFlutterKeyEventTypeDown, FlutterKeyEventType_kFlutterKeyEventTypeRepeat,
     FlutterKeyEventType_kFlutterKeyEventTypeUp, FlutterLayer, FlutterOpenGLRendererConfig,
     FlutterPlatformMessage, FlutterPlatformMessageCreateResponseHandle,
@@ -42,6 +47,7 @@ use crate::task_runner::{self, Task, TaskRunner};
 
 pub struct FlutterEngineConfig<'a> {
     pub assets_path: &'a str,
+    pub aot_library_path: Option<&'a str>,
     pub egl: Arc<EglDevice>,
     pub compositor: FlutterCompositor,
     pub platform_task_handler: Box<dyn Fn(Task)>,
@@ -152,6 +158,7 @@ impl FlutterEngine {
         };
 
         let assets_path = CString::from_str(config.assets_path)?;
+        let aot_data = load_aot_data(config.aot_library_path)?.unwrap_or(ptr::null_mut());
 
         // This is freed when the FlutterEngine is dropped.
         let compositor = Box::into_raw(Box::new(config.compositor));
@@ -160,6 +167,7 @@ impl FlutterEngine {
             struct_size: mem::size_of::<FlutterProjectArgs>(),
             assets_path: assets_path.as_ptr(),
             icu_data_path: c"icudtl.dat".as_ptr(),
+            aot_data,
             custom_task_runners: &FlutterCustomTaskRunners {
                 struct_size: mem::size_of::<FlutterCustomTaskRunners>(),
                 platform_task_runner: &platform_task_runner,
@@ -480,6 +488,39 @@ impl Drop for FlutterEngine {
             ));
         }
     }
+}
+
+fn load_aot_data(path: Option<&str>) -> eyre::Result<Option<FlutterEngineAOTData>> {
+    if !unsafe { FlutterEngineRunsAOTCompiledDartCode() } {
+        tracing::debug!("Engine does not support AOT dart code");
+        return Ok(None);
+    }
+
+    let Some(path) = path else {
+        bail!("No AOT library path was provided");
+    };
+
+    if !Path::new(path).exists() {
+        bail!("AOT library not found at {path}");
+    }
+
+    let c_path = CString::from_str(path)?;
+    let source = FlutterEngineAOTDataSource {
+        type_: FlutterEngineAOTDataSourceType_kFlutterEngineAOTDataSourceTypeElfPath,
+        __bindgen_anon_1: FlutterEngineAOTDataSource__bindgen_ty_1 {
+            elf_path: c_path.as_ptr(),
+        },
+    };
+
+    let mut aot_data = ptr::null_mut();
+    if unsafe { FlutterEngineCreateAOTData(&source, &mut aot_data) } != FlutterEngineResult_kSuccess
+    {
+        bail!("Failed to load AOT data from {path}");
+    }
+
+    tracing::info!("Loaded AOT data from {path}");
+
+    Ok(Some(aot_data))
 }
 
 fn create_task_runner<F: Fn(Task) + 'static>(

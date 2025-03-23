@@ -15,9 +15,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .init();
     }
 
-    FlionEngine::new("build/flutter_assets")
-        .with_plugins(PLUGINS)
-        .run()?;
+    FlionEngine::new().with_plugins(PLUGINS).run()?;
 
     Ok(())
 }

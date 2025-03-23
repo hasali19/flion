@@ -16,9 +16,10 @@ pub mod standard_method_channel;
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
-use std::mem;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::{env, mem};
 
 use engine::{PointerButtons, PointerDeviceKind, PointerEvent};
 use eyre::OptionExt;
@@ -84,18 +85,24 @@ enum PlatformEvent {
 }
 
 pub struct FlionEngine<'a> {
-    assets_path: &'a str,
+    bundle_path: &'a Path,
     plugin_initializers: &'a [unsafe extern "C" fn(*mut c_void)],
     platform_message_handlers: Vec<(&'a str, Box<dyn BinaryMessageHandler>)>,
 }
 
 impl<'a> FlionEngine<'a> {
-    pub fn new(assets_path: &str) -> FlionEngine {
+    #[expect(clippy::new_without_default)]
+    pub fn new() -> FlionEngine<'a> {
         FlionEngine {
-            assets_path,
+            bundle_path: Path::new("data"),
             plugin_initializers: &[],
             platform_message_handlers: vec![],
         }
+    }
+
+    pub fn with_bundle_path(mut self, path: &'a Path) -> Self {
+        self.bundle_path = path;
+        self
     }
 
     pub fn with_plugins(mut self, plugins: &'a [unsafe extern "C" fn(*mut c_void)]) -> Self {
@@ -115,7 +122,7 @@ impl<'a> FlionEngine<'a> {
     pub fn run(self) -> eyre::Result<()> {
         let event_loop = EventLoopBuilder::<PlatformEvent>::with_user_event().build()?;
         let window = WindowBuilder::new()
-            .with_inner_size(LogicalSize::new(800, 600))
+            .with_inner_size(LogicalSize::new(1280, 720))
             .with_no_redirection_bitmap(true)
             .build(&event_loop)?;
 
@@ -212,8 +219,24 @@ impl<'a> FlionEngine<'a> {
 
         platform_message_handlers.extend(self.platform_message_handlers);
 
+        // TODO: Disable environment variable lookup in release builds.
+        // These variables are provided by the flion cli during development, and are not intended
+        // to be used in release builds.
+        let assets_path = env::var("FLION_ASSETS_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| self.bundle_path.join("flutter_assets"));
+
+        let aot_library_path = env::var("FLION_AOT_LIBRARY_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| self.bundle_path.join("app.so"));
+
         let engine = Rc::new(FlutterEngine::new(FlutterEngineConfig {
-            assets_path: self.assets_path,
+            assets_path: assets_path.to_str().ok_or_eyre("invalid assets path")?,
+            aot_library_path: Some(
+                aot_library_path
+                    .to_str()
+                    .ok_or_eyre("invalid aot library path")?,
+            ),
             egl: egl.clone(),
             compositor,
             platform_task_handler: Box::new({
