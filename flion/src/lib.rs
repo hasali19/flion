@@ -379,7 +379,7 @@ impl<'a> FlionEngine<'a> {
 
                             let scroll_multiplier = f64::from(lines_per_scroll) * 100.0 / 3.0;
 
-                            let x = f64::from(x) * scroll_multiplier;
+                            let x = -f64::from(x) * scroll_multiplier;
                             let y = -f64::from(y) * scroll_multiplier;
 
                             let _ = engine
