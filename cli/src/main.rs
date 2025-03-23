@@ -48,7 +48,10 @@ impl BuildMode {
 
 fn main() -> eyre::Result<()> {
     color_eyre::install()?;
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .without_time()
+        .with_target(false)
+        .init();
 
     let command = Command::parse();
 
@@ -123,10 +126,14 @@ fn main() -> eyre::Result<()> {
                     "FLION_AOT_LIBRARY_PATH",
                     flutter_bundle_dir.join("windows").join("app.so"),
                 )
+                .unchecked()
                 .run()?;
 
-            if let Some(code) = out.status.code() {
-                process::exit(code);
+            if let Some(code) = out.status.code()
+                && code != 0
+            {
+                tracing::error!("command exited with code {code}");
+                process::exit(1);
             }
         }
     }
@@ -284,6 +291,8 @@ fn flutter_assemble(
 ) -> eyre::Result<()> {
     tracing::info!("running flutter build");
 
+    cmd!(flutter_path, "pub", "get").run()?;
+
     let mode = match build_mode {
         BuildMode::Debug => "debug",
         BuildMode::Release => "release",
@@ -299,7 +308,6 @@ fn flutter_assemble(
         "--define=TargetPlatform=windows-x64",
         "--define=TargetFile=lib/main.dart",
         format!("{mode}_bundle_windows-x64_assets"),
-        "-v",
     )
     .run()?;
 
@@ -507,17 +515,42 @@ fn process_plugins(
         fs::write(plugins_build_dir.join("plugins.txt"), plugins_list)?;
     }
 
-    cmake::Config::new(&plugins_build_dir)
-        .host("x86_64-pc-windows-msvc")
-        .target("x86_64-pc-windows-msvc")
-        .profile("Release")
-        .no_build_target(true)
-        .out_dir(&plugins_build_dir)
-        .define("FLUTTER_PLUGINS", plugin_names.join(";"))
-        .build();
+    let d_flutter_plugins = format!("-DFLUTTER_PLUGINS={}", plugin_names.join(";"));
+    let d_cmake_install_prefix = format!("-DCMAKE_INSTALL_PREFIX={}", plugins_build_dir.display());
+
+    fs::create_dir_all(plugins_build_dir.join("build"))?;
+
+    let cmake_build_dir = plugins_build_dir.join("build");
+
+    tracing::info!("running cmake gen for plugins");
+
+    cmd!(
+        "cmake",
+        &plugins_build_dir,
+        d_flutter_plugins,
+        d_cmake_install_prefix,
+        "-DCMAKE_BUILD_TYPE=Release",
+    )
+    .dir(&cmake_build_dir)
+    .stdout_file(File::create(plugins_build_dir.join("cmake_gen.txt"))?)
+    .stderr_to_stdout()
+    .run()?;
+
+    tracing::info!("running cmake build for plugins");
+
+    cmd!("cmake", "--build", &cmake_build_dir, "--config", "Release")
+        .stdout_file(File::create(plugins_build_dir.join("cmake_build.txt"))?)
+        .stderr_to_stdout()
+        .run()?;
+
+    let log_file = plugins_build_dir.join("cmake_install.txt");
+
+    tracing::info!("running cmake install for plugins");
 
     cmd!("cmake", "--install", ".", "--config", "Release")
-        .dir(plugins_build_dir.join("build"))
+        .dir(&cmake_build_dir)
+        .stdout_file(File::create(log_file)?)
+        .stderr_to_stdout()
         .run()?;
 
     for lib in std::fs::read_dir(plugins_build_dir.join("bin"))? {
