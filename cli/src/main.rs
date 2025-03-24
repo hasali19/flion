@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter};
+use std::io::{self, BufWriter, Cursor};
 use std::path::{Path, PathBuf};
 use std::{env, fs, process};
 
@@ -271,22 +271,15 @@ fn download_engine_artifact(name: &str, url: &str, out_dir: &Path) -> eyre::Resu
     fs::create_dir_all(out_dir)?;
 
     let extract_path = out_dir.join(name);
-    let archive_path = extract_path.with_extension("zip");
-
-    {
-        let body = res.into_body();
-        let out_file = File::create(&archive_path)
-            .wrap_err_with(|| eyre!("failed to create file: {}", archive_path.display()))?;
-
-        io::copy(&mut body.into_reader(), &mut BufWriter::new(out_file))?;
-    }
-
-    let archive = File::open(&archive_path)
-        .wrap_err_with(|| eyre!("failed to open file: {}", archive_path.display()))?;
+    let bytes = res
+        .into_body()
+        .with_config()
+        .limit(1_000_000_000) // 1GB should be plenty
+        .read_to_vec()?;
 
     tracing::info!("unpacking {name} to {}", extract_path.display());
 
-    ZipArchive::new(BufReader::new(archive))?.extract(extract_path)?;
+    ZipArchive::new(Cursor::new(bytes))?.extract(extract_path)?;
 
     Ok(())
 }
@@ -422,6 +415,8 @@ fn copy_native_libraries(
         tracing::info!("unpacking angle to {angle_extract_path:?}");
 
         cmd!("tar", "xf", &angle_archive_path, "-C", &build_dir).run()?;
+
+        fs::remove_file(angle_archive_path)?;
     }
 
     for lib in ["libEGL.dll", "libGLESv2.dll"] {
