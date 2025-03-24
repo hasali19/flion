@@ -5,9 +5,9 @@ edition = "2024"
 
 [dependencies]
 color-eyre = "0.6.3"
-flion = { path = "../flion" }
+flion = { path = "../crates/flion" }
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 
 [build-dependencies]
-flion-build = { path = "../flion-build" }
+flion-build = { path = "../crates/flion-build" }
