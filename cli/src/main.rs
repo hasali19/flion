@@ -81,7 +81,8 @@ fn main() -> eyre::Result<()> {
                 BuildMode::Debug
             };
 
-            let flion_build_dir = flutter_project_dir.join("build").join("flion");
+            let flutter_build_dir = flutter_project_dir.join("build");
+            let flion_build_dir = flutter_build_dir.join("flion");
             let target_dir = cargo_metadata
                 .target_directory
                 .as_std_path()
@@ -91,7 +92,16 @@ fn main() -> eyre::Result<()> {
                 fs::create_dir_all(&target_dir)?;
             }
 
-            flutter_assemble(&flutter_program, &flion_build_dir, build_mode)?;
+            let engine_artifacts_dir =
+                get_engine_artifacts_dir(&flutter_program, &flion_build_dir)?;
+
+            flutter_build(
+                &flutter_program,
+                flutter_project_dir,
+                &engine_artifacts_dir,
+                &flion_build_dir,
+                build_mode,
+            )?;
 
             copy_native_libraries(
                 &flutter_program,
@@ -104,28 +114,21 @@ fn main() -> eyre::Result<()> {
 
             process_plugins(&flutter_program, flutter_project_dir, &target_dir)?;
 
-            let embedder_path = get_engine_artifacts_dir(&flutter_program, &flion_build_dir)?.join(
-                match build_mode {
-                    BuildMode::Debug => "windows-x64-embedder",
-                    BuildMode::Release => "windows-x64-embedder-release",
-                },
-            );
+            let embedder_path = engine_artifacts_dir.join(match build_mode {
+                BuildMode::Debug => "windows-x64-embedder",
+                BuildMode::Release => "windows-x64-embedder-release",
+            });
 
             let angle_path = flion_build_dir.join("angle-win64");
-
-            let flutter_bundle_dir = flion_build_dir.join("out").join(build_mode.name());
 
             let out = cmd!("cargo", "run", "--profile", build_mode.cargo_profile())
                 .env("FLUTTER_EMBEDDER_PATH", embedder_path)
                 .env("ANGLE_PATH", angle_path)
                 .env(
                     "FLION_ASSETS_PATH",
-                    flutter_bundle_dir.join("flutter_assets"),
+                    flutter_build_dir.join("flutter_assets"),
                 )
-                .env(
-                    "FLION_AOT_LIBRARY_PATH",
-                    flutter_bundle_dir.join("windows").join("app.so"),
-                )
+                .env("FLION_AOT_LIBRARY_PATH", flion_build_dir.join("app.so"))
                 .unchecked()
                 .run()?;
 
@@ -189,6 +192,10 @@ fn get_engine_artifacts_dir(flutter_path: &Path, build_dir: &Path) -> eyre::Resu
 
 const FLUTTER_ENGINE_ARTIFACTS: &[(&str, &str)] = &[
     ("artifacts", "windows-x64/artifacts.zip"),
+    (
+        "flutter_patched_sdk_product",
+        "flutter_patched_sdk_product.zip",
+    ),
     (
         "windows-x64-embedder",
         "windows-x64/windows-x64-embedder.zip",
@@ -284,35 +291,73 @@ fn download_engine_artifact(name: &str, url: &str, out_dir: &Path) -> eyre::Resu
     Ok(())
 }
 
-fn flutter_assemble(
+fn flutter_build(
     flutter_path: &Path,
+    flutter_project_dir: &Path,
+    engine_artifacts_dir: &Path,
     build_dir: &Path,
     build_mode: BuildMode,
 ) -> eyre::Result<()> {
-    tracing::info!("running flutter build");
+    tracing::info!("building flutter bundle");
 
-    cmd!(flutter_path, "pub", "get").run()?;
+    cmd!(flutter_path, "build", "bundle").run()?;
 
-    let mode = match build_mode {
-        BuildMode::Debug => "debug",
-        BuildMode::Release => "release",
-    };
+    if build_mode == BuildMode::Release {
+        let dartaotruntime = flutter_path
+            .parent()
+            .unwrap()
+            .join("cache/dart-sdk/bin/dartaotruntime.exe");
 
-    let output = format!("--output={}", build_dir.join("out").join(mode).display());
+        let frontend_server_snapshot = engine_artifacts_dir
+            .join("artifacts")
+            .join("frontend_server_aot.dart.snapshot");
 
-    let out = cmd!(
-        flutter_path,
-        "assemble",
-        output,
-        format!("--define=BuildMode={mode}"),
-        "--define=TargetPlatform=windows-x64",
-        "--define=TargetFile=lib/main.dart",
-        format!("{mode}_bundle_windows-x64_assets"),
-    )
-    .run()?;
+        let sdk_root = engine_artifacts_dir
+            .join("flutter_patched_sdk_product")
+            .join("flutter_patched_sdk_product");
 
-    if !out.status.success() {
-        bail!("flutter build failed with status {}", out.status);
+        tracing::info!("building kernel_snapshot.dill");
+
+        cmd!(
+            dartaotruntime,
+            frontend_server_snapshot,
+            "--sdk-root",
+            sdk_root,
+            "--target=flutter",
+            "--no-print-incremental-dependencies",
+            "-Ddart.vm.profile=false",
+            "-Ddart.vm.product=true",
+            "--delete-tostring-package-uri=dart:ui",
+            "--delete-tostring-package-uri=package:flutter",
+            "--aot",
+            "--tfa",
+            "--target-os",
+            "windows",
+            "--packages",
+            flutter_project_dir
+                .join(".dart_tool")
+                .join("package_config.json"),
+            "--output-dill",
+            build_dir.join("kernel_snapshot.dill"),
+            flutter_project_dir.join("lib").join("main.dart"),
+        )
+        .run()?;
+
+        let gen_snapshot = engine_artifacts_dir
+            .join("windows-x64-embedder-release")
+            .join("gen_snapshot.exe");
+
+        tracing::info!("building aot library");
+
+        cmd!(
+            gen_snapshot,
+            "--deterministic",
+            "--snapshot_kind=app-aot-elf",
+            format!("--elf={}", build_dir.join("app.so").display()),
+            "--strip",
+            build_dir.join("kernel_snapshot.dill"),
+        )
+        .run()?;
     }
 
     Ok(())
