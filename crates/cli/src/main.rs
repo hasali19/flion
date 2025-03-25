@@ -391,7 +391,7 @@ fn copy_native_libraries(
     let angle_archive_path = build_dir.join(angle_archive_name);
     let angle_extract_path = build_dir.join("angle-win64");
 
-    if !angle_archive_path.exists() {
+    if !angle_extract_path.exists() {
         let url = format!(
             "https://github.com/hasali19/angle-build/releases/download/build-{angle_version}/angle-win64.tar.gz"
         );
