@@ -1,5 +1,7 @@
 import 'package:dynamic_system_colors/dynamic_system_colors.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
+import 'package:flutter/services.dart';
 
 void main() {
   runApp(const MyApp());
@@ -82,32 +84,40 @@ class _MyHomePageState extends State<MyHomePage> {
       body: Center(
         // Center is a layout widget. It takes a single child and positions it
         // in the middle of the parent.
-        child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Invoke "debug painting" (press "p" in the console, choose the
-          // "Toggle Debug Paint" action from the Flutter Inspector in Android
-          // Studio, or the "Toggle Debug Paint" command in Visual Studio Code)
-          // to see the wireframe for each widget.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            TextField(
-              controller: _textController,
+        child: Stack(
+          children: [
+            const Padding(
+              padding: EdgeInsets.all(32),
+              child: FlionPlatformView(),
             ),
-            const Text(
-              'You have pushed the button this many times:',
-            ),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
+            Column(
+              // Column is also a layout widget. It takes a list of children and
+              // arranges them vertically. By default, it sizes itself to fit its
+              // children horizontally, and tries to be as tall as its parent.
+              //
+              // Invoke "debug painting" (press "p" in the console, choose the
+              // "Toggle Debug Paint" action from the Flutter Inspector in Android
+              // Studio, or the "Toggle Debug Paint" command in Visual Studio Code)
+              // to see the wireframe for each widget.
+              //
+              // Column has various properties to control how it sizes itself and
+              // how it positions its children. Here we use mainAxisAlignment to
+              // center the children vertically; the main axis here is the vertical
+              // axis because Columns are vertical (the cross axis would be
+              // horizontal).
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: <Widget>[
+                TextField(
+                  controller: _textController,
+                ),
+                const Text(
+                  'You have pushed the button this many times:',
+                ),
+                Text(
+                  '$_counter',
+                  style: Theme.of(context).textTheme.headlineMedium,
+                ),
+              ],
             ),
           ],
         ),
@@ -118,5 +128,89 @@ class _MyHomePageState extends State<MyHomePage> {
         child: const Icon(Icons.add),
       ), // This trailing comma makes auto-formatting nicer for build methods.
     );
+  }
+}
+
+class FlionPlatformView extends StatefulWidget {
+  const FlionPlatformView({super.key});
+
+  @override
+  State<FlionPlatformView> createState() => _FlionPlatformViewState();
+}
+
+const platformViewsChannel = MethodChannel('flion/platform_views');
+
+class _FlionPlatformViewState extends State<FlionPlatformView> {
+  late final int _id;
+
+  bool _isInit = false;
+
+  @override
+  void initState() {
+    super.initState();
+
+    _id = platformViewsRegistry.getNextPlatformViewId();
+
+    platformViewsChannel
+        .invokeMethod('create', {'id': _id, 'type': 'example'}).then((value) {
+      setState(() {
+        _isInit = true;
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    super.dispose();
+    platformViewsChannel.invokeMethod('destroy', {'id': _id});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_isInit) {
+      return FlionPlatformViewImpl(viewId: _id);
+    } else {
+      return Container();
+    }
+  }
+}
+
+class FlionPlatformViewImpl extends LeafRenderObjectWidget {
+  final int viewId;
+
+  const FlionPlatformViewImpl({
+    super.key,
+    required this.viewId,
+  });
+
+  @override
+  RenderObject createRenderObject(BuildContext context) {
+    return PlatformViewRenderBox(viewId: viewId);
+  }
+}
+
+class PlatformViewRenderBox extends RenderBox {
+  final int viewId;
+
+  PlatformViewRenderBox({required this.viewId});
+
+  @override
+  bool get sizedByParent => true;
+
+  @override
+  bool get alwaysNeedsCompositing => true;
+
+  @override
+  bool get isRepaintBoundary => true;
+
+  @override
+  @protected
+  Size computeDryLayout(covariant BoxConstraints constraints) {
+    return constraints.biggest;
+  }
+
+  @override
+  void paint(PaintingContext context, Offset offset) {
+    context.addLayer(PlatformViewLayer(rect: offset & size, viewId: viewId));
   }
 }

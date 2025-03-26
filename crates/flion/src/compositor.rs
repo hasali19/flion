@@ -6,13 +6,13 @@ use flutter_embedder::{
     FlutterBackingStore, FlutterBackingStoreConfig,
     FlutterBackingStoreType_kFlutterBackingStoreTypeOpenGL, FlutterBackingStore__bindgen_ty_1,
     FlutterLayer, FlutterLayerContentType_kFlutterLayerContentTypeBackingStore,
-    FlutterOpenGLBackingStore, FlutterOpenGLBackingStore__bindgen_ty_1, FlutterOpenGLSurface,
+    FlutterLayerContentType_kFlutterLayerContentTypePlatformView, FlutterOpenGLBackingStore,
+    FlutterOpenGLBackingStore__bindgen_ty_1, FlutterOpenGLSurface,
     FlutterOpenGLTargetType_kFlutterOpenGLTargetTypeSurface,
+    FlutterPlatformViewMutationType_kFlutterPlatformViewMutationTypeTransformation,
 };
 use khronos_egl::{self as egl};
-use windows::core::Interface;
-use windows::Foundation::Numerics::Vector2;
-use windows::Win32::Foundation::BOOL;
+use windows::core::{Interface, BOOL};
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
@@ -24,8 +24,10 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
 use windows::Win32::System::WinRT::Composition::ICompositorInterop;
 use windows::UI::Composition::{Compositor, ContainerVisual, SpriteVisual};
+use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::egl::EglDevice;
+use crate::platform_views::{PlatformViewUpdateArgs, PlatformViews};
 
 pub trait CompositionHandler: Send {
     /// Returns the current size of the rendering area.
@@ -41,8 +43,15 @@ pub struct FlutterCompositor {
     compositor: Compositor,
     root_visual: ContainerVisual,
     egl: Arc<EglDevice>,
-    layers: Vec<*const CompositorFlutterLayer>,
+    layers: Vec<LayerId>,
     handler: Box<dyn CompositionHandler>,
+    platform_views: Arc<PlatformViews>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LayerId {
+    FlutterLayer(*const CompositorFlutterLayer),
+    PlatformView(u64),
 }
 
 struct CompositorFlutterLayer {
@@ -62,6 +71,8 @@ impl FlutterCompositor {
     ) -> eyre::Result<FlutterCompositor> {
         let compositor = visual.Compositor()?;
 
+        let platform_views = Arc::new(PlatformViews::new());
+
         Ok(FlutterCompositor {
             device,
             compositor,
@@ -69,7 +80,12 @@ impl FlutterCompositor {
             root_visual: visual,
             layers: vec![],
             handler,
+            platform_views,
         })
+    }
+
+    pub fn platform_views(&self) -> Arc<PlatformViews> {
+        self.platform_views.clone()
     }
 
     pub fn get_surface_transformation(
@@ -229,35 +245,87 @@ impl FlutterCompositor {
         let mut should_update_composition_layers = self.layers.len() != layers.len();
         let mut should_flush_rendering = false;
 
+        let mut platform_views = self.platform_views.acquire();
+
         for (i, &layer) in layers.iter().enumerate() {
-            // TODO: Support platform views
-            assert_eq!(
-                layer.type_,
-                FlutterLayerContentType_kFlutterLayerContentTypeBackingStore
-            );
+            if layer.type_ == FlutterLayerContentType_kFlutterLayerContentTypeBackingStore {
+                let compositor_layer = unsafe {
+                    (*layer.__bindgen_anon_1.backing_store)
+                        .user_data
+                        .cast::<CompositorFlutterLayer>()
+                        .as_mut()
+                        .unwrap()
+                };
 
-            let compositor_layer = unsafe {
-                (*layer.__bindgen_anon_1.backing_store)
-                    .user_data
-                    .cast::<CompositorFlutterLayer>()
-                    .as_mut()
-                    .unwrap()
-            };
+                // Composition layers need to be updated if flutter layers have been reordered.
+                should_update_composition_layers = should_update_composition_layers
+                    || self.layers[i] != LayerId::FlutterLayer(compositor_layer);
 
-            // Composition layers need to be updated if flutter layers have been reordered.
-            should_update_composition_layers =
-                should_update_composition_layers || self.layers[i] != compositor_layer;
+                unsafe {
+                    compositor_layer
+                        .swapchain
+                        .Present(0, DXGI_PRESENT::default())
+                        .ok()?;
+                }
 
-            unsafe {
-                compositor_layer
-                    .swapchain
-                    .Present(0, DXGI_PRESENT::default())
-                    .ok()?;
+                should_flush_rendering =
+                    should_flush_rendering || compositor_layer.is_first_present;
+
+                compositor_layer.is_first_present = false;
+            } else if layer.type_ == FlutterLayerContentType_kFlutterLayerContentTypePlatformView {
+                let platform_view_layer = unsafe { &*layer.__bindgen_anon_1.platform_view };
+                let id = platform_view_layer.identifier.try_into()?;
+                let Some(platform_view) = platform_views.get_mut(id) else {
+                    tracing::error!("no platform view found with id: {id}");
+                    continue;
+                };
+
+                let size = layer.size;
+
+                // TODO: Figure out how flutter calculates this offset. It seems to be nonsense.
+                // let offset = layer.offset;
+
+                let mutations = unsafe {
+                    std::slice::from_raw_parts(
+                        platform_view_layer.mutations,
+                        platform_view_layer.mutations_count,
+                    )
+                };
+
+                let mut full_transform = Matrix3x2::identity();
+
+                // The first mutation seems to be the surface transformation that we provide to
+                // flutter to vertically flip flutter surfaces. We don't need to apply that to
+                // platform views, so skip it.
+                for &mutation in mutations.iter().skip(1) {
+                    let mutation = unsafe { &*mutation };
+                    let is_transformation = mutation.type_ == FlutterPlatformViewMutationType_kFlutterPlatformViewMutationTypeTransformation;
+                    if is_transformation {
+                        let transformation = unsafe { mutation.__bindgen_anon_1.transformation };
+
+                        let transform_matrix = Matrix3x2 {
+                            M11: transformation.scaleX as f32,
+                            M21: transformation.skewX as f32,
+                            M31: transformation.transX as f32,
+                            M12: transformation.skewY as f32,
+                            M22: transformation.scaleY as f32,
+                            M32: transformation.transY as f32,
+                        };
+
+                        full_transform = transform_matrix * full_transform;
+                    }
+                }
+
+                (platform_view.on_update)(&PlatformViewUpdateArgs {
+                    // size appears to already be multiplied by scale factor of transformation
+                    width: size.width,
+                    height: size.height,
+                    x: full_transform.M31 as f64,
+                    y: full_transform.M32 as f64,
+                });
+            } else {
+                tracing::error!("invalid flutter layer content type: {}", layer.type_);
             }
-
-            should_flush_rendering = should_flush_rendering || compositor_layer.is_first_present;
-
-            compositor_layer.is_first_present = false;
         }
 
         if should_flush_rendering {
@@ -280,19 +348,38 @@ impl FlutterCompositor {
             self.layers.clear();
 
             for &layer in layers {
-                let compositor_layer = unsafe {
-                    (*layer.__bindgen_anon_1.backing_store)
-                        .user_data
-                        .cast::<CompositorFlutterLayer>()
-                        .as_mut()
-                        .unwrap()
-                };
+                if layer.type_ == FlutterLayerContentType_kFlutterLayerContentTypeBackingStore {
+                    let compositor_layer = unsafe {
+                        (*layer.__bindgen_anon_1.backing_store)
+                            .user_data
+                            .cast::<CompositorFlutterLayer>()
+                            .as_mut()
+                            .unwrap()
+                    };
 
-                self.root_visual
-                    .Children()?
-                    .InsertAtTop(&compositor_layer.visual)?;
+                    self.root_visual
+                        .Children()?
+                        .InsertAtTop(&compositor_layer.visual)?;
 
-                self.layers.push(compositor_layer);
+                    self.layers.push(LayerId::FlutterLayer(compositor_layer));
+                } else if layer.type_
+                    == FlutterLayerContentType_kFlutterLayerContentTypePlatformView
+                {
+                    let platform_view_layer = unsafe { &*layer.__bindgen_anon_1.platform_view };
+                    let id = platform_view_layer.identifier.try_into()?;
+                    let Some(platform_view) = platform_views.get_mut(id) else {
+                        tracing::error!("no platform view found with id: {id}");
+                        continue;
+                    };
+
+                    self.root_visual
+                        .Children()?
+                        .InsertAtTop(&platform_view.visual)?;
+
+                    self.layers.push(LayerId::PlatformView(id));
+                } else {
+                    unimplemented!("unsupported layer type: {}", layer.type_);
+                }
             }
         }
 
