@@ -83,7 +83,7 @@ pub enum PointerDeviceKind {
     Trackpad = FlutterPointerDeviceKind_kFlutterPointerDeviceKindTrackpad,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 #[repr(i32)]
 pub enum PointerPhase {
     #[default]

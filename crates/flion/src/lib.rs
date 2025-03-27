@@ -15,7 +15,7 @@ mod text_input;
 pub mod codec;
 pub mod standard_method_channel;
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
@@ -46,10 +46,12 @@ use windows::Win32::System::WinRT::Composition::ICompositorDesktopInterop;
 use windows::Win32::System::WinRT::{
     CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_ASTA, DQTYPE_THREAD_CURRENT,
 };
+use windows::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     SystemParametersInfoW, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    WM_NCCALCSIZE,
+    WM_MOUSEMOVE, WM_NCCALCSIZE,
 };
 use windows::UI::Composition::Core::CompositorController;
 use windows::UI::Composition::{Compositor, ContainerVisual};
@@ -82,7 +84,44 @@ macro_rules! include_plugins {
 struct WindowData {
     engine: *const engine::FlutterEngine,
     resize_controller: Arc<ResizeController>,
-    scale_factor: Cell<f64>,
+    scale_factor: f64,
+    cursor_position: (f64, f64),
+    pointer_is_down: bool,
+    buttons: PointerButtons,
+    is_tracking_mouse_leave: bool,
+}
+
+impl WindowData {
+    fn track_mouse_leave_event(&mut self, hwnd: HWND) {
+        if !self.is_tracking_mouse_leave {
+            let mut event = TRACKMOUSEEVENT {
+                cbSize: mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                hwndTrack: hwnd,
+                dwFlags: TME_LEAVE,
+                dwHoverTime: 0,
+            };
+
+            unsafe {
+                TrackMouseEvent(&mut event).unwrap();
+            }
+
+            self.is_tracking_mouse_leave = true;
+
+            unsafe {
+                tracing::info!("mouse added");
+                let _ = (*self.engine)
+                    .send_pointer_event(&PointerEvent {
+                        device_kind: PointerDeviceKind::Mouse,
+                        device_id: 1,
+                        phase: PointerPhase::Add,
+                        x: self.cursor_position.0,
+                        y: self.cursor_position.1,
+                        buttons: self.buttons,
+                    })
+                    .trace_err();
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -332,10 +371,14 @@ impl<'a> FlionEngine<'a> {
 
         settings::send_to_engine(&engine)?;
 
-        let window_data = Box::leak(Box::new(WindowData {
+        let window_data = Box::into_raw(Box::new(WindowData {
             engine: &*engine,
             resize_controller,
-            scale_factor: Cell::new(window.scale_factor()),
+            scale_factor: window.scale_factor(),
+            cursor_position: (0.0, 0.0),
+            pointer_is_down: false,
+            buttons: PointerButtons::empty(),
+            is_tracking_mouse_leave: false,
         }));
 
         unsafe {
@@ -363,53 +406,9 @@ impl<'a> FlionEngine<'a> {
                     WindowEvent::ScaleFactorChanged {
                         scale_factor,
                         inner_size_writer: _,
-                    } => {
-                        window_data.scale_factor.set(scale_factor);
-                    }
-                    WindowEvent::CursorMoved { position, .. } => {
-                        cursor_pos = position;
-
-                        let phase = if pointer_is_down {
-                            PointerPhase::Move
-                        } else {
-                            PointerPhase::Hover
-                        };
-
-                        let _ = engine
-                            .send_pointer_event(&PointerEvent {
-                                device_kind: PointerDeviceKind::Mouse,
-                                device_id: 1,
-                                phase,
-                                x: cursor_pos.x,
-                                y: cursor_pos.y,
-                                buttons,
-                            })
-                            .trace_err();
-                    }
-                    WindowEvent::CursorEntered { .. } => {
-                        let _ = engine
-                            .send_pointer_event(&PointerEvent {
-                                device_kind: PointerDeviceKind::Mouse,
-                                device_id: 1,
-                                phase: PointerPhase::Add,
-                                x: cursor_pos.x,
-                                y: cursor_pos.y,
-                                buttons,
-                            })
-                            .trace_err();
-                    }
-                    WindowEvent::CursorLeft { .. } => {
-                        let _ = engine
-                            .send_pointer_event(&PointerEvent {
-                                device_kind: PointerDeviceKind::Mouse,
-                                device_id: 1,
-                                phase: PointerPhase::Remove,
-                                x: cursor_pos.x,
-                                y: cursor_pos.y,
-                                buttons,
-                            })
-                            .trace_err();
-                    }
+                    } => unsafe {
+                        (*window_data).scale_factor = scale_factor;
+                    },
                     WindowEvent::MouseInput { state, button, .. } => {
                         let phase = match state {
                             ElementState::Pressed => PointerPhase::Down,
@@ -526,7 +525,7 @@ unsafe extern "system" fn wnd_proc(
     _uidsubclass: usize,
     dwrefdata: usize,
 ) -> LRESULT {
-    let data = (dwrefdata as *const WindowData).as_ref().unwrap();
+    let data = &mut *(dwrefdata as *mut WindowData);
     match msg {
         WM_NCCALCSIZE => {
             DefSubclassProc(window, msg, wparam, lparam);
@@ -544,11 +543,52 @@ unsafe extern "system" fn wnd_proc(
                             .send_window_metrics_event(
                                 width as usize,
                                 height as usize,
-                                data.scale_factor.get(),
+                                data.scale_factor,
                             )
                             .unwrap();
                     });
             }
+        }
+        WM_MOUSEMOVE => {
+            data.track_mouse_leave_event(window);
+
+            let x = lparam.0 & 0xffff;
+            let y = (lparam.0 >> 16) & 0xffff;
+
+            data.cursor_position = (x as f64, y as f64);
+
+            let phase = if data.pointer_is_down {
+                PointerPhase::Move
+            } else {
+                PointerPhase::Hover
+            };
+
+            let _ = (*data.engine)
+                .send_pointer_event(&PointerEvent {
+                    device_kind: PointerDeviceKind::Mouse,
+                    device_id: 1,
+                    phase,
+                    x: x as f64,
+                    y: y as f64,
+                    buttons: data.buttons,
+                })
+                .trace_err();
+        }
+        WM_MOUSELEAVE => {
+            tracing::info!("mouse removed");
+
+            let _ = (*data.engine)
+                .send_pointer_event(&PointerEvent {
+                    device_kind: PointerDeviceKind::Mouse,
+                    device_id: 1,
+                    phase: PointerPhase::Remove,
+                    x: data.cursor_position.0,
+                    y: data.cursor_position.1,
+                    buttons: data.buttons,
+                })
+                .trace_err();
+
+            data.is_tracking_mouse_leave = false;
         }
         _ => return DefSubclassProc(window, msg, wparam, lparam),
     }
