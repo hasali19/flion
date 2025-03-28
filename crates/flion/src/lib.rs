@@ -47,17 +47,20 @@ use windows::Win32::System::WinRT::{
     CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_ASTA, DQTYPE_THREAD_CURRENT,
 };
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
-use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     SystemParametersInfoW, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    WM_MOUSEMOVE, WM_NCCALCSIZE,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1, XBUTTON2,
 };
 use windows::UI::Composition::Core::CompositorController;
 use windows::UI::Composition::{Compositor, ContainerVisual};
 use windows_numerics::Vector2;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, Event, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
+use winit::event::{Event, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoopBuilder};
 use winit::platform::windows::WindowBuilderExtWindows;
 use winit::window::WindowBuilder;
@@ -86,7 +89,6 @@ struct WindowData {
     resize_controller: Arc<ResizeController>,
     scale_factor: f64,
     cursor_position: (f64, f64),
-    pointer_is_down: bool,
     buttons: PointerButtons,
     is_tracking_mouse_leave: bool,
 }
@@ -376,7 +378,6 @@ impl<'a> FlionEngine<'a> {
             resize_controller,
             scale_factor: window.scale_factor(),
             cursor_position: (0.0, 0.0),
-            pointer_is_down: false,
             buttons: PointerButtons::empty(),
             is_tracking_mouse_leave: false,
         }));
@@ -385,12 +386,9 @@ impl<'a> FlionEngine<'a> {
             SetWindowSubclass(hwnd, Some(wnd_proc), 696969, window_data as *mut _ as _).ok()?
         };
 
-        let mut buttons = PointerButtons::empty();
         let mut cursor_pos = PhysicalPosition::new(0.0, 0.0);
         let mut task_executor = TaskRunnerExecutor::default();
         let mut keyboard = Keyboard::new(engine.clone(), text_input);
-
-        let mut pointer_is_down = false;
 
         event_loop.run(move |event, target| {
             match event {
@@ -409,40 +407,6 @@ impl<'a> FlionEngine<'a> {
                     } => unsafe {
                         (*window_data).scale_factor = scale_factor;
                     },
-                    WindowEvent::MouseInput { state, button, .. } => {
-                        let phase = match state {
-                            ElementState::Pressed => PointerPhase::Down,
-                            ElementState::Released => PointerPhase::Up,
-                        };
-
-                        pointer_is_down = state == ElementState::Pressed;
-
-                        let button = match button {
-                            MouseButton::Left => PointerButtons::PRIMARY,
-                            MouseButton::Right => PointerButtons::SECONDARY,
-                            MouseButton::Middle => PointerButtons::MIDDLE,
-                            MouseButton::Back => PointerButtons::BACK,
-                            MouseButton::Forward => PointerButtons::FORWARD,
-                            MouseButton::Other(_) => PointerButtons::empty(),
-                        };
-
-                        if pointer_is_down {
-                            buttons.insert(button);
-                        } else {
-                            buttons.remove(button);
-                        }
-
-                        let _ = engine
-                            .send_pointer_event(&PointerEvent {
-                                device_kind: PointerDeviceKind::Mouse,
-                                device_id: 1,
-                                phase,
-                                x: cursor_pos.x,
-                                y: cursor_pos.y,
-                                buttons,
-                            })
-                            .trace_err();
-                    }
                     WindowEvent::ModifiersChanged(modifiers) => {
                         let _ = keyboard.handle_modifiers_changed(modifiers).trace_err();
                     }
@@ -557,10 +521,10 @@ unsafe extern "system" fn wnd_proc(
 
             data.cursor_position = (x as f64, y as f64);
 
-            let phase = if data.pointer_is_down {
-                PointerPhase::Move
-            } else {
+            let phase = if data.buttons.is_empty() {
                 PointerPhase::Hover
+            } else {
+                PointerPhase::Move
             };
 
             let _ = (*data.engine)
@@ -589,6 +553,72 @@ unsafe extern "system" fn wnd_proc(
                 .trace_err();
 
             data.is_tracking_mouse_leave = false;
+        }
+        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN => {
+            if msg == WM_LBUTTONDOWN {
+                SetCapture(window);
+            }
+
+            let x = lparam.0 & 0xffff;
+            let y = (lparam.0 >> 16) & 0xffff;
+
+            let button = match msg {
+                WM_LBUTTONDOWN => PointerButtons::PRIMARY,
+                WM_RBUTTONDOWN => PointerButtons::SECONDARY,
+                WM_MBUTTONDOWN => PointerButtons::MIDDLE,
+                WM_XBUTTONDOWN => match ((wparam.0 >> 16) & 0xffff) as u16 {
+                    XBUTTON1 => PointerButtons::BACK,
+                    XBUTTON2 => PointerButtons::FORWARD,
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            };
+
+            data.buttons.insert(button);
+
+            let _ = (*data.engine)
+                .send_pointer_event(&PointerEvent {
+                    device_kind: PointerDeviceKind::Mouse,
+                    device_id: 1,
+                    phase: PointerPhase::Down,
+                    x: x as f64,
+                    y: y as f64,
+                    buttons: data.buttons,
+                })
+                .trace_err();
+        }
+        WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP => {
+            if msg == WM_LBUTTONUP {
+                ReleaseCapture().unwrap();
+            }
+
+            let x = lparam.0 & 0xffff;
+            let y = (lparam.0 >> 16) & 0xffff;
+
+            let button = match msg {
+                WM_LBUTTONUP => PointerButtons::PRIMARY,
+                WM_RBUTTONUP => PointerButtons::SECONDARY,
+                WM_MBUTTONUP => PointerButtons::MIDDLE,
+                WM_XBUTTONUP => match ((wparam.0 >> 16) & 0xffff) as u16 {
+                    XBUTTON1 => PointerButtons::BACK,
+                    XBUTTON2 => PointerButtons::FORWARD,
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            };
+
+            data.buttons.remove(button);
+
+            let _ = (*data.engine)
+                .send_pointer_event(&PointerEvent {
+                    device_kind: PointerDeviceKind::Mouse,
+                    device_id: 1,
+                    phase: PointerPhase::Up,
+                    x: x as f64,
+                    y: y as f64,
+                    buttons: data.buttons,
+                })
+                .trace_err();
         }
         _ => return DefSubclassProc(window, msg, wparam, lparam),
     }
