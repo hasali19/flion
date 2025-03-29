@@ -316,13 +316,17 @@ impl FlutterCompositor {
                     }
                 }
 
-                (platform_view.on_update)(&PlatformViewUpdateArgs {
+                let platform_view_update_args = PlatformViewUpdateArgs {
                     // size appears to already be multiplied by scale factor of transformation
                     width: size.width,
                     height: size.height,
                     x: full_transform.M31 as f64,
                     y: full_transform.M32 as f64,
-                });
+                };
+
+                if let Err(e) = (platform_view.on_update)(&platform_view_update_args) {
+                    tracing::error!("platform view update failed: {e:?}");
+                };
             } else {
                 tracing::error!("invalid flutter layer content type: {}", layer.type_);
             }

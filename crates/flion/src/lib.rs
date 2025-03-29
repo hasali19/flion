@@ -23,14 +23,12 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::{env, mem};
 
-use codec::EncodableValue;
 use engine::{PointerButtons, PointerDeviceKind, PointerEvent};
 use eyre::OptionExt;
-use platform_views::PlatformViews;
+use platform_views::{PlatformViewFactory, PlatformViewsMessageHandler};
 use plugins_shim::FlutterPluginsEngine;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use resize_controller::ResizeController;
-use standard_method_channel::StandardMethodHandler;
 use task_runner::Task;
 use windows::core::Interface;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -51,8 +49,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SystemParametersInfoW, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     WM_NCCALCSIZE,
 };
+use windows::UI::Composition::ContainerVisual;
 use windows::UI::Composition::Core::CompositorController;
-use windows::UI::Composition::{Compositor, ContainerVisual};
 use windows_numerics::Vector2;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Event, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
@@ -94,7 +92,7 @@ pub struct FlionEngine<'a> {
     bundle_path: &'a Path,
     plugin_initializers: &'a [unsafe extern "C" fn(*mut c_void)],
     platform_message_handlers: Vec<(&'a str, Box<dyn BinaryMessageHandler>)>,
-    platform_view_factories: HashMap<String, Box<dyn Fn(&Compositor) -> PlatformView>>,
+    platform_view_factories: HashMap<String, Box<dyn PlatformViewFactory>>,
 }
 
 impl<'a> FlionEngine<'a> {
@@ -130,10 +128,10 @@ impl<'a> FlionEngine<'a> {
     pub fn with_platform_view_factory(
         mut self,
         name: &'a str,
-        handler: Box<dyn Fn(&Compositor) -> PlatformView>,
+        factory: impl PlatformViewFactory + 'static,
     ) -> Self {
         self.platform_view_factories
-            .insert(name.to_owned(), handler);
+            .insert(name.to_owned(), Box::new(factory));
         self
     }
 
@@ -226,47 +224,6 @@ impl<'a> FlionEngine<'a> {
 
         let platform_views = compositor.platform_views();
 
-        struct PlatformViewsHandler {
-            platform_views: Arc<PlatformViews>,
-            compositor: Compositor,
-            factories: HashMap<String, Box<dyn Fn(&Compositor) -> PlatformView>>,
-        }
-
-        impl StandardMethodHandler for PlatformViewsHandler {
-            fn handle(
-                &self,
-                method: &str,
-                args: codec::EncodableValue,
-                reply: standard_method_channel::StandardMethodReply,
-            ) {
-                if method == "create" {
-                    let args = args.as_map().unwrap();
-
-                    let id = args
-                        .get(&EncodableValue::Str("id"))
-                        .unwrap()
-                        .as_i32()
-                        .unwrap();
-
-                    let type_ = args
-                        .get(&EncodableValue::Str("type"))
-                        .unwrap()
-                        .as_string()
-                        .unwrap();
-
-                    self.platform_views
-                        .register(*id as u64, (self.factories[type_])(&self.compositor));
-
-                    reply.success(&EncodableValue::Null);
-                } else if method == "remove" {
-                    // TODO
-                    reply.success(&EncodableValue::Null);
-                } else {
-                    reply.not_implemented();
-                }
-            }
-        }
-
         let mut platform_message_handlers: Vec<(&str, Box<dyn BinaryMessageHandler>)> = vec![
             (
                 "flutter/mousecursor",
@@ -278,11 +235,11 @@ impl<'a> FlionEngine<'a> {
             ),
             (
                 "flion/platform_views",
-                Box::new(PlatformViewsHandler {
+                Box::new(PlatformViewsMessageHandler::new(
                     platform_views,
-                    compositor: compositor_controller.Compositor()?,
-                    factories: self.platform_view_factories,
-                }),
+                    compositor_controller.Compositor()?,
+                    self.platform_view_factories,
+                )),
             ),
         ];
 

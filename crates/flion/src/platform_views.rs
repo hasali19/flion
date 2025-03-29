@@ -1,7 +1,12 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use parking_lot::{Mutex, MutexGuard};
-use windows::UI::Composition::Visual;
+use windows::UI::Composition::{Compositor, Visual};
+
+use crate::codec::EncodableValue;
+use crate::standard_method_channel::StandardMethodHandler;
+use crate::{codec, standard_method_channel};
 
 pub struct PlatformViews {
     views: Mutex<HashMap<u64, PlatformView>>,
@@ -31,9 +36,12 @@ impl PlatformViewsGuard<'_> {
     }
 }
 
+pub type PlatformViewUpdateCallback =
+    Box<dyn FnMut(&PlatformViewUpdateArgs) -> eyre::Result<()> + Send + Sync>;
+
 pub struct PlatformView {
     pub visual: Visual,
-    pub on_update: Box<dyn FnMut(&PlatformViewUpdateArgs) + Send + Sync>,
+    pub on_update: PlatformViewUpdateCallback,
 }
 
 #[derive(Debug)]
@@ -42,4 +50,71 @@ pub struct PlatformViewUpdateArgs {
     pub height: f64,
     pub x: f64,
     pub y: f64,
+}
+
+pub struct PlatformViewsMessageHandler {
+    platform_views: Arc<PlatformViews>,
+    compositor: Compositor,
+    factories: HashMap<String, Box<dyn PlatformViewFactory>>,
+}
+
+pub trait PlatformViewFactory {
+    fn create(&self, compositor: &Compositor) -> eyre::Result<PlatformView>;
+}
+
+impl<F: Fn(&Compositor) -> eyre::Result<PlatformView>> PlatformViewFactory for F {
+    fn create(&self, compositor: &Compositor) -> eyre::Result<PlatformView> {
+        self(compositor)
+    }
+}
+
+impl PlatformViewsMessageHandler {
+    pub fn new(
+        platform_views: Arc<PlatformViews>,
+        compositor: Compositor,
+        factories: HashMap<String, Box<dyn PlatformViewFactory>>,
+    ) -> PlatformViewsMessageHandler {
+        PlatformViewsMessageHandler {
+            platform_views,
+            compositor,
+            factories,
+        }
+    }
+}
+
+impl StandardMethodHandler for PlatformViewsMessageHandler {
+    fn handle(
+        &self,
+        method: &str,
+        args: codec::EncodableValue,
+        reply: standard_method_channel::StandardMethodReply,
+    ) {
+        if method == "create" {
+            let args = args.as_map().unwrap();
+
+            let id = args
+                .get(&EncodableValue::Str("id"))
+                .unwrap()
+                .as_i32()
+                .unwrap();
+
+            let type_ = args
+                .get(&EncodableValue::Str("type"))
+                .unwrap()
+                .as_string()
+                .unwrap();
+
+            self.platform_views.register(
+                *id as u64,
+                self.factories[type_].create(&self.compositor).unwrap(),
+            );
+
+            reply.success(&EncodableValue::Null);
+        } else if method == "remove" {
+            // TODO
+            reply.success(&EncodableValue::Null);
+        } else {
+            reply.not_implemented();
+        }
+    }
 }
