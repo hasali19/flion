@@ -1,45 +1,78 @@
 use std::ffi::{c_char, c_void, CStr};
 use std::mem;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use flutter_embedder::FlutterPlatformMessageResponseHandle;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use windows::Win32::Foundation::HWND;
-use winit::event_loop::EventLoopWindowTarget;
-use winit::window::{Window, WindowBuilder};
+use windows::core::w;
+use windows::Win32::Foundation::{HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, RegisterClassExW, WNDCLASSEXW, WS_CHILD,
+    WS_EX_NOREDIRECTIONBITMAP,
+};
+use winit::window::Window;
 
 use crate::engine::FlutterEngine;
 use crate::{BinaryMessageHandler, BinaryMessageReply};
 
-pub struct FlutterPluginsEngine<'a> {
-    engine: &'a FlutterEngine,
-    _child_window: Window,
+pub struct FlutterPluginsEngine {
+    engine: Rc<FlutterEngine>,
     child_window_hwnd: HWND,
 }
 
-impl<'a> FlutterPluginsEngine<'a> {
-    pub fn new<T: 'static>(
-        engine: &'a FlutterEngine,
-        window: &Window,
-        event_loop: &EventLoopWindowTarget<T>,
-    ) -> eyre::Result<FlutterPluginsEngine<'a>> {
-        let child_window = unsafe {
-            WindowBuilder::new()
-                .with_parent_window(Some(window.window_handle()?.as_raw()))
-                .with_visible(false)
-                .build(event_loop)?
-        };
+impl FlutterPluginsEngine {
+    pub fn new(engine: Rc<FlutterEngine>, window: &Window) -> eyre::Result<FlutterPluginsEngine> {
+        static IS_WINDOW_CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
 
-        #[cfg(target_os = "windows")]
-        let RawWindowHandle::Win32(child_handle) = child_window.window_handle()?.as_raw() else {
+        if !IS_WINDOW_CLASS_REGISTERED.swap(true, Ordering::SeqCst) {
+            unsafe {
+                RegisterClassExW(&WNDCLASSEXW {
+                    cbSize: mem::size_of::<WNDCLASSEXW>() as u32,
+                    lpfnWndProc: Some(wnd_proc),
+                    lpszClassName: w!("PluginsViewWindow"),
+                    hInstance: mem::transmute::<HMODULE, HINSTANCE>(GetModuleHandleW(None)?),
+                    ..Default::default()
+                })
+            };
+        }
+
+        unsafe extern "system" fn wnd_proc(
+            hwnd: HWND,
+            msg: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
+        let RawWindowHandle::Win32(parent_window_handle) = window.window_handle()?.as_raw() else {
             unreachable!()
         };
 
-        let child_window_hwnd = HWND(child_handle.hwnd.get() as *mut c_void);
+        let parent_hwnd = HWND(parent_window_handle.hwnd.get() as *mut c_void);
+
+        let window = unsafe {
+            CreateWindowExW(
+                WS_EX_NOREDIRECTIONBITMAP,
+                w!("PluginsViewWindow"),
+                w!("PluginsViewWindow"),
+                WS_CHILD,
+                0,
+                0,
+                300,
+                300,
+                Some(parent_hwnd),
+                None,
+                None,
+                None,
+            )?
+        };
 
         Ok(FlutterPluginsEngine {
             engine,
-            _child_window: child_window,
-            child_window_hwnd,
+            child_window_hwnd: window,
         })
     }
 }
@@ -114,7 +147,7 @@ unsafe extern "C" fn flutter_desktop_messenger_set_callback(
     tracing::debug!("setting callback for platform channel: {channel:?}");
 
     struct Handler {
-        engine: *const FlutterPluginsEngine<'static>,
+        engine: *const FlutterPluginsEngine,
         callback: plugins_compat::FlutterDesktopMessageCallback,
         user_data: *mut c_void,
     }
@@ -179,7 +212,7 @@ unsafe extern "C" fn flutter_dsktop_messenger_send_response(
     let engine = messenger.cast::<FlutterPluginsEngine>().as_ref().unwrap();
     let response_handle = handle.cast::<FlutterPlatformMessageResponseHandle>();
 
-    let reply = BinaryMessageReply::for_engine(engine.engine, response_handle);
+    let reply = BinaryMessageReply::for_engine(&engine.engine, response_handle);
     if data.is_null() {
         reply.not_implemented();
     } else {

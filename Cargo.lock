@@ -749,6 +749,7 @@ dependencies = [
  "tracing-subscriber",
  "windows",
  "windows-numerics",
+ "winit",
 ]
 
 [[package]]

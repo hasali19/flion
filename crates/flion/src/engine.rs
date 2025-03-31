@@ -77,9 +77,7 @@ pub enum PointerDeviceKind {
     Unknown = 0,
     Mouse = FlutterPointerDeviceKind_kFlutterPointerDeviceKindMouse,
     Touch = FlutterPointerDeviceKind_kFlutterPointerDeviceKindTouch,
-    #[expect(unused)]
     Stylus = FlutterPointerDeviceKind_kFlutterPointerDeviceKindStylus,
-    #[expect(unused)]
     Trackpad = FlutterPointerDeviceKind_kFlutterPointerDeviceKindTrackpad,
 }
 

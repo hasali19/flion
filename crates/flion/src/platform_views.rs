@@ -13,6 +13,7 @@ pub struct PlatformViews {
 }
 
 impl PlatformViews {
+    #[expect(clippy::new_without_default)]
     pub fn new() -> PlatformViews {
         PlatformViews {
             views: Mutex::new(HashMap::new()),
