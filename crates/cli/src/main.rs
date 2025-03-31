@@ -311,6 +311,35 @@ fn flutter_build(
 
         tracing::info!("building kernel_snapshot.dill");
 
+        let mut current_dir = flutter_project_dir;
+
+        let package_config_path = loop {
+            let path = current_dir.join(".dart_tool").join("package_config.json");
+            if path.exists() {
+                break Some(path);
+            }
+
+            let Some(parent) = current_dir.parent() else {
+                break None;
+            };
+
+            current_dir = parent;
+        }
+        .ok_or_eyre("failed to locate .dart_tool/package_config.json")?;
+
+        let dart_plugin_registrant_path = flutter_project_dir
+            .join(".dart_tool")
+            .join("flutter_build")
+            .join("dart_plugin_registrant.dart");
+
+        let d_dart_plugin_registrant = format!(
+            "-Dflutter.dart_plugin_registrant=file:///{}",
+            dart_plugin_registrant_path
+                .to_str()
+                .unwrap()
+                .replace("\\", "/"),
+        );
+
         cmd!(
             dartaotruntime,
             frontend_server_snapshot,
@@ -327,11 +356,14 @@ fn flutter_build(
             "--target-os",
             "windows",
             "--packages",
-            flutter_project_dir
-                .join(".dart_tool")
-                .join("package_config.json"),
+            package_config_path,
             "--output-dill",
             build_dir.join("kernel_snapshot.dill"),
+            "--source",
+            dart_plugin_registrant_path,
+            "--source",
+            "package:flutter/src/dart_plugin_registrant.dart",
+            d_dart_plugin_registrant,
             flutter_project_dir.join("lib").join("main.dart"),
         )
         .run()?;
