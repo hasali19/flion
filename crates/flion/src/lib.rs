@@ -192,7 +192,7 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
             compositor_controller
                 .Compositor()?
                 .cast::<ICompositorDesktopInterop>()?
-                .CreateDesktopWindowTarget(hwnd, false)?
+                .CreateDesktopWindowTarget(hwnd, true)?
         };
 
         let root_visual = compositor_controller
