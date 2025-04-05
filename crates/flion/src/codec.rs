@@ -80,6 +80,8 @@ pub enum EncodableValue<'a> {
     I64(i64),
     F64(Float64),
     Str(&'a str),
+    List(Vec<EncodableValue<'a>>),
+    U8List(Vec<u8>),
     Map(BTreeMap<EncodableValue<'a>, EncodableValue<'a>>),
 }
 
@@ -167,6 +169,22 @@ fn write_string(w: &mut WriteCursor, value: &str) -> io::Result<()> {
     Ok(())
 }
 
+fn write_list(w: &mut WriteCursor, values: &[EncodableValue]) -> io::Result<()> {
+    write_size(w, values.len() as u32)?;
+    for v in values {
+        write_value(w, v)?;
+    }
+    Ok(())
+}
+
+fn write_u8_list(w: &mut WriteCursor, values: &[u8]) -> io::Result<()> {
+    write_size(w, values.len() as u32)?;
+    for v in values {
+        w.write_u8(*v)?;
+    }
+    Ok(())
+}
+
 fn read_map<'a>(
     cursor: &mut ReadCursor<'a>,
 ) -> io::Result<BTreeMap<EncodableValue<'a>, EncodableValue<'a>>> {
@@ -198,12 +216,10 @@ pub fn read_value<'a>(cursor: &mut ReadCursor<'a>) -> io::Result<EncodableValue<
         EncodedType::Null => Ok(EncodableValue::Null),
         EncodedType::True => Ok(EncodableValue::Bool(true)),
         EncodedType::False => Ok(EncodableValue::Bool(false)),
-        EncodedType::Int32 => Ok(EncodableValue::I32(cursor.read_i32::<NativeEndian>()?)),
+        EncodedType::Int32 => todo!(),
         EncodedType::Int64 => Ok(EncodableValue::I64(cursor.read_i64::<NativeEndian>()?)),
         EncodedType::LargeInt => todo!(),
-        EncodedType::Float64 => Ok(EncodableValue::F64(Float64(
-            cursor.read_f64::<NativeEndian>()?,
-        ))),
+        EncodedType::Float64 => todo!(),
         EncodedType::String => Ok(EncodableValue::Str(read_string(cursor)?)),
         EncodedType::UInt8List => todo!(),
         EncodedType::Int32List => todo!(),
@@ -243,6 +259,14 @@ pub fn write_value(w: &mut WriteCursor, value: &EncodableValue) -> io::Result<()
         EncodableValue::Str(v) => {
             w.write_u8(EncodedType::String as u8)?;
             write_string(w, v)?;
+        }
+        EncodableValue::List(v) => {
+            w.write_u8(EncodedType::List as u8)?;
+            write_list(w, v)?;
+        }
+        EncodableValue::U8List(v) => {
+            w.write_u8(EncodedType::UInt8List as u8)?;
+            write_u8_list(w, v)?;
         }
         EncodableValue::Map(v) => {
             w.write_u8(EncodedType::Map as u8)?;
