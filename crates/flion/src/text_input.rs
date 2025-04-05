@@ -52,6 +52,7 @@ impl TextInputState {
             let message = serde_json::to_vec(&message).unwrap();
 
             engine
+                .messenger()
                 .send_platform_message(c"flutter/textinput", &message)
                 .unwrap();
         }

@@ -203,7 +203,7 @@ fn send_channel_key_event(
         modifiers: modifiers.bits(),
     };
 
-    engine.send_platform_message_with_reply(
+    engine.messenger().send_platform_message_with_reply(
         c"flutter/keyevent",
         &serde_json::to_vec(&message)?,
         |response| {

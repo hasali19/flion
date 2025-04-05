@@ -28,7 +28,9 @@ pub fn send_to_engine(engine: &FlutterEngine) -> eyre::Result<()> {
         "textScaleFactor": 1.0f32,
     });
 
-    engine.send_platform_message(c"flutter/settings", &serde_json::to_vec(&message)?)?;
+    engine
+        .messenger()
+        .send_platform_message(c"flutter/settings", &serde_json::to_vec(&message)?)?;
 
     Ok(())
 }

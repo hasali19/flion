@@ -65,7 +65,7 @@ use crate::keyboard::Keyboard;
 use crate::mouse_cursor::MouseCursorHandler;
 use crate::text_input::{TextInputHandler, TextInputState};
 
-pub use crate::engine::{BinaryMessageHandler, BinaryMessageReply};
+pub use crate::engine::{BinaryMessageHandler, BinaryMessageReply, BinaryMessenger};
 pub use crate::platform_views::{PlatformView, PlatformViewUpdateArgs};
 pub use crate::task_runner::TaskRunnerExecutor;
 
@@ -344,6 +344,10 @@ impl<'e> FlionEngine<'e> {
             _plugins: plugins,
             _composition_target: composition_target,
         }
+    }
+
+    pub fn messenger(&self) -> BinaryMessenger {
+        self.engine.messenger()
     }
 
     pub fn process_tasks(
