@@ -45,7 +45,7 @@ pub struct PlatformView {
     pub on_update: PlatformViewUpdateCallback,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PlatformViewUpdateArgs {
     pub width: f64,
     pub height: f64,
@@ -60,12 +60,24 @@ pub struct PlatformViewsMessageHandler {
 }
 
 pub trait PlatformViewFactory {
-    fn create(&self, compositor: &Compositor) -> eyre::Result<PlatformView>;
+    fn create(
+        &self,
+        compositor: &Compositor,
+        id: i32,
+        args: EncodableValue,
+    ) -> eyre::Result<PlatformView>;
 }
 
-impl<F: Fn(&Compositor) -> eyre::Result<PlatformView>> PlatformViewFactory for F {
-    fn create(&self, compositor: &Compositor) -> eyre::Result<PlatformView> {
-        self(compositor)
+impl<F: Fn(&Compositor, i32, EncodableValue) -> eyre::Result<PlatformView>> PlatformViewFactory
+    for F
+{
+    fn create(
+        &self,
+        compositor: &Compositor,
+        id: i32,
+        args: EncodableValue,
+    ) -> eyre::Result<PlatformView> {
+        self(compositor, id, args)
     }
 }
 
@@ -91,9 +103,9 @@ impl StandardMethodHandler for PlatformViewsMessageHandler {
         reply: standard_method_channel::StandardMethodReply,
     ) {
         if method == "create" {
-            let args = args.as_map().unwrap();
+            let mut args = args.into_map().unwrap();
 
-            let id = args
+            let id = *args
                 .get(&EncodableValue::Str("id"))
                 .unwrap()
                 .as_i32()
@@ -105,9 +117,15 @@ impl StandardMethodHandler for PlatformViewsMessageHandler {
                 .as_string()
                 .unwrap();
 
+            let create_args = args
+                .remove(&EncodableValue::Str("args"))
+                .unwrap_or(EncodableValue::Null);
+
             self.platform_views.register(
-                *id as u64,
-                self.factories[type_].create(&self.compositor).unwrap(),
+                id as u64,
+                self.factories[type_]
+                    .create(&self.compositor, id, create_args)
+                    .unwrap(),
             );
 
             reply.success(&EncodableValue::Null);

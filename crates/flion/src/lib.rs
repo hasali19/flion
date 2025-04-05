@@ -66,7 +66,7 @@ use crate::mouse_cursor::MouseCursorHandler;
 use crate::text_input::{TextInputHandler, TextInputState};
 
 pub use crate::engine::{BinaryMessageHandler, BinaryMessageReply};
-pub use crate::platform_views::PlatformView;
+pub use crate::platform_views::{PlatformView, PlatformViewUpdateArgs};
 pub use crate::task_runner::TaskRunnerExecutor;
 
 #[macro_export]

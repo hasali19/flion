@@ -3,6 +3,7 @@ use std::mem;
 use std::os::raw::c_void;
 use std::rc::Rc;
 
+use flion::codec::EncodableValue;
 use flion::{
     FlionEngineEnvironment, PlatformTask, PlatformView, TaskRunnerExecutor, include_plugins,
 };
@@ -66,34 +67,37 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut engine = env
         .new_engine_builder()
         .with_plugins(PLUGINS)
-        .with_platform_view_factory("example", |compositor: &Compositor| {
-            let visual = compositor.CreateSpriteVisual()?;
+        .with_platform_view_factory(
+            "example",
+            |compositor: &Compositor, _id: i32, _args: EncodableValue| {
+                let visual = compositor.CreateSpriteVisual()?;
 
-            visual.SetBrush(&compositor.CreateColorBrushWithColor(Color {
-                R: 255,
-                G: 0,
-                B: 0,
-                A: 100,
-            })?)?;
+                visual.SetBrush(&compositor.CreateColorBrushWithColor(Color {
+                    R: 255,
+                    G: 0,
+                    B: 0,
+                    A: 100,
+                })?)?;
 
-            Ok(PlatformView {
-                visual: visual.cast()?,
-                on_update: Box::new(move |args| {
-                    visual.SetSize(Vector2 {
-                        X: args.width as f32,
-                        Y: args.height as f32,
-                    })?;
+                Ok(PlatformView {
+                    visual: visual.cast()?,
+                    on_update: Box::new(move |args| {
+                        visual.SetSize(Vector2 {
+                            X: args.width as f32,
+                            Y: args.height as f32,
+                        })?;
 
-                    visual.SetOffset(Vector3 {
-                        X: args.x as f32,
-                        Y: args.y as f32,
-                        Z: 0.0,
-                    })?;
+                        visual.SetOffset(Vector3 {
+                            X: args.x as f32,
+                            Y: args.y as f32,
+                            Z: 0.0,
+                        })?;
 
-                    Ok(())
-                }),
-            })
-        })
+                        Ok(())
+                    }),
+                })
+            },
+        )
         .build(window.clone(), {
             let event_loop = event_loop.create_proxy();
             move |task| {

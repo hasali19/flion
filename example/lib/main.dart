@@ -1,7 +1,6 @@
 import 'package:dynamic_system_colors/dynamic_system_colors.dart';
+import 'package:flion/flion.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart';
-import 'package:flutter/services.dart';
 
 void main() {
   runApp(const MyApp());
@@ -88,7 +87,9 @@ class _MyHomePageState extends State<MyHomePage> {
           children: [
             const Padding(
               padding: EdgeInsets.all(32),
-              child: FlionPlatformView(),
+              child: FlionPlatformView(
+                type: 'example',
+              ),
             ),
             Column(
               // Column is also a layout widget. It takes a list of children and
@@ -107,12 +108,8 @@ class _MyHomePageState extends State<MyHomePage> {
               // horizontal).
               mainAxisAlignment: MainAxisAlignment.center,
               children: <Widget>[
-                TextField(
-                  controller: _textController,
-                ),
-                const Text(
-                  'You have pushed the button this many times:',
-                ),
+                TextField(controller: _textController),
+                const Text('You have pushed the button this many times:'),
                 Text(
                   '$_counter',
                   style: Theme.of(context).textTheme.headlineMedium,
@@ -128,89 +125,5 @@ class _MyHomePageState extends State<MyHomePage> {
         child: const Icon(Icons.add),
       ), // This trailing comma makes auto-formatting nicer for build methods.
     );
-  }
-}
-
-class FlionPlatformView extends StatefulWidget {
-  const FlionPlatformView({super.key});
-
-  @override
-  State<FlionPlatformView> createState() => _FlionPlatformViewState();
-}
-
-const platformViewsChannel = MethodChannel('flion/platform_views');
-
-class _FlionPlatformViewState extends State<FlionPlatformView> {
-  late final int _id;
-
-  bool _isInit = false;
-
-  @override
-  void initState() {
-    super.initState();
-
-    _id = platformViewsRegistry.getNextPlatformViewId();
-
-    platformViewsChannel
-        .invokeMethod('create', {'id': _id, 'type': 'example'}).then((value) {
-      setState(() {
-        _isInit = true;
-      });
-    });
-  }
-
-  @override
-  void dispose() {
-    super.dispose();
-    platformViewsChannel.invokeMethod('destroy', {'id': _id});
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    if (_isInit) {
-      return FlionPlatformViewImpl(viewId: _id);
-    } else {
-      return Container();
-    }
-  }
-}
-
-class FlionPlatformViewImpl extends LeafRenderObjectWidget {
-  final int viewId;
-
-  const FlionPlatformViewImpl({
-    super.key,
-    required this.viewId,
-  });
-
-  @override
-  RenderObject createRenderObject(BuildContext context) {
-    return PlatformViewRenderBox(viewId: viewId);
-  }
-}
-
-class PlatformViewRenderBox extends RenderBox {
-  final int viewId;
-
-  PlatformViewRenderBox({required this.viewId});
-
-  @override
-  bool get sizedByParent => true;
-
-  @override
-  bool get alwaysNeedsCompositing => true;
-
-  @override
-  bool get isRepaintBoundary => true;
-
-  @override
-  @protected
-  Size computeDryLayout(covariant BoxConstraints constraints) {
-    return constraints.biggest;
-  }
-
-  @override
-  void paint(PaintingContext context, Offset offset) {
-    context.addLayer(PlatformViewLayer(rect: offset & size, viewId: viewId));
   }
 }

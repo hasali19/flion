@@ -123,6 +123,14 @@ impl<'a> EncodableValue<'a> {
             None
         }
     }
+
+    pub fn into_map(self) -> Option<BTreeMap<EncodableValue<'a>, EncodableValue<'a>>> {
+        if let Self::Map(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
 }
 
 fn read_size(cursor: &mut ReadCursor) -> io::Result<u32> {
