@@ -350,6 +350,14 @@ impl<'e> FlionEngine<'e> {
         self.engine.messenger()
     }
 
+    pub fn set_platform_message_handler(
+        &self,
+        name: impl Into<String>,
+        handler: impl BinaryMessageHandler + 'static,
+    ) {
+        self.engine.set_platform_message_handler(name, handler)
+    }
+
     pub fn process_tasks(
         &mut self,
         task_executor: &mut TaskRunnerExecutor,
