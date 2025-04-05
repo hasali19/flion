@@ -51,6 +51,7 @@ class MyHomePage extends StatefulWidget {
 
 class _MyHomePageState extends State<MyHomePage> {
   final _textController = TextEditingController();
+  final _viewController = FlionPlatformViewController(type: 'example');
 
   int _counter = 0;
 
@@ -63,6 +64,19 @@ class _MyHomePageState extends State<MyHomePage> {
       // called again, and so nothing would appear to happen.
       _counter++;
     });
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _viewController.init();
+  }
+
+  @override
+  void dispose() {
+    super.dispose();
+    _textController.dispose();
+    _viewController.dispose();
   }
 
   @override
@@ -85,11 +99,9 @@ class _MyHomePageState extends State<MyHomePage> {
         // in the middle of the parent.
         child: Stack(
           children: [
-            const Padding(
-              padding: EdgeInsets.all(32),
-              child: FlionPlatformView(
-                type: 'example',
-              ),
+            Padding(
+              padding: const EdgeInsets.all(32),
+              child: FlionPlatformView(controller: _viewController),
             ),
             Column(
               // Column is also a layout widget. It takes a list of children and

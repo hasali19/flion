@@ -4,53 +4,64 @@ import 'package:flutter/widgets.dart';
 
 const _platformViewsChannel = MethodChannel('flion/platform_views');
 
-class FlionPlatformView extends StatefulWidget {
+class FlionPlatformViewController extends ChangeNotifier {
   final String type;
   final dynamic args;
 
-  const FlionPlatformView({super.key, required this.type, this.args});
+  late final int id;
+
+  bool _isInit = false;
+  bool get isInit => _isInit;
+
+  FlionPlatformViewController({required this.type, this.args}) {
+    id = platformViewsRegistry.getNextPlatformViewId();
+  }
+
+  Future<dynamic> init() async {
+    final result = await _platformViewsChannel.invokeMethod('create', {
+      'id': id,
+      'type': type,
+      'args': args,
+    });
+    _isInit = true;
+    return result;
+  }
+
+  @override
+  void dispose() {
+    super.dispose();
+    _platformViewsChannel.invokeMethod('destroy', {'id': id});
+  }
+}
+
+class FlionPlatformView extends StatefulWidget {
+  final FlionPlatformViewController controller;
+
+  const FlionPlatformView({super.key, required this.controller});
 
   @override
   State<FlionPlatformView> createState() => _FlionPlatformViewState();
 }
 
 class _FlionPlatformViewState extends State<FlionPlatformView> {
-  late final int _id;
-
-  bool _isInit = false;
-
-  @override
-  void initState() {
-    super.initState();
-
-    _id = platformViewsRegistry.getNextPlatformViewId();
-
-    _platformViewsChannel
-        .invokeMethod('create', {
-          'id': _id,
-          'type': widget.type,
-          'args': widget.args,
-        })
-        .then((value) {
-          setState(() {
-            _isInit = true;
-          });
-        });
-  }
-
   @override
   void dispose() {
     super.dispose();
-    _platformViewsChannel.invokeMethod('destroy', {'id': _id});
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_isInit) {
-      return _FlionPlatformViewImpl(viewId: _id);
-    } else {
-      return Container();
-    }
+    final controller = widget.controller;
+    return ListenableBuilder(
+      listenable: controller,
+      builder: (context, child) {
+        if (controller.isInit) {
+          return _FlionPlatformViewImpl(viewId: controller.id);
+        } else {
+          return Container();
+        }
+      },
+    );
   }
 }
 
