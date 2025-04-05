@@ -5,19 +5,19 @@ import 'package:flutter/widgets.dart';
 const _platformViewsChannel = MethodChannel('flion/platform_views');
 
 class FlionPlatformViewController extends ChangeNotifier {
-  final String type;
-  final dynamic args;
-
   late final int id;
 
   bool _isInit = false;
   bool get isInit => _isInit;
 
-  FlionPlatformViewController({required this.type, this.args}) {
+  FlionPlatformViewController() {
     id = platformViewsRegistry.getNextPlatformViewId();
   }
 
-  Future<dynamic> init() async {
+  Future<dynamic> init({required String type, dynamic args}) async {
+    if (_isInit) {
+      throw Exception('already initialised');
+    }
     final result = await _platformViewsChannel.invokeMethod('create', {
       'id': id,
       'type': type,
