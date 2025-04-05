@@ -51,7 +51,7 @@ class MyHomePage extends StatefulWidget {
 
 class _MyHomePageState extends State<MyHomePage> {
   final _textController = TextEditingController();
-  final _viewController = FlionPlatformViewController(type: 'example');
+  final _viewController = FlionPlatformViewController();
 
   int _counter = 0;
 
@@ -69,7 +69,7 @@ class _MyHomePageState extends State<MyHomePage> {
   @override
   void initState() {
     super.initState();
-    _viewController.init();
+    _viewController.init(type: 'example');
   }
 
   @override
