@@ -9,7 +9,7 @@ use crate::standard_method_channel::StandardMethodHandler;
 use crate::{codec, standard_method_channel};
 
 pub struct PlatformViews {
-    views: Mutex<HashMap<u64, PlatformView>>,
+    views: Mutex<HashMap<u64, Box<dyn PlatformView>>>,
 }
 
 impl PlatformViews {
@@ -20,8 +20,12 @@ impl PlatformViews {
         }
     }
 
-    pub fn register(&self, id: u64, view: PlatformView) {
+    fn add(&self, id: u64, view: Box<dyn PlatformView>) {
         self.views.lock().insert(id, view);
+    }
+
+    fn remove(&self, id: u64) -> Option<Box<dyn PlatformView>> {
+        self.views.lock().remove(&id)
     }
 
     pub fn acquire(&self) -> PlatformViewsGuard {
@@ -29,20 +33,24 @@ impl PlatformViews {
     }
 }
 
-pub struct PlatformViewsGuard<'a>(MutexGuard<'a, HashMap<u64, PlatformView>>);
+pub struct PlatformViewsGuard<'a>(MutexGuard<'a, HashMap<u64, Box<dyn PlatformView>>>);
 
 impl PlatformViewsGuard<'_> {
-    pub fn get_mut(&mut self, id: u64) -> Option<&mut PlatformView> {
-        self.0.get_mut(&id)
+    pub fn get_mut(&mut self, id: u64) -> Option<&mut dyn PlatformView> {
+        match self.0.get_mut(&id) {
+            Some(view) => Some(&mut **view),
+            None => None,
+        }
     }
 }
 
-pub type PlatformViewUpdateCallback =
-    Box<dyn FnMut(&PlatformViewUpdateArgs) -> eyre::Result<()> + Send + Sync>;
+pub trait PlatformView: Send + Sync {
+    fn visual(&mut self) -> &Visual;
 
-pub struct PlatformView {
-    pub visual: Visual,
-    pub on_update: PlatformViewUpdateCallback,
+    fn update(&mut self, args: &PlatformViewUpdateArgs) -> eyre::Result<()> {
+        let _ = args;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -65,18 +73,19 @@ pub trait PlatformViewFactory {
         compositor: &Compositor,
         id: i32,
         args: EncodableValue,
-    ) -> eyre::Result<PlatformView>;
+    ) -> eyre::Result<Box<dyn PlatformView>>;
 }
 
-impl<F: Fn(&Compositor, i32, EncodableValue) -> eyre::Result<PlatformView>> PlatformViewFactory
-    for F
+impl<F> PlatformViewFactory for F
+where
+    F: Fn(&Compositor, i32, EncodableValue) -> eyre::Result<Box<dyn PlatformView>>,
 {
     fn create(
         &self,
         compositor: &Compositor,
         id: i32,
         args: EncodableValue,
-    ) -> eyre::Result<PlatformView> {
+    ) -> eyre::Result<Box<dyn PlatformView>> {
         self(compositor, id, args)
     }
 }
@@ -121,7 +130,7 @@ impl StandardMethodHandler for PlatformViewsMessageHandler {
                 .remove(&EncodableValue::Str("args"))
                 .unwrap_or(EncodableValue::Null);
 
-            self.platform_views.register(
+            self.platform_views.add(
                 id as u64,
                 self.factories[type_]
                     .create(&self.compositor, id, create_args)
@@ -129,8 +138,17 @@ impl StandardMethodHandler for PlatformViewsMessageHandler {
             );
 
             reply.success(&EncodableValue::Null);
-        } else if method == "remove" {
-            // TODO
+        } else if method == "destroy" {
+            let args = args.into_map().unwrap();
+
+            let id = *args
+                .get(&EncodableValue::Str("id"))
+                .unwrap()
+                .as_i32()
+                .unwrap();
+
+            self.platform_views.remove(id as u64);
+
             reply.success(&EncodableValue::Null);
         } else {
             reply.not_implemented();

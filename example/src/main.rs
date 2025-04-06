@@ -8,7 +8,7 @@ use flion::{
     FlionEngineEnvironment, PlatformTask, PlatformView, TaskRunnerExecutor, include_plugins,
 };
 use windows::UI::Color;
-use windows::UI::Composition::Compositor;
+use windows::UI::Composition::{Compositor, SpriteVisual, Visual};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Dwm::{
     DWM_SYSTEMBACKDROP_TYPE, DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DwmSetWindowAttribute,
@@ -69,7 +69,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         .with_plugins(PLUGINS)
         .with_platform_view_factory(
             "example",
-            |compositor: &Compositor, _id: i32, _args: EncodableValue| {
+            |compositor: &Compositor,
+             _id: i32,
+             _args: EncodableValue|
+             -> color_eyre::Result<Box<dyn PlatformView>> {
                 let visual = compositor.CreateSpriteVisual()?;
 
                 visual.SetBrush(&compositor.CreateColorBrushWithColor(Color {
@@ -79,23 +82,39 @@ fn main() -> Result<(), Box<dyn Error>> {
                     A: 100,
                 })?)?;
 
-                Ok(PlatformView {
-                    visual: visual.cast()?,
-                    on_update: Box::new(move |args| {
-                        visual.SetSize(Vector2 {
+                struct SolidColorView {
+                    visual: Visual,
+                    sprite_visual: SpriteVisual,
+                }
+
+                impl PlatformView for SolidColorView {
+                    fn visual(&mut self) -> &windows::UI::Composition::Visual {
+                        &self.visual
+                    }
+
+                    fn update(
+                        &mut self,
+                        args: &flion::PlatformViewUpdateArgs,
+                    ) -> color_eyre::eyre::Result<()> {
+                        self.sprite_visual.SetSize(Vector2 {
                             X: args.width as f32,
                             Y: args.height as f32,
                         })?;
 
-                        visual.SetOffset(Vector3 {
+                        self.sprite_visual.SetOffset(Vector3 {
                             X: args.x as f32,
                             Y: args.y as f32,
                             Z: 0.0,
                         })?;
 
                         Ok(())
-                    }),
-                })
+                    }
+                }
+
+                Ok(Box::new(SolidColorView {
+                    visual: visual.cast()?,
+                    sprite_visual: visual,
+                }))
             },
         )
         .build(window.clone(), {

@@ -324,7 +324,7 @@ impl FlutterCompositor {
                     y: full_transform.M32 as f64,
                 };
 
-                if let Err(e) = (platform_view.on_update)(&platform_view_update_args) {
+                if let Err(e) = platform_view.update(&platform_view_update_args) {
                     tracing::error!("platform view update failed: {e:?}");
                 };
             } else {
@@ -378,7 +378,7 @@ impl FlutterCompositor {
 
                     self.root_visual
                         .Children()?
-                        .InsertAtTop(&platform_view.visual)?;
+                        .InsertAtTop(platform_view.visual())?;
 
                     self.layers.push(LayerId::PlatformView(id));
                 } else {
