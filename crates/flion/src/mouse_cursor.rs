@@ -26,17 +26,22 @@ impl StandardMethodHandler for MouseCursorHandler {
                     .as_string()
                     .unwrap();
 
-                let cursor = match kind {
-                    "basic" => CursorIcon::Default,
-                    "click" => CursorIcon::Pointer,
-                    "text" => CursorIcon::Text,
-                    name => {
-                        tracing::warn!("unknown cursor name: {name}");
-                        CursorIcon::Default
-                    }
-                };
+                if kind == "none" {
+                    self.window.set_cursor_visible(false);
+                } else {
+                    let cursor = match kind {
+                        "basic" => CursorIcon::Default,
+                        "click" => CursorIcon::Pointer,
+                        "text" => CursorIcon::Text,
+                        name => {
+                            tracing::warn!("unknown cursor name: {name}");
+                            CursorIcon::Default
+                        }
+                    };
 
-                self.window.set_cursor_icon(cursor);
+                    self.window.set_cursor_icon(cursor);
+                    self.window.set_cursor_visible(true);
+                }
 
                 reply.success(&EncodableValue::Null);
             }
