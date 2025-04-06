@@ -1,3 +1,5 @@
+#![feature(let_chains)]
+
 mod compositor;
 mod egl;
 mod engine;
@@ -108,7 +110,7 @@ impl FlionEngineEnvironment {
 
 pub struct FlionEngineBuilder<'e, 'a> {
     env: PhantomData<&'e FlionEngineEnvironment>,
-    bundle_path: &'a Path,
+    bundle_path: PathBuf,
     plugin_initializers: &'a [unsafe extern "C" fn(*mut c_void)],
     platform_message_handlers: Vec<(&'a str, Box<dyn BinaryMessageHandler>)>,
     platform_view_factories: HashMap<String, Box<dyn PlatformViewFactory>>,
@@ -118,9 +120,17 @@ pub type PlatformTask = Task;
 
 impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
     fn new() -> FlionEngineBuilder<'e, 'a> {
+        let bundle_path = if let Ok(exe) = env::current_exe()
+            && let Some(dir) = exe.parent()
+        {
+            dir.join("data")
+        } else {
+            PathBuf::from("data")
+        };
+
         FlionEngineBuilder {
             env: PhantomData,
-            bundle_path: Path::new("data"),
+            bundle_path,
             plugin_initializers: &[],
             platform_message_handlers: vec![],
             platform_view_factories: HashMap::new(),
@@ -128,7 +138,7 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
     }
 
     pub fn with_bundle_path(mut self, path: &'a Path) -> Self {
-        self.bundle_path = path;
+        self.bundle_path = path.to_owned();
         self
     }
 
