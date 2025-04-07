@@ -14,6 +14,7 @@ use flutter_embedder::{
 use khronos_egl::{self as egl};
 use windows::core::{Interface, BOOL};
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
+use windows::Win32::Graphics::DirectComposition::{IDCompositionDevice, IDCompositionVisual};
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
 };
@@ -22,9 +23,7 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
-use windows::Win32::System::WinRT::Composition::ICompositorInterop;
-use windows::UI::Composition::{Compositor, ContainerVisual, SpriteVisual};
-use windows_numerics::{Matrix3x2, Vector2};
+use windows_numerics::Matrix3x2;
 
 use crate::egl::EglDevice;
 use crate::platform_views::{PlatformViewUpdateArgs, PlatformViews};
@@ -40,8 +39,8 @@ pub trait CompositionHandler: Send {
 
 pub struct FlutterCompositor {
     device: ID3D11Device,
-    compositor: Compositor,
-    root_visual: ContainerVisual,
+    composition_device: IDCompositionDevice,
+    root_visual: IDCompositionVisual,
     egl: Arc<EglDevice>,
     layers: Vec<LayerId>,
     handler: Box<dyn CompositionHandler>,
@@ -56,7 +55,7 @@ enum LayerId {
 
 struct CompositorFlutterLayer {
     egl: Arc<EglDevice>,
-    visual: SpriteVisual,
+    visual: IDCompositionVisual,
     swapchain: IDXGISwapChain1,
     egl_surface: egl::Surface,
     is_first_present: bool,
@@ -64,18 +63,17 @@ struct CompositorFlutterLayer {
 
 impl FlutterCompositor {
     pub fn new(
-        visual: ContainerVisual,
         device: ID3D11Device,
+        composition_device: IDCompositionDevice,
+        visual: IDCompositionVisual,
         egl: Arc<EglDevice>,
         handler: Box<dyn CompositionHandler>,
     ) -> eyre::Result<FlutterCompositor> {
-        let compositor = visual.Compositor()?;
-
         let platform_views = Arc::new(PlatformViews::new());
 
         Ok(FlutterCompositor {
             device,
-            compositor,
+            composition_device,
             egl,
             root_visual: visual,
             layers: vec![],
@@ -109,9 +107,7 @@ impl FlutterCompositor {
     ) -> eyre::Result<()> {
         let size = config.size;
 
-        let visual = self.compositor.CreateSpriteVisual()?;
-
-        visual.SetSize(Vector2::new(size.width as f32, size.height as f32))?;
+        let visual = unsafe { self.composition_device.CreateVisual()? };
 
         let dxgi_device: IDXGIDevice = self.device.cast()?;
         let dxgi_factory: IDXGIFactory2 = unsafe { dxgi_device.GetAdapter()?.GetParent()? };
@@ -139,23 +135,15 @@ impl FlutterCompositor {
             )?
         };
 
+        unsafe {
+            visual.SetContent(&swapchain)?;
+        }
+
         let back_buffer: ID3D11Texture2D = unsafe { swapchain.GetBuffer(0)? };
 
         let egl_surface = self
             .egl
             .create_surface_from_d3d11_texture(&back_buffer, (0, 0))?;
-
-        let composition_surface = unsafe {
-            self.compositor
-                .cast::<ICompositorInterop>()?
-                .CreateCompositionSurfaceForSwapChain(&swapchain)?
-        };
-
-        let surface_brush = self
-            .compositor
-            .CreateSurfaceBrushWithSurface(&composition_surface)?;
-
-        visual.SetBrush(&surface_brush)?;
 
         // This is freed when collect_backing_store is called.
         let compositor_layer = Box::into_raw(Box::new(CompositorFlutterLayer {
@@ -348,7 +336,10 @@ impl FlutterCompositor {
         // Flutter layers have changed. We need to re-insert all layer visuals into the root visual in
         // the correct order.
         if should_update_composition_layers {
-            self.root_visual.Children()?.RemoveAll()?;
+            unsafe {
+                self.root_visual.RemoveAllVisuals()?;
+            }
+
             self.layers.clear();
 
             for &layer in layers {
@@ -361,9 +352,10 @@ impl FlutterCompositor {
                             .unwrap()
                     };
 
-                    self.root_visual
-                        .Children()?
-                        .InsertAtTop(&compositor_layer.visual)?;
+                    unsafe {
+                        self.root_visual
+                            .AddVisual(&compositor_layer.visual, false, None)?;
+                    }
 
                     self.layers.push(LayerId::FlutterLayer(compositor_layer));
                 } else if layer.type_
@@ -376,9 +368,10 @@ impl FlutterCompositor {
                         continue;
                     };
 
-                    self.root_visual
-                        .Children()?
-                        .InsertAtTop(platform_view.visual())?;
+                    unsafe {
+                        self.root_visual
+                            .AddVisual(platform_view.visual(), false, None)?;
+                    }
 
                     self.layers.push(LayerId::PlatformView(id));
                 } else {

@@ -19,12 +19,12 @@ pub mod standard_method_channel;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::env;
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::{env, mem};
 
 use engine::{PointerButtons, PointerDeviceKind, PointerEvent};
 use eyre::OptionExt;
@@ -34,26 +34,20 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle, Win32WindowHandle};
 use resize_controller::ResizeController;
 use task_runner::Task;
 use windows::core::Interface;
-use windows::System::DispatcherQueueController;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION,
 };
-use windows::Win32::Graphics::Dwm::DwmFlush;
-use windows::Win32::System::WinRT::Composition::ICompositorDesktopInterop;
-use windows::Win32::System::WinRT::{
-    CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_ASTA, DQTYPE_THREAD_CURRENT,
+use windows::Win32::Graphics::DirectComposition::{
+    DCompositionCreateDevice2, IDCompositionDevice, IDCompositionTarget,
 };
+use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     SystemParametersInfoW, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     WM_NCCALCSIZE,
 };
-use windows::UI::Composition::ContainerVisual;
-use windows::UI::Composition::Core::CompositorController;
-use windows::UI::Composition::Desktop::DesktopWindowTarget;
-use windows_numerics::Vector2;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::EventLoopWindowTarget;
@@ -68,7 +62,7 @@ use crate::mouse_cursor::MouseCursorHandler;
 use crate::text_input::{TextInputHandler, TextInputState};
 
 pub use crate::engine::{BinaryMessageHandler, BinaryMessageReply, BinaryMessenger};
-pub use crate::platform_views::{PlatformView, PlatformViewUpdateArgs};
+pub use crate::platform_views::{CompositorContext, PlatformView, PlatformViewUpdateArgs};
 pub use crate::task_runner::TaskRunnerExecutor;
 
 #[macro_export]
@@ -84,23 +78,11 @@ struct WindowData {
     scale_factor: Rc<Cell<f64>>,
 }
 
-pub struct FlionEngineEnvironment {
-    _dispatcher_queue_controller: DispatcherQueueController,
-}
+pub struct FlionEngineEnvironment;
 
 impl FlionEngineEnvironment {
     pub fn init() -> eyre::Result<FlionEngineEnvironment> {
-        let dispatcher_queue_controller = unsafe {
-            CreateDispatcherQueueController(DispatcherQueueOptions {
-                dwSize: mem::size_of::<DispatcherQueueOptions>() as u32,
-                threadType: DQTYPE_THREAD_CURRENT,
-                apartmentType: DQTAT_COM_ASTA,
-            })?
-        };
-
-        Ok(FlionEngineEnvironment {
-            _dispatcher_queue_controller: dispatcher_queue_controller,
-        })
+        Ok(FlionEngineEnvironment)
     }
 
     pub fn new_engine_builder<'a>(&self) -> FlionEngineBuilder<'_, 'a> {
@@ -197,26 +179,18 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
             device.ok_or_eyre("failed to create D3D11 device")?
         };
 
-        let compositor_controller = CompositorController::new()?;
-        let composition_target = unsafe {
-            compositor_controller
-                .Compositor()?
-                .cast::<ICompositorDesktopInterop>()?
-                .CreateDesktopWindowTarget(hwnd, true)?
-        };
+        let composition_device: IDCompositionDevice =
+            unsafe { DCompositionCreateDevice2(&device.cast::<IDXGIDevice>()?)? };
 
-        let root_visual = compositor_controller
-            .Compositor()?
-            .CreateContainerVisual()?;
+        let composition_target = unsafe { composition_device.CreateTargetForHwnd(hwnd, true)? };
+
+        let root_visual = unsafe { composition_device.CreateVisual()? };
 
         let PhysicalSize { width, height } = window.inner_size();
 
-        root_visual.SetSize(Vector2 {
-            X: width as f32,
-            Y: height as f32,
-        })?;
-
-        composition_target.SetRoot(&root_visual)?;
+        unsafe {
+            composition_target.SetRoot(&root_visual)?;
+        }
 
         let egl = EglDevice::create(&device)?;
 
@@ -224,13 +198,14 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
         let text_input = Rc::new(RefCell::new(TextInputState::new()));
 
         let compositor = FlutterCompositor::new(
+            device.clone(),
+            composition_device.clone(),
             root_visual.clone(),
-            device,
             egl.clone(),
             Box::new(CompositionHandler {
-                compositor_controller: compositor_controller.clone(),
+                composition_device: composition_device.clone(),
                 resize_controller: resize_controller.clone(),
-                root_visual,
+                surface_size: (width, height),
             }),
         )?;
 
@@ -249,7 +224,8 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
                 "flion/platform_views",
                 Box::new(PlatformViewsMessageHandler::new(
                     platform_views,
-                    compositor_controller.Compositor()?,
+                    device,
+                    composition_device,
                     self.platform_view_factories,
                 )),
             ),
@@ -328,7 +304,7 @@ pub struct FlionEngine<'e> {
     keyboard: Keyboard,
     window_data: *mut WindowData,
     _plugins: Box<FlutterPluginsEngine>,
-    _composition_target: DesktopWindowTarget,
+    _composition_target: IDCompositionTarget,
 }
 
 impl<'e> FlionEngine<'e> {
@@ -337,7 +313,7 @@ impl<'e> FlionEngine<'e> {
         window: Rc<Window>,
         text_input: Rc<RefCell<TextInputState>>,
         plugins: Box<FlutterPluginsEngine>,
-        composition_target: DesktopWindowTarget,
+        composition_target: IDCompositionTarget,
         scale_factor: Rc<Cell<f64>>,
         window_data: *mut WindowData,
     ) -> FlionEngine<'e> {
@@ -600,33 +576,29 @@ unsafe extern "system" fn wnd_proc(
 }
 
 struct CompositionHandler {
-    compositor_controller: CompositorController,
+    composition_device: IDCompositionDevice,
     resize_controller: Arc<ResizeController>,
-    root_visual: ContainerVisual,
+    surface_size: (u32, u32),
 }
+
+unsafe impl Send for CompositionHandler {}
 
 impl compositor::CompositionHandler for CompositionHandler {
     fn get_surface_size(&mut self) -> eyre::Result<(u32, u32)> {
         if let Some(resize) = self.resize_controller.current_resize() {
-            Ok(resize.size())
-        } else {
-            let size = self.root_visual.Size()?;
-            Ok((size.X as u32, size.Y as u32))
+            self.surface_size = resize.size();
         }
+        Ok(self.surface_size)
     }
 
     fn present(&mut self) -> eyre::Result<()> {
-        let commit_compositor = || self.compositor_controller.Commit();
+        let commit_compositor = || unsafe { self.composition_device.Commit() };
 
         if let Some(resize) = self.resize_controller.current_resize() {
-            let (width, height) = resize.size();
-
-            self.root_visual
-                .SetSize(Vector2::new(width as f32, height as f32))
-                .unwrap();
-
-            // Calling DwmFlush() seems to reduce glitches when resizing.
-            unsafe { DwmFlush()? };
+            // Make sure the previous commit has completed. This reduces glitches while resizing.
+            unsafe {
+                self.composition_device.WaitForCommitCompletion()?;
+            }
 
             commit_compositor()?;
 

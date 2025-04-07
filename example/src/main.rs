@@ -5,16 +5,23 @@ use std::rc::Rc;
 
 use flion::codec::EncodableValue;
 use flion::{
-    FlionEngineEnvironment, PlatformTask, PlatformView, TaskRunnerExecutor, include_plugins,
+    CompositorContext, FlionEngineEnvironment, PlatformTask, PlatformView, TaskRunnerExecutor,
+    include_plugins,
 };
-use windows::UI::Color;
-use windows::UI::Composition::{Compositor, SpriteVisual, Visual};
 use windows::Win32::Foundation::HWND;
+use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
+use windows::Win32::Graphics::DirectComposition::{
+    DCOMPOSITION_OPACITY_MODE_MULTIPLY, IDCompositionVisual, IDCompositionVisual2,
+    IDCompositionVisual3,
+};
 use windows::Win32::Graphics::Dwm::{
     DWM_SYSTEMBACKDROP_TYPE, DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DwmSetWindowAttribute,
 };
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM,
+};
 use windows::core::Interface;
-use windows_numerics::{Vector2, Vector3};
+use windows_numerics::Matrix3x2;
 use winit::dpi::LogicalSize;
 use winit::event_loop::{ControlFlow, EventLoopBuilder};
 use winit::platform::windows::WindowBuilderExtWindows;
@@ -69,26 +76,60 @@ fn main() -> Result<(), Box<dyn Error>> {
         .with_plugins(PLUGINS)
         .with_platform_view_factory(
             "example",
-            |compositor: &Compositor,
+            |context: CompositorContext,
              _id: i32,
              _args: EncodableValue|
              -> color_eyre::Result<Box<dyn PlatformView>> {
-                let visual = compositor.CreateSpriteVisual()?;
+                let visual = unsafe { context.composition_device.CreateVisual()? };
 
-                visual.SetBrush(&compositor.CreateColorBrushWithColor(Color {
-                    R: 255,
-                    G: 0,
-                    B: 0,
-                    A: 100,
-                })?)?;
+                // Create a 1x1 bitmap surface. This will be scaled to fill the size of the platform
+                // view.
+                let surface = unsafe {
+                    context.composition_device.CreateSurface(
+                        1,
+                        1,
+                        DXGI_FORMAT_B8G8R8A8_UNORM,
+                        DXGI_ALPHA_MODE_PREMULTIPLIED,
+                    )?
+                };
 
-                struct SolidColorView {
-                    visual: Visual,
-                    sprite_visual: SpriteVisual,
+                let mut offset = Default::default();
+                let texture: ID3D11Texture2D = unsafe { surface.BeginDraw(None, &mut offset)? };
+
+                unsafe {
+                    // Clear the surface texture to a solid color
+                    let mut rtv = None;
+                    context
+                        .d3d11_device
+                        .CreateRenderTargetView(&texture, None, Some(&mut rtv))?;
+                    let rtv = rtv.unwrap();
+                    context
+                        .d3d11_device
+                        .GetImmediateContext()?
+                        .ClearRenderTargetView(&rtv, &[1.0, 0.0, 0.0, 1.0]);
                 }
 
+                unsafe {
+                    surface.EndDraw()?;
+                }
+
+                struct SolidColorView {
+                    visual: IDCompositionVisual,
+                }
+
+                unsafe {
+                    visual.SetContent(&surface)?;
+                    visual
+                        .cast::<IDCompositionVisual2>()?
+                        .SetOpacityMode(DCOMPOSITION_OPACITY_MODE_MULTIPLY)?;
+                    visual.cast::<IDCompositionVisual3>()?.SetOpacity2(0.3)?;
+                }
+
+                unsafe impl Send for SolidColorView {}
+                unsafe impl Sync for SolidColorView {}
+
                 impl PlatformView for SolidColorView {
-                    fn visual(&mut self) -> &windows::UI::Composition::Visual {
+                    fn visual(&mut self) -> &IDCompositionVisual {
                         &self.visual
                     }
 
@@ -96,24 +137,29 @@ fn main() -> Result<(), Box<dyn Error>> {
                         &mut self,
                         args: &flion::PlatformViewUpdateArgs,
                     ) -> color_eyre::eyre::Result<()> {
-                        self.sprite_visual.SetSize(Vector2 {
-                            X: args.width as f32,
-                            Y: args.height as f32,
-                        })?;
+                        unsafe {
+                            self.visual.SetTransform2(&Matrix3x2 {
+                                M11: args.width as f32,
+                                M22: args.height as f32,
+                                ..Default::default()
+                            })?;
 
-                        self.sprite_visual.SetOffset(Vector3 {
-                            X: args.x as f32,
-                            Y: args.y as f32,
-                            Z: 0.0,
-                        })?;
+                            self.visual.SetOffsetX2(args.x as f32)?;
+                            self.visual.SetOffsetY2(args.y as f32)?;
+                        }
 
                         Ok(())
                     }
                 }
 
+                impl Drop for SolidColorView {
+                    fn drop(&mut self) {
+                        tracing::info!("destroying platform view");
+                    }
+                }
+
                 Ok(Box::new(SolidColorView {
                     visual: visual.cast()?,
-                    sprite_visual: visual,
                 }))
             },
         )

@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::{Mutex, MutexGuard};
-use windows::UI::Composition::{Compositor, Visual};
+use windows::Win32::Graphics::Direct3D11::ID3D11Device;
+use windows::Win32::Graphics::DirectComposition::{IDCompositionDevice, IDCompositionVisual};
 
 use crate::codec::EncodableValue;
 use crate::standard_method_channel::StandardMethodHandler;
@@ -45,7 +46,7 @@ impl PlatformViewsGuard<'_> {
 }
 
 pub trait PlatformView: Send + Sync {
-    fn visual(&mut self) -> &Visual;
+    fn visual(&mut self) -> &IDCompositionVisual;
 
     fn update(&mut self, args: &PlatformViewUpdateArgs) -> eyre::Result<()> {
         let _ = args;
@@ -61,16 +62,19 @@ pub struct PlatformViewUpdateArgs {
     pub y: f64,
 }
 
-pub struct PlatformViewsMessageHandler {
-    platform_views: Arc<PlatformViews>,
-    compositor: Compositor,
-    factories: HashMap<String, Box<dyn PlatformViewFactory>>,
+#[derive(Clone)]
+pub struct CompositorContext<'a> {
+    pub d3d11_device: &'a ID3D11Device,
+    pub composition_device: &'a IDCompositionDevice,
 }
+
+unsafe impl Send for CompositorContext<'_> {}
+unsafe impl Sync for CompositorContext<'_> {}
 
 pub trait PlatformViewFactory {
     fn create(
         &self,
-        compositor: &Compositor,
+        context: CompositorContext,
         id: i32,
         args: EncodableValue,
     ) -> eyre::Result<Box<dyn PlatformView>>;
@@ -78,27 +82,36 @@ pub trait PlatformViewFactory {
 
 impl<F> PlatformViewFactory for F
 where
-    F: Fn(&Compositor, i32, EncodableValue) -> eyre::Result<Box<dyn PlatformView>>,
+    F: Fn(CompositorContext, i32, EncodableValue) -> eyre::Result<Box<dyn PlatformView>>,
 {
     fn create(
         &self,
-        compositor: &Compositor,
+        context: CompositorContext,
         id: i32,
         args: EncodableValue,
     ) -> eyre::Result<Box<dyn PlatformView>> {
-        self(compositor, id, args)
+        self(context, id, args)
     }
+}
+
+pub struct PlatformViewsMessageHandler {
+    platform_views: Arc<PlatformViews>,
+    d3d11_device: ID3D11Device,
+    composition_device: IDCompositionDevice,
+    factories: HashMap<String, Box<dyn PlatformViewFactory>>,
 }
 
 impl PlatformViewsMessageHandler {
     pub fn new(
         platform_views: Arc<PlatformViews>,
-        compositor: Compositor,
+        d3d11_device: ID3D11Device,
+        composition_device: IDCompositionDevice,
         factories: HashMap<String, Box<dyn PlatformViewFactory>>,
     ) -> PlatformViewsMessageHandler {
         PlatformViewsMessageHandler {
             platform_views,
-            compositor,
+            d3d11_device,
+            composition_device,
             factories,
         }
     }
@@ -130,12 +143,17 @@ impl StandardMethodHandler for PlatformViewsMessageHandler {
                 .remove(&EncodableValue::Str("args"))
                 .unwrap_or(EncodableValue::Null);
 
-            self.platform_views.add(
-                id as u64,
-                self.factories[type_]
-                    .create(&self.compositor, id, create_args)
-                    .unwrap(),
-            );
+            let context = CompositorContext {
+                d3d11_device: &self.d3d11_device,
+                composition_device: &self.composition_device,
+            };
+
+            // TODO: Return an error instead of unwrapping
+            let platform_view = self.factories[type_]
+                .create(context, id, create_args)
+                .unwrap();
+
+            self.platform_views.add(id as u64, platform_view);
 
             reply.success(&EncodableValue::Null);
         } else if method == "destroy" {

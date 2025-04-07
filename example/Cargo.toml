@@ -13,7 +13,6 @@ winit = "0.29.15"
 
 [dependencies.windows]
 version = "0.60"
-features = ["UI_Composition"]
 
 [build-dependencies]
 flion-build = { path = "../crates/flion-build" }
