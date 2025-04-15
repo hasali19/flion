@@ -1,22 +1,51 @@
 use std::cell::RefCell;
+use std::collections::{BTreeSet, VecDeque};
 use std::rc::Rc;
 
 use bitflags::bitflags;
-use eyre::Context;
+use eyre::{bail, Context};
 use serde::{Deserialize, Serialize};
-use winit::event::{ElementState, Modifiers};
-use winit::keyboard::{Key, NamedKey};
-use winit::platform::scancode::PhysicalKeyExtScancode;
+use smol_str::SmolStr;
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    VIRTUAL_KEY, VK_CONTROL, VK_LCONTROL, VK_LSHIFT, VK_RCONTROL, VK_RSHIFT, VK_SHIFT,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    PeekMessageW, PM_NOREMOVE, WM_CHAR, WM_KEYDOWN, WM_KEYFIRST, WM_KEYLAST, WM_KEYUP,
+};
 
 use crate::engine::{FlutterEngine, KeyEvent, KeyEventType};
 use crate::error_utils::ResultExt;
 use crate::keymap;
 use crate::text_input::TextInputState;
 
+#[derive(Clone)]
+pub struct SystemKeyEvent {
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+}
+
+impl SystemKeyEvent {
+    pub fn code(&self) -> u64 {
+        self.wparam.0 as u64
+    }
+
+    pub fn scan_code(&self) -> u8 {
+        ((self.lparam.0 >> 16) & 0xff) as u8
+    }
+
+    pub fn was_down(&self) -> bool {
+        self.lparam.0 & (1 << 30) != 0
+    }
+}
+
 pub struct Keyboard {
     engine: Rc<FlutterEngine>,
     text_input: Rc<RefCell<TextInputState>>,
     modifiers: ModifierState,
+    session: VecDeque<SystemKeyEvent>,
+    pressed_keys: BTreeSet<u64>,
 }
 
 bitflags! {
@@ -45,110 +74,182 @@ impl Keyboard {
             engine,
             text_input,
             modifiers: ModifierState::default(),
+            session: VecDeque::new(),
+            pressed_keys: BTreeSet::new(),
         }
     }
 
-    pub fn handle_keyboard_input(
+    pub fn handle_message(
         &mut self,
-        event: winit::event::KeyEvent,
-        is_synthetic: bool,
-    ) -> eyre::Result<()> {
-        if let Key::Named(key) = event.logical_key {
-            match key {
-                NamedKey::CapsLock => {
-                    self.modifiers
-                        .set(ModifierState::CAPS_LOCK, event.state.is_pressed());
+        hwnd: HWND,
+        msg: u32,
+        wparam: windows::Win32::Foundation::WPARAM,
+        lparam: windows::Win32::Foundation::LPARAM,
+    ) -> eyre::Result<bool> {
+        let event = SystemKeyEvent {
+            msg,
+            wparam,
+            lparam,
+        };
+
+        self.session.push_back(event.clone());
+
+        let event = match msg {
+            WM_KEYDOWN => {
+                let next_msg = unsafe { peek_next_message(hwnd) };
+                if let Some(WM_CHAR) = next_msg {
+                    return Ok(true);
                 }
-                NamedKey::NumLock => {
-                    self.modifiers
-                        .set(ModifierState::NUM_LOCK, event.state.is_pressed());
+
+                let scan_code = event.scan_code();
+                let key_code = event.code();
+
+                KeyEvent {
+                    event_type: if event.was_down() {
+                        KeyEventType::Repeat
+                    } else {
+                        KeyEventType::Down
+                    },
+                    synthesized: false,
+                    character: None,
+                    logical: Some(key_code),
+                    physical: Some(scan_code as u64),
                 }
-                NamedKey::ScrollLock => {
-                    self.modifiers
-                        .set(ModifierState::SCROLL_LOCK, event.state.is_pressed());
+            }
+            WM_CHAR => {
+                let next_msg = unsafe { peek_next_message(hwnd) };
+                if let Some(WM_CHAR) = next_msg {
+                    return Ok(true);
                 }
-                _ => {}
+
+                let Some(
+                    key_down @ SystemKeyEvent {
+                        msg: WM_KEYDOWN, ..
+                    },
+                ) = self.session.pop_front()
+                else {
+                    bail!("Got char event without a key down")
+                };
+
+                let scan_code = key_down.scan_code();
+                let key_code = key_down.code();
+
+                let code_points = self.session.iter().map(|e| e.code() as u16);
+                let chars = char::decode_utf16(code_points.clone())
+                    .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER));
+                let text = SmolStr::from_iter(chars);
+
+                KeyEvent {
+                    event_type: if key_down.was_down() {
+                        KeyEventType::Repeat
+                    } else {
+                        KeyEventType::Down
+                    },
+                    synthesized: false,
+                    character: Some(text),
+                    logical: Some(key_code),
+                    physical: Some(scan_code as u64),
+                }
+            }
+            WM_KEYUP => {
+                let scan_code = event.scan_code();
+                let key_code = event.code();
+
+                KeyEvent {
+                    event_type: KeyEventType::Up,
+                    synthesized: false,
+                    character: None,
+                    logical: Some(key_code),
+                    physical: Some(scan_code as u64),
+                }
+            }
+            _ => return Ok(false),
+        };
+
+        if let Some(logical) = event.logical {
+            let vk = VIRTUAL_KEY(logical as u16);
+
+            let is_pressed = event.event_type != KeyEventType::Up;
+
+            let modifier = match vk {
+                VK_CONTROL => Some(ModifierState::CONTROL),
+                VK_LCONTROL => Some(ModifierState::CONTROL_LEFT),
+                VK_RCONTROL => Some(ModifierState::CONTROL_RIGHT),
+                VK_SHIFT => Some(ModifierState::SHIFT),
+                VK_LSHIFT => Some(ModifierState::SHIFT_LEFT),
+                VK_RSHIFT => Some(ModifierState::SHIFT_RIGHT),
+                _ => None,
+            };
+
+            if let Some(modifier) = modifier {
+                self.modifiers.set(modifier, is_pressed);
             }
         }
 
-        let process_text_input = {
-            let engine = self.engine.clone();
-            let text_input = self.text_input.clone();
-            move |event: winit::event::KeyEvent| {
-                let mut text_input = text_input.borrow_mut();
-                let _ = text_input
-                    .process_key_event(&event, &engine)
-                    .wrap_err("text input plugin failed to process key event")
-                    .trace_err();
+        self.session.clear();
+
+        if let Some(physical) = event.physical {
+            if event.event_type == KeyEventType::Up {
+                // Ignore an up event if we haven't recorded that the key is down.
+                if !self.pressed_keys.remove(&physical) {
+                    tracing::debug!("Key {physical} is not currently pressed. Ignoring up event.");
+                    return Ok(true);
+                }
+            } else {
+                let inserted = self.pressed_keys.insert(physical);
+
+                // Ignore a down event if we have already recorded that the key is down. Repeats
+                // are still processed as normal.
+                if event.event_type == KeyEventType::Down && !inserted {
+                    tracing::debug!("Key {physical} is already pressed. Ignoring down event.");
+                    return Ok(true);
+                }
             }
-        };
+        }
 
-        let send_channel = {
+        let text_input = self.text_input.clone();
+        let modifiers = self.modifiers;
+
+        send_embedder_key_event(&self.engine, event, {
             let engine = self.engine.clone();
-            let modifiers = self.modifiers;
-            move |event: winit::event::KeyEvent| {
-                let _ = send_channel_key_event(&engine, event, modifiers, process_text_input)
-                    .trace_err();
+            move |event| {
+                let _ = send_channel_key_event(&engine, event, modifiers, {
+                    let engine = engine.clone();
+                    move |event| {
+                        let mut text_input = text_input.borrow_mut();
+                        let _ = text_input
+                            .process_key_event(&event, &engine)
+                            .wrap_err("text input plugin failed to process key event")
+                            .trace_err();
+                    }
+                })
+                .trace_err();
             }
-        };
+        })?;
 
-        let send_embedder = {
-            let engine = self.engine.clone();
-            move |event: winit::event::KeyEvent| {
-                let _ = send_embedder_key_event(&engine, event, is_synthetic, send_channel)
-                    .wrap_err("failed to send embedder key event")
-                    .trace_err();
-            }
-        };
-
-        send_embedder(event);
-
-        Ok(())
+        Ok(true)
     }
+}
 
-    pub fn handle_modifiers_changed(&mut self, modifiers: Modifiers) -> eyre::Result<()> {
-        self.modifiers
-            .set(ModifierState::SHIFT, modifiers.state().shift_key());
-        self.modifiers
-            .set(ModifierState::CONTROL, modifiers.state().control_key());
-        self.modifiers
-            .set(ModifierState::ALT, modifiers.state().alt_key());
-        Ok(())
-    }
+unsafe fn peek_next_message(hwnd: HWND) -> Option<u32> {
+    let mut msg = Default::default();
+
+    unsafe { PeekMessageW(&mut msg, Some(hwnd), WM_KEYFIRST, WM_KEYLAST, PM_NOREMOVE) }
+        .as_bool()
+        .then_some(msg.message)
 }
 
 fn send_embedder_key_event(
     engine: &FlutterEngine,
-    event: winit::event::KeyEvent,
-    is_synthetic: bool,
-    next_handler: impl FnOnce(winit::event::KeyEvent) + 'static,
+    event: KeyEvent,
+    next_handler: impl FnOnce(KeyEvent) + 'static,
 ) -> eyre::Result<()> {
-    let character = match &event.logical_key {
-        Key::Named(_) => None,
-        Key::Character(c) => {
-            if event.state == ElementState::Released {
-                None
-            } else {
-                Some(c.clone())
-            }
-        }
-        Key::Unidentified(_) => None,
-        Key::Dead(_) => None,
-    };
+    let mut key_event = event.clone();
+    key_event.logical = event
+        .logical
+        .map(|k| keymap::map_windows_to_logical(k as u32).unwrap_or(k));
 
-    let key_event = KeyEvent {
-        event_type: match event.state {
-            ElementState::Pressed if event.repeat => KeyEventType::Repeat,
-            ElementState::Pressed => KeyEventType::Down,
-            ElementState::Released => KeyEventType::Up,
-        },
-        synthesized: is_synthetic,
-        character: character.as_ref(),
-        logical: keymap::to_flutter(&event.logical_key),
-        physical: event.physical_key.to_scancode().map(|code| code.into()),
-    };
-
-    engine.send_key_event(key_event, move |handled| {
+    engine.send_key_event(&key_event, move |handled| {
         if !handled {
             next_handler(event);
         }
@@ -157,9 +258,9 @@ fn send_embedder_key_event(
 
 fn send_channel_key_event(
     engine: &FlutterEngine,
-    event: winit::event::KeyEvent,
+    event: crate::engine::KeyEvent,
     modifiers: ModifierState,
-    next_handler: impl FnOnce(winit::event::KeyEvent) + 'static,
+    next_handler: impl FnOnce(KeyEvent) + 'static,
 ) -> eyre::Result<()> {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
@@ -178,8 +279,8 @@ fn send_channel_key_event(
         handled: bool,
     }
 
-    let character = match &event.logical_key {
-        Key::Character(c) => {
+    let character = match event.character.as_deref() {
+        Some(c) => {
             if (1..=4).contains(&c.len()) {
                 let mut bytes = [0u8; 4];
                 bytes[..c.len()].copy_from_slice(c.as_bytes());
@@ -188,18 +289,19 @@ fn send_channel_key_event(
                 None
             }
         }
-        _ => None,
+        None => None,
     };
 
     let message = Message {
         keymap: "windows",
-        event_type: match event.state {
-            ElementState::Pressed => "keydown",
-            ElementState::Released => "keyup",
+        event_type: match event.event_type {
+            KeyEventType::Down => "keydown",
+            KeyEventType::Up => "keyup",
+            KeyEventType::Repeat => "keydown",
         },
         character_code_point: character,
-        key_code: keymap::to_flutter(&event.logical_key),
-        scan_code: event.physical_key.to_scancode().map(|code| code.into()),
+        key_code: event.logical,
+        scan_code: event.physical,
         modifiers: modifiers.bits(),
     };
 
