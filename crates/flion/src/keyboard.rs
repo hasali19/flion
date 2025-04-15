@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::rc::Rc;
 
 use bitflags::bitflags;
@@ -45,6 +45,7 @@ pub struct Keyboard {
     text_input: Rc<RefCell<TextInputState>>,
     modifiers: ModifierState,
     session: VecDeque<SystemKeyEvent>,
+    pressed_keys: BTreeSet<u64>,
 }
 
 bitflags! {
@@ -74,6 +75,7 @@ impl Keyboard {
             text_input,
             modifiers: ModifierState::default(),
             session: VecDeque::new(),
+            pressed_keys: BTreeSet::new(),
         }
     }
 
@@ -184,6 +186,19 @@ impl Keyboard {
             }
         }
 
+        self.session.clear();
+
+        if event.event_type == KeyEventType::Up {
+            if let Some(physical) = event.physical
+                && !self.pressed_keys.remove(&physical)
+            {
+                tracing::debug!("Key {physical} is not currently pressed. Ignoring up event.");
+                return Ok(true);
+            }
+        } else if let Some(physical) = event.physical {
+            self.pressed_keys.insert(physical);
+        }
+
         let text_input = self.text_input.clone();
         let modifiers = self.modifiers;
 
@@ -203,8 +218,6 @@ impl Keyboard {
                 .trace_err();
             }
         })?;
-
-        self.session.clear();
 
         Ok(true)
     }
