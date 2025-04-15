@@ -188,15 +188,23 @@ impl Keyboard {
 
         self.session.clear();
 
-        if event.event_type == KeyEventType::Up {
-            if let Some(physical) = event.physical
-                && !self.pressed_keys.remove(&physical)
-            {
-                tracing::debug!("Key {physical} is not currently pressed. Ignoring up event.");
-                return Ok(true);
+        if let Some(physical) = event.physical {
+            if event.event_type == KeyEventType::Up {
+                // Ignore an up event if we haven't recorded that the key is down.
+                if !self.pressed_keys.remove(&physical) {
+                    tracing::debug!("Key {physical} is not currently pressed. Ignoring up event.");
+                    return Ok(true);
+                }
+            } else {
+                let inserted = self.pressed_keys.insert(physical);
+
+                // Ignore a down event if we have already recorded that the key is down. Repeats
+                // are still processed as normal.
+                if event.event_type == KeyEventType::Down && !inserted {
+                    tracing::debug!("Key {physical} is already pressed. Ignoring down event.");
+                    return Ok(true);
+                }
             }
-        } else if let Some(physical) = event.physical {
-            self.pressed_keys.insert(physical);
         }
 
         let text_input = self.text_input.clone();
