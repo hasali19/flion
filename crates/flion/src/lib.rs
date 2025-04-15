@@ -45,8 +45,8 @@ use windows::Win32::Graphics::DirectComposition::{
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    SystemParametersInfoW, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    WM_NCCALCSIZE,
+    SystemParametersInfoW, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_CHAR,
+    WM_DEADCHAR, WM_KEYDOWN, WM_KEYUP, WM_NCCALCSIZE,
 };
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
@@ -76,6 +76,7 @@ struct WindowData {
     engine: *const engine::FlutterEngine,
     resize_controller: Arc<ResizeController>,
     scale_factor: Rc<Cell<f64>>,
+    keyboard: Keyboard,
 }
 
 pub struct FlionEngineEnvironment;
@@ -275,6 +276,7 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
             engine: &*engine,
             resize_controller,
             scale_factor: scale_factor.clone(),
+            keyboard: Keyboard::new(engine.clone(), text_input.clone()),
         }));
 
         unsafe {
@@ -284,7 +286,6 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
         Ok(FlionEngine::new(
             engine,
             window,
-            text_input,
             plugins_engine,
             composition_target,
             scale_factor,
@@ -301,7 +302,6 @@ pub struct FlionEngine<'e> {
     cursor_pos: PhysicalPosition<f64>,
     pointer_is_down: bool,
     buttons: PointerButtons,
-    keyboard: Keyboard,
     window_data: *mut WindowData,
     _plugins: Box<FlutterPluginsEngine>,
     _composition_target: IDCompositionTarget,
@@ -311,7 +311,6 @@ impl<'e> FlionEngine<'e> {
     fn new(
         engine: Rc<FlutterEngine>,
         window: Rc<Window>,
-        text_input: Rc<RefCell<TextInputState>>,
         plugins: Box<FlutterPluginsEngine>,
         composition_target: IDCompositionTarget,
         scale_factor: Rc<Cell<f64>>,
@@ -325,7 +324,6 @@ impl<'e> FlionEngine<'e> {
             cursor_pos: PhysicalPosition::new(0.0, 0.0),
             pointer_is_down: false,
             buttons: PointerButtons::empty(),
-            keyboard: Keyboard::new(engine, text_input),
             window_data,
             _plugins: plugins,
             _composition_target: composition_target,
@@ -448,22 +446,6 @@ impl<'e> FlionEngine<'e> {
                     })
                     .trace_err();
             }
-            WindowEvent::ModifiersChanged(modifiers) => {
-                let _ = self
-                    .keyboard
-                    .handle_modifiers_changed(*modifiers)
-                    .trace_err();
-            }
-            WindowEvent::KeyboardInput {
-                device_id: _,
-                event,
-                is_synthetic,
-            } => {
-                let _ = self
-                    .keyboard
-                    .handle_keyboard_input(event.clone(), *is_synthetic)
-                    .trace_err();
-            }
             WindowEvent::MouseWheel { delta, .. } => match delta {
                 MouseScrollDelta::LineDelta(x, y) => {
                     let mut lines_per_scroll = 3u32;
@@ -545,7 +527,7 @@ unsafe extern "system" fn wnd_proc(
     _uidsubclass: usize,
     dwrefdata: usize,
 ) -> LRESULT {
-    let data = (dwrefdata as *const WindowData).as_ref().unwrap();
+    let data = (dwrefdata as *mut WindowData).as_mut().unwrap();
     match msg {
         WM_NCCALCSIZE => {
             DefSubclassProc(window, msg, wparam, lparam);
@@ -568,11 +550,25 @@ unsafe extern "system" fn wnd_proc(
                             .unwrap();
                     });
             }
+
+            return LRESULT(0);
         }
-        _ => return DefSubclassProc(window, msg, wparam, lparam),
+        WM_KEYDOWN | WM_CHAR | WM_DEADCHAR | WM_KEYUP => {
+            match data.keyboard.handle_message(window, msg, wparam, lparam) {
+                Ok(handled) => {
+                    if handled {
+                        return LRESULT(0);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to handle keyboard event: {e:?}");
+                }
+            }
+        }
+        _ => {}
     }
 
-    LRESULT(0)
+    DefSubclassProc(window, msg, wparam, lparam)
 }
 
 struct CompositionHandler {

@@ -115,6 +115,7 @@ pub struct PointerEvent {
     pub buttons: PointerButtons,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum KeyEventType {
     Up = FlutterKeyEventType_kFlutterKeyEventTypeUp,
@@ -122,10 +123,11 @@ pub enum KeyEventType {
     Repeat = FlutterKeyEventType_kFlutterKeyEventTypeRepeat,
 }
 
-pub struct KeyEvent<'a> {
+#[derive(Clone)]
+pub struct KeyEvent {
     pub event_type: KeyEventType,
     pub synthesized: bool,
-    pub character: Option<&'a SmolStr>,
+    pub character: Option<SmolStr>,
     pub logical: Option<u64>,
     pub physical: Option<u64>,
 }
@@ -329,7 +331,7 @@ impl FlutterEngine {
         Ok(())
     }
 
-    pub fn send_key_event<F>(&self, event: KeyEvent, callback: F) -> eyre::Result<()>
+    pub fn send_key_event<F>(&self, event: &KeyEvent, callback: F) -> eyre::Result<()>
     where
         F: FnOnce(bool) + 'static,
     {
@@ -349,6 +351,7 @@ impl FlutterEngine {
             type_: event.event_type as i32,
             character: event
                 .character
+                .as_deref()
                 .map(|c| c.as_ptr().cast())
                 .unwrap_or(ptr::null()),
             synthesized: event.synthesized,
