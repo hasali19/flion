@@ -77,9 +77,7 @@ pub enum PointerDeviceKind {
     Unknown = 0,
     Mouse = FlutterPointerDeviceKind_kFlutterPointerDeviceKindMouse,
     Touch = FlutterPointerDeviceKind_kFlutterPointerDeviceKindTouch,
-    #[expect(unused)]
     Stylus = FlutterPointerDeviceKind_kFlutterPointerDeviceKindStylus,
-    #[expect(unused)]
     Trackpad = FlutterPointerDeviceKind_kFlutterPointerDeviceKindTrackpad,
 }
 
@@ -117,6 +115,7 @@ pub struct PointerEvent {
     pub buttons: PointerButtons,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum KeyEventType {
     Up = FlutterKeyEventType_kFlutterKeyEventTypeUp,
@@ -124,10 +123,11 @@ pub enum KeyEventType {
     Repeat = FlutterKeyEventType_kFlutterKeyEventTypeRepeat,
 }
 
-pub struct KeyEvent<'a> {
+#[derive(Clone)]
+pub struct KeyEvent {
     pub event_type: KeyEventType,
     pub synthesized: bool,
-    pub character: Option<&'a SmolStr>,
+    pub character: Option<SmolStr>,
     pub logical: Option<u64>,
     pub physical: Option<u64>,
 }
@@ -331,7 +331,7 @@ impl FlutterEngine {
         Ok(())
     }
 
-    pub fn send_key_event<F>(&self, event: KeyEvent, callback: F) -> eyre::Result<()>
+    pub fn send_key_event<F>(&self, event: &KeyEvent, callback: F) -> eyre::Result<()>
     where
         F: FnOnce(bool) + 'static,
     {
@@ -351,6 +351,7 @@ impl FlutterEngine {
             type_: event.event_type as i32,
             character: event
                 .character
+                .as_deref()
                 .map(|c| c.as_ptr().cast())
                 .unwrap_or(ptr::null()),
             synthesized: event.synthesized,
@@ -375,91 +376,6 @@ impl FlutterEngine {
         Ok(())
     }
 
-    pub fn send_platform_message(&self, channel: &CStr, message: &[u8]) -> eyre::Result<()> {
-        unsafe {
-            let result = FlutterEngineSendPlatformMessage(
-                self.inner.handle,
-                &FlutterPlatformMessage {
-                    struct_size: mem::size_of::<FlutterPlatformMessage>(),
-                    channel: channel.as_ptr(),
-                    message: message.as_ptr(),
-                    message_size: message.len(),
-                    response_handle: ptr::null_mut(),
-                },
-            );
-
-            if result != FlutterEngineResult_kSuccess {
-                bail!("failed to send platform message: {result}");
-            }
-
-            Ok(())
-        }
-    }
-
-    pub fn send_platform_message_with_reply<F>(
-        &self,
-        channel: &CStr,
-        message: &[u8],
-        reply_handler: F,
-    ) -> eyre::Result<()>
-    where
-        F: FnOnce(&[u8]) + 'static,
-    {
-        unsafe extern "C" fn callback<F: FnOnce(&[u8])>(
-            data: *const u8,
-            size: usize,
-            user_data: *mut ::std::os::raw::c_void,
-        ) {
-            let reply_handler = Box::from_raw(user_data.cast::<F>());
-            if data.is_null() {
-                tracing::warn!("null reply from platform message");
-            } else {
-                reply_handler(std::slice::from_raw_parts(data, size));
-            }
-        }
-
-        unsafe {
-            let mut response_handle = ptr::null_mut();
-
-            // This is freed by the callback above, when invoked.
-            let reply = Box::into_raw(Box::new(reply_handler));
-            let result = FlutterPlatformMessageCreateResponseHandle(
-                self.inner.handle,
-                Some(callback::<F>),
-                reply.cast(),
-                &mut response_handle,
-            );
-
-            if result != FlutterEngineResult_kSuccess {
-                bail!("failed to create response handle: {result}");
-            }
-
-            let result = FlutterEngineSendPlatformMessage(
-                self.inner.handle,
-                &FlutterPlatformMessage {
-                    struct_size: mem::size_of::<FlutterPlatformMessage>(),
-                    channel: channel.as_ptr(),
-                    message: message.as_ptr(),
-                    message_size: message.len(),
-                    response_handle,
-                },
-            );
-
-            if result != FlutterEngineResult_kSuccess {
-                bail!("failed to send platform message: {result}");
-            }
-
-            let result =
-                FlutterPlatformMessageReleaseResponseHandle(self.inner.handle, response_handle);
-
-            if result != FlutterEngineResult_kSuccess {
-                bail!("failed to release response handle: {result}");
-            }
-
-            Ok(())
-        }
-    }
-
     pub fn set_platform_message_handler(
         &self,
         name: impl Into<String>,
@@ -469,6 +385,13 @@ impl FlutterEngine {
             .platform_message_handlers
             .lock()
             .insert(name.into(), Box::new(handler));
+    }
+
+    pub fn messenger(&self) -> BinaryMessenger {
+        BinaryMessenger {
+            engine: self.inner.handle,
+            engine_is_running: self.inner.is_running.clone(),
+        }
     }
 }
 
@@ -559,6 +482,110 @@ fn create_task_runner<F: Fn(Task) + 'static>(
         runs_task_on_current_thread_callback: Some(runs_tasks_on_current_thread::<F>),
         post_task_callback: Some(post_task_callback::<F>),
         destruction_callback: Some(destruction_callback::<F>),
+    }
+}
+
+#[derive(Clone)]
+pub struct BinaryMessenger {
+    engine: flutter_embedder::FlutterEngine,
+    engine_is_running: Arc<Mutex<bool>>,
+}
+
+impl BinaryMessenger {
+    pub fn send_platform_message(&self, channel: &CStr, message: &[u8]) -> eyre::Result<()> {
+        if *self.engine_is_running.lock() {
+            unsafe {
+                let result = FlutterEngineSendPlatformMessage(
+                    self.engine,
+                    &FlutterPlatformMessage {
+                        struct_size: mem::size_of::<FlutterPlatformMessage>(),
+                        channel: channel.as_ptr(),
+                        message: message.as_ptr(),
+                        message_size: message.len(),
+                        response_handle: ptr::null_mut(),
+                    },
+                );
+
+                if result != FlutterEngineResult_kSuccess {
+                    bail!("failed to send platform message: {result}");
+                }
+
+                Ok(())
+            }
+        } else {
+            bail!("engine is not running")
+        }
+    }
+
+    pub fn send_platform_message_with_reply<F>(
+        &self,
+        channel: &CStr,
+        message: &[u8],
+        reply_handler: F,
+    ) -> eyre::Result<()>
+    where
+        F: FnOnce(&[u8]) + 'static,
+    {
+        unsafe extern "C" fn callback<F: FnOnce(&[u8])>(
+            data: *const u8,
+            size: usize,
+            user_data: *mut ::std::os::raw::c_void,
+        ) {
+            let reply_handler = Box::from_raw(user_data.cast::<F>());
+            if data.is_null() {
+                tracing::warn!("null reply from platform message");
+            } else {
+                reply_handler(std::slice::from_raw_parts(data, size));
+            }
+        }
+
+        if *self.engine_is_running.lock() {
+            let mut response_handle = ptr::null_mut();
+
+            // This is freed by the callback above, when invoked.
+            let reply = Box::into_raw(Box::new(reply_handler));
+            let result = unsafe {
+                FlutterPlatformMessageCreateResponseHandle(
+                    self.engine,
+                    Some(callback::<F>),
+                    reply.cast(),
+                    &mut response_handle,
+                )
+            };
+
+            if result != FlutterEngineResult_kSuccess {
+                bail!("failed to create response handle: {result}");
+            }
+
+            let result = unsafe {
+                FlutterEngineSendPlatformMessage(
+                    self.engine,
+                    &FlutterPlatformMessage {
+                        struct_size: mem::size_of::<FlutterPlatformMessage>(),
+                        channel: channel.as_ptr(),
+                        message: message.as_ptr(),
+                        message_size: message.len(),
+                        response_handle,
+                    },
+                )
+            };
+
+            if result != FlutterEngineResult_kSuccess {
+                bail!("failed to send platform message: {result}");
+            }
+
+            let result = unsafe {
+                FlutterPlatformMessageReleaseResponseHandle(self.engine, response_handle)
+            };
+
+            if result != FlutterEngineResult_kSuccess {
+                bail!("failed to release response handle: {result}");
+            }
+
+            Ok(())
+        } else {
+            bail!("engine is not running")
+        }
     }
 }
 

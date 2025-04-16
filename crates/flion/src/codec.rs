@@ -80,6 +80,8 @@ pub enum EncodableValue<'a> {
     I64(i64),
     F64(Float64),
     Str(&'a str),
+    List(Vec<EncodableValue<'a>>),
+    U8List(Vec<u8>),
     Map(BTreeMap<EncodableValue<'a>, EncodableValue<'a>>),
 }
 
@@ -123,6 +125,14 @@ impl<'a> EncodableValue<'a> {
             None
         }
     }
+
+    pub fn into_map(self) -> Option<BTreeMap<EncodableValue<'a>, EncodableValue<'a>>> {
+        if let Self::Map(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
 }
 
 fn read_size(cursor: &mut ReadCursor) -> io::Result<u32> {
@@ -156,6 +166,22 @@ fn read_string<'a>(cursor: &mut ReadCursor<'a>) -> io::Result<&'a str> {
 fn write_string(w: &mut WriteCursor, value: &str) -> io::Result<()> {
     write_size(w, value.len() as u32)?;
     w.write_all(value.as_bytes())?;
+    Ok(())
+}
+
+fn write_list(w: &mut WriteCursor, values: &[EncodableValue]) -> io::Result<()> {
+    write_size(w, values.len() as u32)?;
+    for v in values {
+        write_value(w, v)?;
+    }
+    Ok(())
+}
+
+fn write_u8_list(w: &mut WriteCursor, values: &[u8]) -> io::Result<()> {
+    write_size(w, values.len() as u32)?;
+    for v in values {
+        w.write_u8(*v)?;
+    }
     Ok(())
 }
 
@@ -235,6 +261,14 @@ pub fn write_value(w: &mut WriteCursor, value: &EncodableValue) -> io::Result<()
         EncodableValue::Str(v) => {
             w.write_u8(EncodedType::String as u8)?;
             write_string(w, v)?;
+        }
+        EncodableValue::List(v) => {
+            w.write_u8(EncodedType::List as u8)?;
+            write_list(w, v)?;
+        }
+        EncodableValue::U8List(v) => {
+            w.write_u8(EncodedType::UInt8List as u8)?;
+            write_u8_list(w, v)?;
         }
         EncodableValue::Map(v) => {
             w.write_u8(EncodedType::Map as u8)?;

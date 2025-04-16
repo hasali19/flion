@@ -3,10 +3,10 @@ use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use winit::event::KeyEvent;
-use winit::keyboard::{Key, NamedKey};
 
-use crate::engine::{BinaryMessageHandler, BinaryMessageReply, FlutterEngine};
+use crate::engine::{
+    BinaryMessageHandler, BinaryMessageReply, FlutterEngine, KeyEvent, KeyEventType,
+};
 
 pub struct TextInputState {
     client: Option<u32>,
@@ -26,21 +26,20 @@ impl TextInputState {
         event: &KeyEvent,
         engine: &FlutterEngine,
     ) -> eyre::Result<()> {
-        if event.state.is_pressed() {
-            match &event.logical_key {
-                Key::Named(NamedKey::Space) => self.insert_text(" "),
-                Key::Named(NamedKey::Enter) => {
+        if let Some(client) = self.client {
+            if let KeyEventType::Down | KeyEventType::Repeat = event.event_type {
+                if event.logical == Some(0x0010000000d) {
                     // TODO: Handle enter key
                     return Ok(());
                 }
-                Key::Character(c) => self.insert_text(c.as_str()),
-                // Key::Unidentified(_) => todo!(),
-                // Key::Dead(_) => todo!(),
-                _ => return Ok(()),
-            }
-        }
 
-        if let Some(client) = self.client {
+                if let Some(text) = event.character.as_deref() {
+                    self.insert_text(text);
+                } else {
+                    return Ok(());
+                }
+            }
+
             let message = json!({
                 "method": "TextInputClient.updateEditingState",
                 "args": [
@@ -52,6 +51,7 @@ impl TextInputState {
             let message = serde_json::to_vec(&message).unwrap();
 
             engine
+                .messenger()
                 .send_platform_message(c"flutter/textinput", &message)
                 .unwrap();
         }

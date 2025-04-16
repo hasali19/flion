@@ -9,10 +9,10 @@ flion = { path = "../crates/flion" }
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 windows-numerics = "0.1.1"
+winit = "0.29.15"
 
 [dependencies.windows]
 version = "0.60"
-features = ["UI_Composition"]
 
 [build-dependencies]
 flion-build = { path = "../crates/flion-build" }

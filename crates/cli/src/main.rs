@@ -17,6 +17,11 @@ static PLUGINS_SHIM_SOURCE: &str = include_str!("../../plugins-compat/src/lib.rs
 
 #[derive(clap::Parser)]
 enum Command {
+    /// Build a flion application
+    Build {
+        #[arg(long)]
+        release: bool,
+    },
     /// Run a flion application
     Run {
         #[arg(long)]
@@ -55,90 +60,92 @@ fn main() -> eyre::Result<()> {
 
     let command = Command::parse();
 
-    match command {
-        Command::Run { release } => {
-            #[cfg(target_os = "windows")]
-            let flutter_program = "flutter.bat";
+    let (run, release) = match command {
+        Command::Build { release } => (false, release),
+        Command::Run { release } => (true, release),
+    };
 
-            #[cfg(not(target_os = "windows"))]
-            let flutter_program = "flutter";
+    #[cfg(target_os = "windows")]
+    let flutter_program = "flutter.bat";
 
-            let flutter_program = which(flutter_program)?;
-            let cargo_manifest = find_manifest_path()?;
-            let pubspec = find_pubspec_path()?;
-            let flutter_project_dir = pubspec.parent().unwrap();
+    #[cfg(not(target_os = "windows"))]
+    let flutter_program = "flutter";
 
-            let cargo_metadata = get_cargo_metadata(&cargo_manifest)?;
+    let flutter_program = which(flutter_program)?;
+    let cargo_manifest = find_manifest_path()?;
+    let pubspec = find_pubspec_path()?;
+    let flutter_project_dir = pubspec.parent().unwrap();
 
-            download_engine_artifacts(
-                &flutter_program,
-                &flutter_project_dir.join("build").join("flion"),
-            )?;
+    let cargo_metadata = get_cargo_metadata(&cargo_manifest)?;
 
-            let build_mode = if release {
-                BuildMode::Release
-            } else {
-                BuildMode::Debug
-            };
+    download_engine_artifacts(
+        &flutter_program,
+        &flutter_project_dir.join("build").join("flion"),
+    )?;
 
-            let flutter_build_dir = flutter_project_dir.join("build");
-            let flion_build_dir = flutter_build_dir.join("flion");
-            let target_dir = cargo_metadata
-                .target_directory
-                .as_std_path()
-                .join(build_mode.name());
+    let build_mode = if release {
+        BuildMode::Release
+    } else {
+        BuildMode::Debug
+    };
 
-            if !target_dir.exists() {
-                fs::create_dir_all(&target_dir)?;
-            }
+    let flutter_build_dir = flutter_project_dir.join("build");
+    let flion_build_dir = flutter_build_dir.join("flion");
+    let target_dir = cargo_metadata
+        .target_directory
+        .as_std_path()
+        .join(build_mode.name());
 
-            let engine_artifacts_dir =
-                get_engine_artifacts_dir(&flutter_program, &flion_build_dir)?;
+    if !target_dir.exists() {
+        fs::create_dir_all(&target_dir)?;
+    }
 
-            flutter_build(
-                &flutter_program,
-                flutter_project_dir,
-                &engine_artifacts_dir,
-                &flion_build_dir,
-                build_mode,
-            )?;
+    let engine_artifacts_dir = get_engine_artifacts_dir(&flutter_program, &flion_build_dir)?;
 
-            copy_native_libraries(
-                &flutter_program,
-                flutter_project_dir,
-                build_mode,
-                &target_dir,
-            )?;
+    flutter_build(
+        &flutter_program,
+        flutter_project_dir,
+        &engine_artifacts_dir,
+        &flion_build_dir,
+        build_mode,
+    )?;
 
-            compile_plugins_shim(&flion_build_dir.join("plugins"), &target_dir)?;
+    copy_native_libraries(
+        &flutter_program,
+        flutter_project_dir,
+        build_mode,
+        &target_dir,
+    )?;
 
-            process_plugins(&flutter_program, flutter_project_dir, &target_dir)?;
+    compile_plugins_shim(&flion_build_dir.join("plugins"), &target_dir)?;
 
-            let embedder_path = engine_artifacts_dir.join(match build_mode {
-                BuildMode::Debug => "windows-x64-embedder",
-                BuildMode::Release => "windows-x64-embedder-release",
-            });
+    process_plugins(&flutter_program, flutter_project_dir, &target_dir)?;
 
-            let angle_path = flion_build_dir.join("angle-win64");
+    let embedder_path = engine_artifacts_dir.join(match build_mode {
+        BuildMode::Debug => "windows-x64-embedder",
+        BuildMode::Release => "windows-x64-embedder-release",
+    });
 
-            let out = cmd!("cargo", "run", "--profile", build_mode.cargo_profile())
-                .env("FLUTTER_EMBEDDER_PATH", embedder_path)
-                .env("ANGLE_PATH", angle_path)
-                .env(
-                    "FLION_ASSETS_PATH",
-                    flutter_build_dir.join("flutter_assets"),
-                )
-                .env("FLION_AOT_LIBRARY_PATH", flion_build_dir.join("app.so"))
-                .unchecked()
-                .run()?;
+    let angle_path = flion_build_dir.join("angle-win64");
 
-            if let Some(code) = out.status.code()
-                && code != 0
-            {
-                tracing::error!("command exited with code {code}");
-                process::exit(1);
-            }
-        }
+    let cargo_cmd = if run { "run" } else { "build" };
+
+    let out = cmd!("cargo", cargo_cmd, "--profile", build_mode.cargo_profile())
+        .env("FLUTTER_EMBEDDER_PATH", embedder_path)
+        .env("ANGLE_PATH", angle_path)
+        .env(
+            "FLION_ASSETS_PATH",
+            flutter_build_dir.join("flutter_assets"),
+        )
+        .env("FLION_AOT_LIBRARY_PATH", flion_build_dir.join("app.so"))
+        .unchecked()
+        .run()?;
+
+    if let Some(code) = out.status.code()
+        && code != 0
+    {
+        tracing::error!("command exited with code {code}");
+        process::exit(1);
     }
 
     Ok(())
@@ -311,6 +318,35 @@ fn flutter_build(
 
         tracing::info!("building kernel_snapshot.dill");
 
+        let mut current_dir = flutter_project_dir;
+
+        let package_config_path = loop {
+            let path = current_dir.join(".dart_tool").join("package_config.json");
+            if path.exists() {
+                break Some(path);
+            }
+
+            let Some(parent) = current_dir.parent() else {
+                break None;
+            };
+
+            current_dir = parent;
+        }
+        .ok_or_eyre("failed to locate .dart_tool/package_config.json")?;
+
+        let dart_plugin_registrant_path = flutter_project_dir
+            .join(".dart_tool")
+            .join("flutter_build")
+            .join("dart_plugin_registrant.dart");
+
+        let d_dart_plugin_registrant = format!(
+            "-Dflutter.dart_plugin_registrant=file:///{}",
+            dart_plugin_registrant_path
+                .to_str()
+                .unwrap()
+                .replace("\\", "/"),
+        );
+
         cmd!(
             dartaotruntime,
             frontend_server_snapshot,
@@ -327,11 +363,14 @@ fn flutter_build(
             "--target-os",
             "windows",
             "--packages",
-            flutter_project_dir
-                .join(".dart_tool")
-                .join("package_config.json"),
+            package_config_path,
             "--output-dill",
             build_dir.join("kernel_snapshot.dill"),
+            "--source",
+            dart_plugin_registrant_path,
+            "--source",
+            "package:flutter/src/dart_plugin_registrant.dart",
+            d_dart_plugin_registrant,
             flutter_project_dir.join("lib").join("main.dart"),
         )
         .run()?;

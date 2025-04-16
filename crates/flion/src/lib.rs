@@ -1,3 +1,5 @@
+#![feature(let_chains)]
+
 mod compositor;
 mod egl;
 mod engine;
@@ -18,19 +20,18 @@ pub mod standard_method_channel;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::{env, mem};
 
-use codec::EncodableValue;
 use engine::{PointerButtons, PointerDeviceKind, PointerEvent};
 use eyre::OptionExt;
-use platform_views::PlatformViews;
+use platform_views::{PlatformViewFactory, PlatformViewsMessageHandler};
 use plugins_shim::FlutterPluginsEngine;
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle, Win32WindowHandle};
 use resize_controller::ResizeController;
-use standard_method_channel::StandardMethodHandler;
 use task_runner::Task;
 use windows::core::Interface;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -38,15 +39,11 @@ use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION,
 };
-use windows::Win32::Graphics::Dwm::{
-    DwmFlush, DwmSetWindowAttribute, DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
-    DWM_SYSTEMBACKDROP_TYPE,
+use windows::Win32::Graphics::DirectComposition::{
+    DCompositionCreateDevice2, IDCompositionDevice, IDCompositionTarget,
 };
+use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::Graphics::Gdi::ScreenToClient;
-use windows::Win32::System::WinRT::Composition::ICompositorDesktopInterop;
-use windows::Win32::System::WinRT::{
-    CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_ASTA, DQTYPE_THREAD_CURRENT,
-};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -54,25 +51,20 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Input::Touch::{
     CloseTouchInputHandle, GetTouchInputInfo, RegisterTouchWindow, HTOUCHINPUT,
-    REGISTER_TOUCH_WINDOW_FLAGS, TOUCHEVENTF_DOWN, TOUCHEVENTF_FLAGS, TOUCHEVENTF_MOVE,
-    TOUCHEVENTF_UP, TOUCHINPUT,
+    REGISTER_TOUCH_WINDOW_FLAGS, TOUCHEVENTF_DOWN, TOUCHEVENTF_MOVE, TOUCHEVENTF_UP, TOUCHINPUT,
 };
-use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, SystemParametersInfoW, SPI_GETWHEELSCROLLLINES,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WM_DPICHANGED_BEFOREPARENT, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCCALCSIZE, WM_NCCREATE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TOUCH, WM_XBUTTONDOWN,
-    WM_XBUTTONUP, XBUTTON1, XBUTTON2,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WM_CHAR, WM_DEADCHAR,
+    WM_DPICHANGED_BEFOREPARENT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCCREATE,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TOUCH, WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1, XBUTTON2,
 };
-use windows::UI::Composition::Core::CompositorController;
-use windows::UI::Composition::{Compositor, ContainerVisual};
-use windows_numerics::Vector2;
-use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
-use winit::event::{Event, MouseScrollDelta, TouchPhase, WindowEvent};
-use winit::event_loop::{ControlFlow, EventLoopBuilder};
-use winit::platform::windows::WindowBuilderExtWindows;
-use winit::window::WindowBuilder;
+use winit::dpi::PhysicalSize;
+use winit::event::WindowEvent;
+use winit::event_loop::EventLoopWindowTarget;
+use winit::window::Window;
 
 use crate::compositor::FlutterCompositor;
 use crate::egl::EglDevice;
@@ -80,11 +72,11 @@ use crate::engine::{FlutterEngine, FlutterEngineConfig, PointerPhase};
 use crate::error_utils::ResultExt;
 use crate::keyboard::Keyboard;
 use crate::mouse_cursor::MouseCursorHandler;
-use crate::task_runner::TaskRunnerExecutor;
 use crate::text_input::{TextInputHandler, TextInputState};
 
-pub use crate::engine::{BinaryMessageHandler, BinaryMessageReply};
-pub use crate::platform_views::PlatformView;
+pub use crate::engine::{BinaryMessageHandler, BinaryMessageReply, BinaryMessenger};
+pub use crate::platform_views::{CompositorContext, PlatformView, PlatformViewUpdateArgs};
+pub use crate::task_runner::TaskRunnerExecutor;
 
 #[macro_export]
 macro_rules! include_plugins {
@@ -97,6 +89,7 @@ struct WindowData {
     engine: *const engine::FlutterEngine,
     resize_controller: Arc<ResizeController>,
     scale_factor: f64,
+    keyboard: Keyboard,
     cursor_position: (f64, f64),
     buttons: PointerButtons,
     is_tracking_mouse_leave: bool,
@@ -164,23 +157,41 @@ impl WindowData {
     }
 }
 
-#[derive(Debug)]
-enum PlatformEvent {
-    PostFlutterTask(Task),
+pub struct FlionEngineEnvironment;
+
+impl FlionEngineEnvironment {
+    pub fn init() -> eyre::Result<FlionEngineEnvironment> {
+        Ok(FlionEngineEnvironment)
+    }
+
+    pub fn new_engine_builder<'a>(&self) -> FlionEngineBuilder<'_, 'a> {
+        FlionEngineBuilder::new()
+    }
 }
 
-pub struct FlionEngine<'a> {
-    bundle_path: &'a Path,
+pub struct FlionEngineBuilder<'e, 'a> {
+    env: PhantomData<&'e FlionEngineEnvironment>,
+    bundle_path: PathBuf,
     plugin_initializers: &'a [unsafe extern "C" fn(*mut c_void)],
     platform_message_handlers: Vec<(&'a str, Box<dyn BinaryMessageHandler>)>,
-    platform_view_factories: HashMap<String, Box<dyn Fn(&Compositor) -> PlatformView>>,
+    platform_view_factories: HashMap<String, Box<dyn PlatformViewFactory>>,
 }
 
-impl<'a> FlionEngine<'a> {
-    #[expect(clippy::new_without_default)]
-    pub fn new() -> FlionEngine<'a> {
-        FlionEngine {
-            bundle_path: Path::new("data"),
+pub type PlatformTask = Task;
+
+impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
+    fn new() -> FlionEngineBuilder<'e, 'a> {
+        let bundle_path = if let Ok(exe) = env::current_exe()
+            && let Some(dir) = exe.parent()
+        {
+            dir.join("data")
+        } else {
+            PathBuf::from("data")
+        };
+
+        FlionEngineBuilder {
+            env: PhantomData,
+            bundle_path,
             plugin_initializers: &[],
             platform_message_handlers: vec![],
             platform_view_factories: HashMap::new(),
@@ -188,7 +199,7 @@ impl<'a> FlionEngine<'a> {
     }
 
     pub fn with_bundle_path(mut self, path: &'a Path) -> Self {
-        self.bundle_path = path;
+        self.bundle_path = path.to_owned();
         self
     }
 
@@ -209,45 +220,25 @@ impl<'a> FlionEngine<'a> {
     pub fn with_platform_view_factory(
         mut self,
         name: &'a str,
-        handler: Box<dyn Fn(&Compositor) -> PlatformView>,
+        factory: impl PlatformViewFactory + 'static,
     ) -> Self {
         self.platform_view_factories
-            .insert(name.to_owned(), handler);
+            .insert(name.to_owned(), Box::new(factory));
         self
     }
 
-    pub fn run(self) -> eyre::Result<()> {
-        let event_loop = EventLoopBuilder::<PlatformEvent>::with_user_event().build()?;
-        let window = WindowBuilder::new()
-            .with_inner_size(LogicalSize::new(1280, 720))
-            .with_no_redirection_bitmap(true)
-            .build(&event_loop)?;
-
-        let hwnd = match window.window_handle()?.as_raw() {
-            RawWindowHandle::Win32(handle) => HWND(handle.hwnd.get() as _),
-            _ => unreachable!(),
+    pub fn build(
+        self,
+        window: Rc<Window>,
+        platform_task_callback: impl Fn(PlatformTask) + 'static,
+    ) -> eyre::Result<FlionEngine<'e>> {
+        let RawWindowHandle::Win32(Win32WindowHandle { hwnd, .. }) =
+            window.window_handle()?.as_raw()
+        else {
+            unreachable!()
         };
 
-        unsafe {
-            DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_SYSTEMBACKDROP_TYPE,
-                &DWMSBT_MAINWINDOW as *const DWM_SYSTEMBACKDROP_TYPE as *const c_void,
-                mem::size_of::<DWM_SYSTEMBACKDROP_TYPE>() as u32,
-            )
-        }?;
-
-        let PhysicalSize { width, height } = window.inner_size();
-
-        tracing::info!(width, height);
-
-        let _dispatcher_queue_controller = unsafe {
-            CreateDispatcherQueueController(DispatcherQueueOptions {
-                dwSize: mem::size_of::<DispatcherQueueOptions>() as u32,
-                threadType: DQTYPE_THREAD_CURRENT,
-                apartmentType: DQTAT_COM_ASTA,
-            })?
-        };
+        let hwnd = HWND(hwnd.get() as *mut c_void);
 
         let device = unsafe {
             let mut device = Default::default();
@@ -267,84 +258,37 @@ impl<'a> FlionEngine<'a> {
             device.ok_or_eyre("failed to create D3D11 device")?
         };
 
-        let compositor_controller = CompositorController::new()?;
-        let composition_target = unsafe {
-            compositor_controller
-                .Compositor()?
-                .cast::<ICompositorDesktopInterop>()?
-                .CreateDesktopWindowTarget(hwnd, false)?
-        };
+        let composition_device: IDCompositionDevice =
+            unsafe { DCompositionCreateDevice2(&device.cast::<IDXGIDevice>()?)? };
+
+        let composition_target = unsafe { composition_device.CreateTargetForHwnd(hwnd, true)? };
+
+        let root_visual = unsafe { composition_device.CreateVisual()? };
+
+        let PhysicalSize { width, height } = window.inner_size();
+
+        unsafe {
+            composition_target.SetRoot(&root_visual)?;
+        }
 
         let egl = EglDevice::create(&device)?;
-        let resize_controller = Arc::new(ResizeController::new());
 
-        let window = Rc::new(window);
+        let resize_controller = Arc::new(ResizeController::new());
         let text_input = Rc::new(RefCell::new(TextInputState::new()));
 
-        let root_visual = compositor_controller
-            .Compositor()?
-            .CreateContainerVisual()?;
-
-        root_visual.SetSize(Vector2 {
-            X: width as f32,
-            Y: height as f32,
-        })?;
-
-        composition_target.SetRoot(&root_visual)?;
-
         let compositor = FlutterCompositor::new(
+            device.clone(),
+            composition_device.clone(),
             root_visual.clone(),
-            device,
             egl.clone(),
             Box::new(CompositionHandler {
-                compositor_controller: compositor_controller.clone(),
+                composition_device: composition_device.clone(),
                 resize_controller: resize_controller.clone(),
-                root_visual,
+                surface_size: (width, height),
             }),
         )?;
 
         let platform_views = compositor.platform_views();
-
-        struct PlatformViewsHandler {
-            platform_views: Arc<PlatformViews>,
-            compositor: Compositor,
-            factories: HashMap<String, Box<dyn Fn(&Compositor) -> PlatformView>>,
-        }
-
-        impl StandardMethodHandler for PlatformViewsHandler {
-            fn handle(
-                &self,
-                method: &str,
-                args: codec::EncodableValue,
-                reply: standard_method_channel::StandardMethodReply,
-            ) {
-                if method == "create" {
-                    let args = args.as_map().unwrap();
-
-                    let id = args
-                        .get(&EncodableValue::Str("id"))
-                        .unwrap()
-                        .as_i32()
-                        .unwrap();
-
-                    let type_ = args
-                        .get(&EncodableValue::Str("type"))
-                        .unwrap()
-                        .as_string()
-                        .unwrap();
-
-                    self.platform_views
-                        .register(*id as u64, (self.factories[type_])(&self.compositor));
-
-                    reply.success(&EncodableValue::Null);
-                } else if method == "remove" {
-                    // TODO
-                    reply.success(&EncodableValue::Null);
-                } else {
-                    reply.not_implemented();
-                }
-            }
-        }
 
         let mut platform_message_handlers: Vec<(&str, Box<dyn BinaryMessageHandler>)> = vec![
             (
@@ -357,11 +301,12 @@ impl<'a> FlionEngine<'a> {
             ),
             (
                 "flion/platform_views",
-                Box::new(PlatformViewsHandler {
+                Box::new(PlatformViewsMessageHandler::new(
                     platform_views,
-                    compositor: compositor_controller.Compositor()?,
-                    factories: self.platform_view_factories,
-                }),
+                    device,
+                    composition_device,
+                    self.platform_view_factories,
+                )),
             ),
         ];
 
@@ -387,19 +332,11 @@ impl<'a> FlionEngine<'a> {
             ),
             egl: egl.clone(),
             compositor,
-            platform_task_handler: Box::new({
-                let event_loop = event_loop.create_proxy();
-                move |task| {
-                    if let Err(e) = event_loop.send_event(PlatformEvent::PostFlutterTask(task)) {
-                        tracing::error!("{e}");
-                    }
-                }
-            }),
+            platform_task_handler: Box::new(platform_task_callback),
             platform_message_handlers,
         })?);
 
-        let mut plugins_engine =
-            Box::new(FlutterPluginsEngine::new(&engine, &window, &event_loop)?);
+        let mut plugins_engine = Box::new(FlutterPluginsEngine::new(engine.clone(), &window)?);
 
         for init in self.plugin_initializers {
             unsafe {
@@ -417,53 +354,99 @@ impl<'a> FlionEngine<'a> {
             engine: &*engine,
             resize_controller,
             scale_factor,
+            keyboard: Keyboard::new(engine.clone(), text_input.clone()),
             cursor_position: (0.0, 0.0),
             buttons: PointerButtons::empty(),
             is_tracking_mouse_leave: false,
         }));
 
         unsafe {
-            SetWindowSubclass(hwnd, Some(wnd_proc), 696969, window_data as *mut _ as _).ok()?
-        };
+            SetWindowSubclass(hwnd, Some(wnd_proc), 696969, window_data as usize).ok()?;
+        }
 
-        let mut task_executor = TaskRunnerExecutor::default();
-        let mut keyboard = Keyboard::new(engine.clone(), text_input);
+        Ok(FlionEngine::new(
+            engine,
+            window,
+            plugins_engine,
+            composition_target,
+            window_data,
+        ))
+    }
+}
 
-        event_loop.run(move |event, target| {
-            match event {
-                Event::UserEvent(event) => match event {
-                    PlatformEvent::PostFlutterTask(task) => {
-                        task_executor.enqueue(task);
-                    }
-                },
-                Event::WindowEvent { event, .. } => match event {
-                    WindowEvent::CloseRequested => {
-                        target.exit();
-                    }
-                    WindowEvent::ModifiersChanged(modifiers) => {
-                        let _ = keyboard.handle_modifiers_changed(modifiers).trace_err();
-                    }
-                    WindowEvent::KeyboardInput {
-                        device_id: _,
-                        event,
-                        is_synthetic,
-                    } => {
-                        let _ = keyboard
-                            .handle_keyboard_input(event, is_synthetic)
-                            .trace_err();
-                    }
-                    _ => {}
-                },
+pub struct FlionEngine<'e> {
+    env: PhantomData<&'e FlionEngineEnvironment>,
+    engine: Rc<FlutterEngine>,
+    window: Rc<Window>,
+    window_data: *mut WindowData,
+    _plugins: Box<FlutterPluginsEngine>,
+    _composition_target: IDCompositionTarget,
+}
 
-                _ => (),
-            }
+impl<'e> FlionEngine<'e> {
+    fn new(
+        engine: Rc<FlutterEngine>,
+        window: Rc<Window>,
+        plugins: Box<FlutterPluginsEngine>,
+        composition_target: IDCompositionTarget,
+        window_data: *mut WindowData,
+    ) -> FlionEngine<'e> {
+        FlionEngine {
+            env: PhantomData,
+            engine: engine.clone(),
+            window,
+            window_data,
+            _plugins: plugins,
+            _composition_target: composition_target,
+        }
+    }
 
-            if let Some(next_task_target_time) = task_executor.process_all(&engine) {
-                target.set_control_flow(ControlFlow::WaitUntil(next_task_target_time));
-            }
-        })?;
+    pub fn messenger(&self) -> BinaryMessenger {
+        self.engine.messenger()
+    }
+
+    pub fn set_platform_message_handler(
+        &self,
+        name: impl Into<String>,
+        handler: impl BinaryMessageHandler + 'static,
+    ) {
+        self.engine.set_platform_message_handler(name, handler)
+    }
+
+    pub fn process_tasks(
+        &mut self,
+        task_executor: &mut TaskRunnerExecutor,
+    ) -> Option<std::time::Instant> {
+        task_executor.process_all(&self.engine)
+    }
+
+    pub fn handle_window_event<T: 'static>(
+        &mut self,
+        event: &WindowEvent,
+        target: &EventLoopWindowTarget<T>,
+    ) -> eyre::Result<()> {
+        if *event == WindowEvent::CloseRequested {
+            target.exit();
+        }
 
         Ok(())
+    }
+}
+
+impl Drop for FlionEngine<'_> {
+    fn drop(&mut self) {
+        let RawWindowHandle::Win32(Win32WindowHandle { hwnd, .. }) =
+            self.window.window_handle().unwrap().as_raw()
+        else {
+            unreachable!()
+        };
+
+        let hwnd = HWND(hwnd.get() as *mut c_void);
+
+        unsafe {
+            RemoveWindowSubclass(hwnd, Some(wnd_proc), 696969).unwrap();
+            drop(Box::from_raw(self.window_data));
+        }
     }
 }
 
@@ -475,7 +458,7 @@ unsafe extern "system" fn wnd_proc(
     _uidsubclass: usize,
     dwrefdata: usize,
 ) -> LRESULT {
-    let data = &mut *(dwrefdata as *mut WindowData);
+    let data = (dwrefdata as *mut WindowData).as_mut().unwrap();
     match msg {
         WM_NCCREATE => {
             RegisterTouchWindow(window, REGISTER_TOUCH_WINDOW_FLAGS::default()).unwrap();
@@ -643,7 +626,7 @@ unsafe extern "system" fn wnd_proc(
                         y: touch.y / 100,
                     };
 
-                    ScreenToClient(window, &mut point);
+                    let _ = ScreenToClient(window, &mut point);
 
                     let x = touch.x as f64;
                     let y = touch.y as f64;
@@ -675,6 +658,18 @@ unsafe extern "system" fn wnd_proc(
 
             CloseTouchInputHandle(touch_input_handle).unwrap();
         }
+        WM_KEYDOWN | WM_CHAR | WM_DEADCHAR | WM_KEYUP => {
+            match data.keyboard.handle_message(window, msg, wparam, lparam) {
+                Ok(handled) => {
+                    if handled {
+                        return LRESULT(0);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to handle keyboard event: {e:?}");
+                }
+            }
+        }
         _ => return DefSubclassProc(window, msg, wparam, lparam),
     }
 
@@ -682,33 +677,29 @@ unsafe extern "system" fn wnd_proc(
 }
 
 struct CompositionHandler {
-    compositor_controller: CompositorController,
+    composition_device: IDCompositionDevice,
     resize_controller: Arc<ResizeController>,
-    root_visual: ContainerVisual,
+    surface_size: (u32, u32),
 }
+
+unsafe impl Send for CompositionHandler {}
 
 impl compositor::CompositionHandler for CompositionHandler {
     fn get_surface_size(&mut self) -> eyre::Result<(u32, u32)> {
         if let Some(resize) = self.resize_controller.current_resize() {
-            Ok(resize.size())
-        } else {
-            let size = self.root_visual.Size()?;
-            Ok((size.X as u32, size.Y as u32))
+            self.surface_size = resize.size();
         }
+        Ok(self.surface_size)
     }
 
     fn present(&mut self) -> eyre::Result<()> {
-        let commit_compositor = || self.compositor_controller.Commit();
+        let commit_compositor = || unsafe { self.composition_device.Commit() };
 
         if let Some(resize) = self.resize_controller.current_resize() {
-            let (width, height) = resize.size();
-
-            self.root_visual
-                .SetSize(Vector2::new(width as f32, height as f32))
-                .unwrap();
-
-            // Calling DwmFlush() seems to reduce glitches when resizing.
-            unsafe { DwmFlush()? };
+            // Make sure the previous commit has completed. This reduces glitches while resizing.
+            unsafe {
+                self.composition_device.WaitForCommitCompletion()?;
+            }
 
             commit_compositor()?;
 
