@@ -32,7 +32,7 @@ use platform_views::{PlatformViewFactory, PlatformViewsMessageHandler};
 use plugins_shim::FlutterPluginsEngine;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle, Win32WindowHandle};
 use resize_controller::ResizeController;
-use task_runner::Task;
+use task_runner::FlutterTaskExecutor;
 use windows::core::Interface;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
@@ -76,7 +76,6 @@ use crate::text_input::{TextInputHandler, TextInputState};
 
 pub use crate::engine::{BinaryMessageHandler, BinaryMessageReply, BinaryMessenger};
 pub use crate::platform_views::{CompositorContext, PlatformView, PlatformViewUpdateArgs};
-pub use crate::task_runner::TaskRunnerExecutor;
 
 #[macro_export]
 macro_rules! include_plugins {
@@ -177,8 +176,6 @@ pub struct FlionEngineBuilder<'e, 'a> {
     platform_view_factories: HashMap<String, Box<dyn PlatformViewFactory>>,
 }
 
-pub type PlatformTask = Task;
-
 impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
     fn new() -> FlionEngineBuilder<'e, 'a> {
         let bundle_path = if let Ok(exe) = env::current_exe()
@@ -227,11 +224,7 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
         self
     }
 
-    pub fn build(
-        self,
-        window: Rc<Window>,
-        platform_task_callback: impl Fn(PlatformTask) + 'static,
-    ) -> eyre::Result<FlionEngine<'e>> {
+    pub fn build(self, window: Rc<Window>) -> eyre::Result<FlionEngine<'e>> {
         let RawWindowHandle::Win32(Win32WindowHandle { hwnd, .. }) =
             window.window_handle()?.as_raw()
         else {
@@ -312,6 +305,9 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
 
         platform_message_handlers.extend(self.platform_message_handlers);
 
+        let task_executor = FlutterTaskExecutor::new()?;
+        let task_queue = task_executor.queue().clone();
+
         // TODO: Disable environment variable lookup in release builds.
         // These variables are provided by the flion cli during development, and are not intended
         // to be used in release builds.
@@ -332,9 +328,11 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
             ),
             egl: egl.clone(),
             compositor,
-            platform_task_handler: Box::new(platform_task_callback),
+            platform_task_handler: Box::new(move |task| task_queue.enqueue(task)),
             platform_message_handlers,
         })?);
+
+        task_executor.init(engine.clone());
 
         let mut plugins_engine = Box::new(FlutterPluginsEngine::new(engine.clone(), &window)?);
 
@@ -364,13 +362,15 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
             SetWindowSubclass(hwnd, Some(wnd_proc), 696969, window_data as usize).ok()?;
         }
 
-        Ok(FlionEngine::new(
+        Ok(FlionEngine {
+            env: PhantomData,
             engine,
             window,
-            plugins_engine,
-            composition_target,
             window_data,
-        ))
+            _plugins: plugins_engine,
+            _composition_target: composition_target,
+            _task_executor: task_executor,
+        })
     }
 }
 
@@ -381,26 +381,10 @@ pub struct FlionEngine<'e> {
     window_data: *mut WindowData,
     _plugins: Box<FlutterPluginsEngine>,
     _composition_target: IDCompositionTarget,
+    _task_executor: FlutterTaskExecutor,
 }
 
-impl<'e> FlionEngine<'e> {
-    fn new(
-        engine: Rc<FlutterEngine>,
-        window: Rc<Window>,
-        plugins: Box<FlutterPluginsEngine>,
-        composition_target: IDCompositionTarget,
-        window_data: *mut WindowData,
-    ) -> FlionEngine<'e> {
-        FlionEngine {
-            env: PhantomData,
-            engine: engine.clone(),
-            window,
-            window_data,
-            _plugins: plugins,
-            _composition_target: composition_target,
-        }
-    }
-
+impl FlionEngine<'_> {
     pub fn messenger(&self) -> BinaryMessenger {
         self.engine.messenger()
     }
@@ -411,13 +395,6 @@ impl<'e> FlionEngine<'e> {
         handler: impl BinaryMessageHandler + 'static,
     ) {
         self.engine.set_platform_message_handler(name, handler)
-    }
-
-    pub fn process_tasks(
-        &mut self,
-        task_executor: &mut TaskRunnerExecutor,
-    ) -> Option<std::time::Instant> {
-        task_executor.process_all(&self.engine)
     }
 
     pub fn handle_window_event<T: 'static>(
