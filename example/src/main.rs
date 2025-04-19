@@ -4,10 +4,7 @@ use std::os::raw::c_void;
 use std::rc::Rc;
 
 use flion::codec::EncodableValue;
-use flion::{
-    CompositorContext, FlionEngineEnvironment, PlatformTask, PlatformView, TaskRunnerExecutor,
-    include_plugins,
-};
+use flion::{CompositorContext, FlionEngineEnvironment, PlatformView, include_plugins};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::Graphics::DirectComposition::{
@@ -23,16 +20,12 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::core::Interface;
 use windows_numerics::Matrix3x2;
 use winit::dpi::LogicalSize;
-use winit::event_loop::{ControlFlow, EventLoopBuilder};
+use winit::event_loop::EventLoopBuilder;
 use winit::platform::windows::WindowBuilderExtWindows;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::WindowBuilder;
 
 include_plugins!();
-
-enum AppEvent {
-    EngineTask(PlatformTask),
-}
 
 fn main() -> Result<(), Box<dyn Error>> {
     #[cfg(debug_assertions)]
@@ -45,7 +38,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .init();
     }
 
-    let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build()?;
+    let event_loop = EventLoopBuilder::new().build()?;
 
     let window = WindowBuilder::new()
         .with_inner_size(LogicalSize::new(1280, 720))
@@ -163,37 +156,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }))
             },
         )
-        .build(window.clone(), {
-            let event_loop = event_loop.create_proxy();
-            move |task| {
-                if event_loop.send_event(AppEvent::EngineTask(task)).is_err() {
-                    tracing::error!("failed to post task to event loop");
-                }
+        .build(window.clone())?;
+
+    event_loop.run(move |event, target| match event {
+        winit::event::Event::WindowEvent { window_id, event } if window_id == window.id() => {
+            if let Err(e) = engine.handle_window_event(&event, target) {
+                tracing::error!("{e:?}");
             }
-        })?;
-
-    let mut task_executor = TaskRunnerExecutor::default();
-
-    event_loop.run(move |event, target| {
-        match event {
-            winit::event::Event::UserEvent(event) => match event {
-                AppEvent::EngineTask(task) => {
-                    task_executor.enqueue(task);
-                }
-            },
-
-            winit::event::Event::WindowEvent { window_id, event } if window_id == window.id() => {
-                if let Err(e) = engine.handle_window_event(&event, target) {
-                    tracing::error!("{e:?}");
-                }
-            }
-
-            _ => {}
         }
 
-        if let Some(next_task_target_time) = engine.process_tasks(&mut task_executor) {
-            target.set_control_flow(ControlFlow::WaitUntil(next_task_target_time));
-        }
+        _ => {}
     })?;
 
     Ok(())

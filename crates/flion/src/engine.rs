@@ -43,7 +43,7 @@ use smol_str::SmolStr;
 
 use crate::compositor::FlutterCompositor;
 use crate::egl::EglDevice;
-use crate::task_runner::{self, Task, TaskRunner};
+use crate::task_runner::{self, FlutterTaskRunner, Task};
 
 pub struct FlutterEngineConfig<'a> {
     pub assets_path: &'a str,
@@ -81,7 +81,7 @@ pub enum PointerDeviceKind {
     Trackpad = FlutterPointerDeviceKind_kFlutterPointerDeviceKindTrackpad,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 #[repr(i32)]
 pub enum PointerPhase {
     #[default]
@@ -136,7 +136,7 @@ impl FlutterEngine {
     pub fn new(config: FlutterEngineConfig) -> eyre::Result<FlutterEngine> {
         let platform_task_runner = create_task_runner(
             1,
-            TaskRunner::new(move |task| (config.platform_task_handler)(task)),
+            FlutterTaskRunner::new(move |task| (config.platform_task_handler)(task)),
         );
 
         let renderer_config = FlutterRendererConfig {
@@ -448,11 +448,11 @@ fn load_aot_data(path: Option<&str>) -> eyre::Result<Option<FlutterEngineAOTData
 
 fn create_task_runner<F: Fn(Task) + 'static>(
     id: usize,
-    runner: TaskRunner<F>,
+    runner: FlutterTaskRunner<F>,
 ) -> FlutterTaskRunnerDescription {
     unsafe extern "C" fn runs_tasks_on_current_thread<F>(task_runner: *mut c_void) -> bool {
         task_runner
-            .cast::<TaskRunner<F>>()
+            .cast::<FlutterTaskRunner<F>>()
             .as_mut()
             .unwrap()
             .runs_tasks_on_current_thread()
@@ -463,13 +463,13 @@ fn create_task_runner<F: Fn(Task) + 'static>(
         target_time_nanos: u64,
         user_data: *mut c_void,
     ) {
-        let runner = user_data.cast::<TaskRunner<F>>();
+        let runner = user_data.cast::<FlutterTaskRunner<F>>();
         (*runner).post_task(task, target_time_nanos);
     }
 
     unsafe extern "C" fn destruction_callback<F: Fn(Task)>(user_data: *mut c_void) {
         tracing::debug!("destroying task runner");
-        drop(Box::from_raw(user_data.cast::<TaskRunner<F>>()));
+        drop(Box::from_raw(user_data.cast::<FlutterTaskRunner<F>>()));
     }
 
     // This is freed by the above destruction_callback.
