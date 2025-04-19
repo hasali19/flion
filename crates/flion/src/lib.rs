@@ -55,11 +55,12 @@ use windows::Win32::UI::Input::Touch::{
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, SystemParametersInfoW, SPI_GETWHEELSCROLLLINES,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WM_CHAR, WM_DEADCHAR,
-    WM_DPICHANGED_BEFOREPARENT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCCREATE,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TOUCH, WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1, XBUTTON2,
+    GetCursorPos, LoadCursorW, SetCursor, SystemParametersInfoW, HCURSOR, HTCLIENT, IDC_ARROW,
+    SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WM_CHAR,
+    WM_DEADCHAR, WM_DPICHANGED_BEFOREPARENT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
+    WM_NCCREATE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_TOUCH, WM_XBUTTONDOWN,
+    WM_XBUTTONUP, XBUTTON1, XBUTTON2,
 };
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
@@ -89,6 +90,7 @@ struct WindowData {
     resize_controller: Arc<ResizeController>,
     scale_factor: f64,
     keyboard: Keyboard,
+    cursor: Rc<RefCell<Option<HCURSOR>>>,
     cursor_position: (f64, f64),
     buttons: PointerButtons,
     is_tracking_mouse_leave: bool,
@@ -282,11 +284,12 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
         )?;
 
         let platform_views = compositor.platform_views();
+        let cursor_state = Rc::new(RefCell::new(Some(unsafe { LoadCursorW(None, IDC_ARROW)? })));
 
         let mut platform_message_handlers: Vec<(&str, Box<dyn BinaryMessageHandler>)> = vec![
             (
                 "flutter/mousecursor",
-                Box::new(MouseCursorHandler::new(window.clone())),
+                Box::new(MouseCursorHandler::new(cursor_state.clone())),
             ),
             (
                 "flutter/textinput",
@@ -353,6 +356,7 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
             resize_controller,
             scale_factor,
             keyboard: Keyboard::new(engine.clone(), text_input.clone()),
+            cursor: cursor_state,
             cursor_position: (0.0, 0.0),
             buttons: PointerButtons::empty(),
             is_tracking_mouse_leave: false,
@@ -439,9 +443,11 @@ unsafe extern "system" fn wnd_proc(
     match msg {
         WM_NCCREATE => {
             RegisterTouchWindow(window, REGISTER_TOUCH_WINDOW_FLAGS::default()).unwrap();
+            return LRESULT(0);
         }
         WM_DPICHANGED_BEFOREPARENT => {
             data.scale_factor = GetDpiForWindow(window) as f64 / 96.0;
+            return LRESULT(0);
         }
         WM_NCCALCSIZE => {
             DefSubclassProc(window, msg, wparam, lparam);
@@ -463,6 +469,15 @@ unsafe extern "system" fn wnd_proc(
                             )
                             .unwrap();
                     });
+            }
+
+            return LRESULT(0);
+        }
+        WM_SETCURSOR => {
+            let hit_test_result = lparam.0 & 0xffff;
+            if hit_test_result as u32 == HTCLIENT {
+                SetCursor(*data.cursor.borrow());
+                return LRESULT(1);
             }
         }
         WM_MOUSEMOVE => {
@@ -489,6 +504,8 @@ unsafe extern "system" fn wnd_proc(
                     buttons: data.buttons,
                 })
                 .trace_err();
+
+            return LRESULT(0);
         }
         WM_MOUSELEAVE => {
             tracing::info!("mouse removed");
@@ -505,6 +522,8 @@ unsafe extern "system" fn wnd_proc(
                 .trace_err();
 
             data.is_tracking_mouse_leave = false;
+
+            return LRESULT(0);
         }
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN => {
             if msg == WM_LBUTTONDOWN {
@@ -538,6 +557,8 @@ unsafe extern "system" fn wnd_proc(
                     buttons: data.buttons,
                 })
                 .trace_err();
+
+            return LRESULT(0);
         }
         WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP => {
             if msg == WM_LBUTTONUP {
@@ -571,14 +592,18 @@ unsafe extern "system" fn wnd_proc(
                     buttons: data.buttons,
                 })
                 .trace_err();
+
+            return LRESULT(0);
         }
         WM_MOUSEWHEEL => {
             let delta = ((wparam.0 >> 16) & 0xffff) as i16 / WHEEL_DELTA as i16;
             let _ = data.on_mouse_scroll(window, 0.0, delta.into()).trace_err();
+            return LRESULT(0);
         }
         WM_MOUSEHWHEEL => {
             let delta = ((wparam.0 >> 16) & 0xffff) as i16 / WHEEL_DELTA as i16;
             let _ = data.on_mouse_scroll(window, delta.into(), 0.0).trace_err();
+            return LRESULT(0);
         }
         WM_TOUCH => {
             // TODO: Why doesn't this work?
@@ -634,6 +659,8 @@ unsafe extern "system" fn wnd_proc(
             }
 
             CloseTouchInputHandle(touch_input_handle).unwrap();
+
+            return LRESULT(0);
         }
         WM_KEYDOWN | WM_CHAR | WM_DEADCHAR | WM_KEYUP => {
             match data.keyboard.handle_message(window, msg, wparam, lparam) {
@@ -647,10 +674,10 @@ unsafe extern "system" fn wnd_proc(
                 }
             }
         }
-        _ => return DefSubclassProc(window, msg, wparam, lparam),
+        _ => {}
     }
 
-    LRESULT(0)
+    DefSubclassProc(window, msg, wparam, lparam)
 }
 
 struct CompositionHandler {
