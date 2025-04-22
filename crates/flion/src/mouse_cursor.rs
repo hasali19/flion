@@ -1,16 +1,19 @@
-use std::rc::Rc;
+use std::rc::Weak;
 
-use winit::window::{CursorIcon, Window};
+use windows::Win32::UI::WindowsAndMessaging::{
+    LoadCursorW, HCURSOR, IDC_ARROW, IDC_HAND, IDC_IBEAM,
+};
 
 use crate::codec::EncodableValue;
 use crate::standard_method_channel::{StandardMethodHandler, StandardMethodReply};
+use crate::window::Window;
 
 pub struct MouseCursorHandler {
-    window: Rc<Window>,
+    window: Weak<Window>,
 }
 
 impl MouseCursorHandler {
-    pub fn new(window: Rc<Window>) -> MouseCursorHandler {
+    pub fn new(window: Weak<Window>) -> MouseCursorHandler {
         MouseCursorHandler { window }
     }
 }
@@ -26,21 +29,8 @@ impl StandardMethodHandler for MouseCursorHandler {
                     .as_string()
                     .unwrap();
 
-                if kind == "none" {
-                    self.window.set_cursor_visible(false);
-                } else {
-                    let cursor = match kind {
-                        "basic" => CursorIcon::Default,
-                        "click" => CursorIcon::Pointer,
-                        "text" => CursorIcon::Text,
-                        name => {
-                            tracing::warn!("unknown cursor name: {name}");
-                            CursorIcon::Default
-                        }
-                    };
-
-                    self.window.set_cursor_icon(cursor);
-                    self.window.set_cursor_visible(true);
+                if let Some(window) = self.window.upgrade() {
+                    window.set_cursor(get_cursor(kind));
                 }
 
                 reply.success(&EncodableValue::Null);
@@ -51,4 +41,16 @@ impl StandardMethodHandler for MouseCursorHandler {
             }
         }
     }
+}
+
+fn get_cursor(name: &str) -> Option<HCURSOR> {
+    let cursor = match name {
+        "none" => return None,
+        "basic" => IDC_ARROW,
+        "click" => IDC_HAND,
+        "text" => IDC_IBEAM,
+        _ => IDC_ARROW,
+    };
+
+    unsafe { LoadCursorW(None, cursor).ok() }
 }

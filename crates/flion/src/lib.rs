@@ -1,4 +1,4 @@
-#![feature(let_chains)]
+#![feature(default_field_values, let_chains)]
 
 mod compositor;
 mod egl;
@@ -13,11 +13,12 @@ mod resize_controller;
 mod settings;
 mod task_runner;
 mod text_input;
+mod window;
 
 pub mod codec;
 pub mod standard_method_channel;
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
 use std::ffi::c_void;
@@ -30,11 +31,11 @@ use engine::{PointerButtons, PointerDeviceKind, PointerEvent};
 use eyre::OptionExt;
 use platform_views::{PlatformViewFactory, PlatformViewsMessageHandler};
 use plugins_shim::FlutterPluginsEngine;
-use raw_window_handle::{HasWindowHandle, RawWindowHandle, Win32WindowHandle};
 use resize_controller::ResizeController;
-use task_runner::Task;
+use task_runner::FlutterTaskExecutor;
+use window::{MouseAction, Window, WindowHandler};
 use windows::core::Interface;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION,
@@ -43,15 +44,6 @@ use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice2, IDCompositionDevice, IDCompositionTarget,
 };
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
-use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
-use windows::Win32::UI::WindowsAndMessaging::{
-    SystemParametersInfoW, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_CHAR,
-    WM_DEADCHAR, WM_KEYDOWN, WM_KEYUP, WM_NCCALCSIZE,
-};
-use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
-use winit::event_loop::EventLoopWindowTarget;
-use winit::window::Window;
 
 use crate::compositor::FlutterCompositor;
 use crate::egl::EglDevice;
@@ -63,20 +55,12 @@ use crate::text_input::{TextInputHandler, TextInputState};
 
 pub use crate::engine::{BinaryMessageHandler, BinaryMessageReply, BinaryMessenger};
 pub use crate::platform_views::{CompositorContext, PlatformView, PlatformViewUpdateArgs};
-pub use crate::task_runner::TaskRunnerExecutor;
 
 #[macro_export]
 macro_rules! include_plugins {
     () => {
         include!(concat!(env!("OUT_DIR"), "/plugin_registrant.rs"));
     };
-}
-
-struct WindowData {
-    engine: *const engine::FlutterEngine,
-    resize_controller: Arc<ResizeController>,
-    scale_factor: Rc<Cell<f64>>,
-    keyboard: Keyboard,
 }
 
 pub struct FlionEngineEnvironment;
@@ -98,8 +82,6 @@ pub struct FlionEngineBuilder<'e, 'a> {
     platform_message_handlers: Vec<(&'a str, Box<dyn BinaryMessageHandler>)>,
     platform_view_factories: HashMap<String, Box<dyn PlatformViewFactory>>,
 }
-
-pub type PlatformTask = Task;
 
 impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
     fn new() -> FlionEngineBuilder<'e, 'a> {
@@ -149,19 +131,7 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
         self
     }
 
-    pub fn build(
-        self,
-        window: Rc<Window>,
-        platform_task_callback: impl Fn(PlatformTask) + 'static,
-    ) -> eyre::Result<FlionEngine<'e>> {
-        let RawWindowHandle::Win32(Win32WindowHandle { hwnd, .. }) =
-            window.window_handle()?.as_raw()
-        else {
-            unreachable!()
-        };
-
-        let hwnd = HWND(hwnd.get() as *mut c_void);
-
+    pub fn build(self) -> eyre::Result<FlionEngine<'e>> {
         let device = unsafe {
             let mut device = Default::default();
 
@@ -183,15 +153,7 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
         let composition_device: IDCompositionDevice =
             unsafe { DCompositionCreateDevice2(&device.cast::<IDXGIDevice>()?)? };
 
-        let composition_target = unsafe { composition_device.CreateTargetForHwnd(hwnd, true)? };
-
         let root_visual = unsafe { composition_device.CreateVisual()? };
-
-        let PhysicalSize { width, height } = window.inner_size();
-
-        unsafe {
-            composition_target.SetRoot(&root_visual)?;
-        }
 
         let egl = EglDevice::create(&device)?;
 
@@ -206,17 +168,13 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
             Box::new(CompositionHandler {
                 composition_device: composition_device.clone(),
                 resize_controller: resize_controller.clone(),
-                surface_size: (width, height),
+                surface_size: (0, 0),
             }),
         )?;
 
         let platform_views = compositor.platform_views();
 
         let mut platform_message_handlers: Vec<(&str, Box<dyn BinaryMessageHandler>)> = vec![
-            (
-                "flutter/mousecursor",
-                Box::new(MouseCursorHandler::new(window.clone())),
-            ),
             (
                 "flutter/textinput",
                 Box::new(TextInputHandler::new(text_input.clone())),
@@ -226,13 +184,16 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
                 Box::new(PlatformViewsMessageHandler::new(
                     platform_views,
                     device,
-                    composition_device,
+                    composition_device.clone(),
                     self.platform_view_factories,
                 )),
             ),
         ];
 
         platform_message_handlers.extend(self.platform_message_handlers);
+
+        let task_executor = FlutterTaskExecutor::new()?;
+        let task_queue = task_executor.queue().clone();
 
         // TODO: Disable environment variable lookup in release builds.
         // These variables are provided by the flion cli during development, and are not intended
@@ -254,11 +215,33 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
             ),
             egl: egl.clone(),
             compositor,
-            platform_task_handler: Box::new(platform_task_callback),
+            platform_task_handler: Box::new(move |task| task_queue.enqueue(task)),
             platform_message_handlers,
         })?);
 
-        let mut plugins_engine = Box::new(FlutterPluginsEngine::new(engine.clone(), &window)?);
+        task_executor.init(engine.clone());
+
+        let window = Rc::new(Window::new(
+            800,
+            600,
+            Box::new(FlutterWindowHandler {
+                engine: engine.clone(),
+                resize_controller,
+                keyboard: Keyboard::new(engine.clone(), text_input.clone()),
+            }),
+        )?);
+
+        engine.set_platform_message_handler(
+            "flutter/mousecursor",
+            MouseCursorHandler::new(Rc::downgrade(&window)),
+        );
+
+        let (width, height) = window.inner_size();
+
+        let mut plugins_engine = Box::new(FlutterPluginsEngine::new(
+            engine.clone(),
+            window.window_handle(),
+        )?);
 
         for init in self.plugin_initializers {
             unsafe {
@@ -266,31 +249,29 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
             }
         }
 
-        engine.send_window_metrics_event(width as usize, height as usize, window.scale_factor())?;
+        let scale_factor = window.scale_factor();
+
+        engine.send_window_metrics_event(width as usize, height as usize, scale_factor)?;
 
         settings::send_to_engine(&engine)?;
 
-        let scale_factor = Rc::new(Cell::new(window.scale_factor()));
-
-        let window_data = Box::into_raw(Box::new(WindowData {
-            engine: &*engine,
-            resize_controller,
-            scale_factor: scale_factor.clone(),
-            keyboard: Keyboard::new(engine.clone(), text_input.clone()),
-        }));
+        // TODO: Composition target should be attached to parent window instead. Use the child window
+        // just for input.
+        let composition_target =
+            unsafe { composition_device.CreateTargetForHwnd(window.window_handle(), true)? };
 
         unsafe {
-            SetWindowSubclass(hwnd, Some(wnd_proc), 696969, window_data as usize).ok()?;
+            composition_target.SetRoot(&root_visual)?;
         }
 
-        Ok(FlionEngine::new(
+        Ok(FlionEngine {
+            env: PhantomData,
             engine,
             window,
-            plugins_engine,
-            composition_target,
-            scale_factor,
-            window_data,
-        ))
+            _plugins: plugins_engine,
+            _composition_target: composition_target,
+            _task_executor: task_executor,
+        })
     }
 }
 
@@ -298,38 +279,12 @@ pub struct FlionEngine<'e> {
     env: PhantomData<&'e FlionEngineEnvironment>,
     engine: Rc<FlutterEngine>,
     window: Rc<Window>,
-    scale_factor: Rc<Cell<f64>>,
-    cursor_pos: PhysicalPosition<f64>,
-    pointer_is_down: bool,
-    buttons: PointerButtons,
-    window_data: *mut WindowData,
     _plugins: Box<FlutterPluginsEngine>,
     _composition_target: IDCompositionTarget,
+    _task_executor: FlutterTaskExecutor,
 }
 
-impl<'e> FlionEngine<'e> {
-    fn new(
-        engine: Rc<FlutterEngine>,
-        window: Rc<Window>,
-        plugins: Box<FlutterPluginsEngine>,
-        composition_target: IDCompositionTarget,
-        scale_factor: Rc<Cell<f64>>,
-        window_data: *mut WindowData,
-    ) -> FlionEngine<'e> {
-        FlionEngine {
-            env: PhantomData,
-            engine: engine.clone(),
-            window,
-            scale_factor,
-            cursor_pos: PhysicalPosition::new(0.0, 0.0),
-            pointer_is_down: false,
-            buttons: PointerButtons::empty(),
-            window_data,
-            _plugins: plugins,
-            _composition_target: composition_target,
-        }
-    }
-
+impl FlionEngine<'_> {
     pub fn messenger(&self) -> BinaryMessenger {
         self.engine.messenger()
     }
@@ -342,233 +297,85 @@ impl<'e> FlionEngine<'e> {
         self.engine.set_platform_message_handler(name, handler)
     }
 
-    pub fn process_tasks(
-        &mut self,
-        task_executor: &mut TaskRunnerExecutor,
-    ) -> Option<std::time::Instant> {
-        task_executor.process_all(&self.engine)
-    }
-
-    pub fn handle_window_event<T: 'static>(
-        &mut self,
-        event: &WindowEvent,
-        target: &EventLoopWindowTarget<T>,
-    ) -> eyre::Result<()> {
-        match event {
-            WindowEvent::CloseRequested => {
-                target.exit();
-            }
-            WindowEvent::ScaleFactorChanged {
-                scale_factor,
-                inner_size_writer: _,
-            } => {
-                self.scale_factor.set(*scale_factor);
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                self.cursor_pos = *position;
-
-                let phase = if self.pointer_is_down {
-                    PointerPhase::Move
-                } else {
-                    PointerPhase::Hover
-                };
-
-                let _ = self
-                    .engine
-                    .send_pointer_event(&PointerEvent {
-                        device_kind: PointerDeviceKind::Mouse,
-                        device_id: 1,
-                        phase,
-                        x: self.cursor_pos.x,
-                        y: self.cursor_pos.y,
-                        buttons: self.buttons,
-                    })
-                    .trace_err();
-            }
-            WindowEvent::CursorEntered { .. } => {
-                let _ = self
-                    .engine
-                    .send_pointer_event(&PointerEvent {
-                        device_kind: PointerDeviceKind::Mouse,
-                        device_id: 1,
-                        phase: PointerPhase::Add,
-                        x: self.cursor_pos.x,
-                        y: self.cursor_pos.y,
-                        buttons: self.buttons,
-                    })
-                    .trace_err();
-            }
-            WindowEvent::CursorLeft { .. } => {
-                let _ = self
-                    .engine
-                    .send_pointer_event(&PointerEvent {
-                        device_kind: PointerDeviceKind::Mouse,
-                        device_id: 1,
-                        phase: PointerPhase::Remove,
-                        x: self.cursor_pos.x,
-                        y: self.cursor_pos.y,
-                        buttons: self.buttons,
-                    })
-                    .trace_err();
-            }
-            WindowEvent::MouseInput { state, button, .. } => {
-                let phase = match state {
-                    ElementState::Pressed => PointerPhase::Down,
-                    ElementState::Released => PointerPhase::Up,
-                };
-
-                self.pointer_is_down = *state == ElementState::Pressed;
-
-                let button = match button {
-                    MouseButton::Left => PointerButtons::PRIMARY,
-                    MouseButton::Right => PointerButtons::SECONDARY,
-                    MouseButton::Middle => PointerButtons::MIDDLE,
-                    MouseButton::Back => PointerButtons::BACK,
-                    MouseButton::Forward => PointerButtons::FORWARD,
-                    MouseButton::Other(_) => PointerButtons::empty(),
-                };
-
-                if self.pointer_is_down {
-                    self.buttons.insert(button);
-                } else {
-                    self.buttons.remove(button);
-                }
-
-                let _ = self
-                    .engine
-                    .send_pointer_event(&PointerEvent {
-                        device_kind: PointerDeviceKind::Mouse,
-                        device_id: 1,
-                        phase,
-                        x: self.cursor_pos.x,
-                        y: self.cursor_pos.y,
-                        buttons: self.buttons,
-                    })
-                    .trace_err();
-            }
-            WindowEvent::MouseWheel { delta, .. } => match delta {
-                MouseScrollDelta::LineDelta(x, y) => {
-                    let mut lines_per_scroll = 3u32;
-                    unsafe {
-                        SystemParametersInfoW(
-                            SPI_GETWHEELSCROLLLINES,
-                            0,
-                            Some(&raw mut lines_per_scroll as *mut c_void),
-                            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS::default(),
-                        )
-                        .unwrap();
-                    }
-
-                    let scroll_multiplier = f64::from(lines_per_scroll) * 100.0 / 3.0;
-
-                    let x = -f64::from(*x) * scroll_multiplier;
-                    let y = -f64::from(*y) * scroll_multiplier;
-
-                    let _ = self
-                        .engine
-                        .send_scroll_event(self.cursor_pos.x, self.cursor_pos.y, x, y)
-                        .trace_err();
-                }
-                MouseScrollDelta::PixelDelta(physical_position) => {
-                    tracing::debug!(?physical_position, "pixel scroll");
-                }
-            },
-            WindowEvent::Touch(touch) => {
-                let phases: &[PointerPhase] = match touch.phase {
-                    TouchPhase::Started => &[PointerPhase::Add, PointerPhase::Down],
-                    TouchPhase::Moved => &[PointerPhase::Move],
-                    TouchPhase::Ended => &[PointerPhase::Up, PointerPhase::Remove],
-                    TouchPhase::Cancelled => &[PointerPhase::Remove],
-                };
-
-                for &phase in phases {
-                    let _ = self
-                        .engine
-                        .send_pointer_event(&PointerEvent {
-                            device_kind: PointerDeviceKind::Touch,
-                            device_id: touch.id as i32,
-                            phase,
-                            x: touch.location.x,
-                            y: touch.location.y,
-                            ..Default::default()
-                        })
-                        .trace_err();
-                }
-            }
-            _ => {}
-        }
-
-        Ok(())
+    pub fn window_handle(&self) -> HWND {
+        self.window.window_handle()
     }
 }
 
-impl Drop for FlionEngine<'_> {
-    fn drop(&mut self) {
-        let RawWindowHandle::Win32(Win32WindowHandle { hwnd, .. }) =
-            self.window.window_handle().unwrap().as_raw()
-        else {
-            unreachable!()
+struct FlutterWindowHandler {
+    engine: Rc<engine::FlutterEngine>,
+    resize_controller: Arc<ResizeController>,
+    keyboard: Keyboard,
+}
+
+impl WindowHandler for FlutterWindowHandler {
+    fn on_resized(&self, width: u32, height: u32, scale_factor: f64) {
+        // TODO: Consider moving this to WM_NCCALCSIZE on the parent window for smoother resizing.
+        self.resize_controller.begin_and_wait(width, height, || {
+            self.engine
+                .send_window_metrics_event(width as usize, height as usize, scale_factor)
+                .unwrap();
+        });
+    }
+
+    fn on_mouse_event(&self, event: window::MouseEvent) {
+        if event.action == MouseAction::Scroll {
+            let _ = self
+                .engine
+                .send_scroll_event(event.x, event.y, event.scroll_delta_x, event.scroll_delta_y)
+                .trace_err();
+        } else {
+            let pointer_event = PointerEvent {
+                device_kind: PointerDeviceKind::Mouse,
+                device_id: 1,
+                phase: match event.action {
+                    window::MouseAction::Enter => PointerPhase::Add,
+                    window::MouseAction::Exit => PointerPhase::Remove,
+                    window::MouseAction::Move => {
+                        if event.buttons.is_empty() {
+                            PointerPhase::Hover
+                        } else {
+                            PointerPhase::Move
+                        }
+                    }
+                    window::MouseAction::Down => PointerPhase::Down,
+                    window::MouseAction::Up => PointerPhase::Up,
+                    window::MouseAction::Scroll => unreachable!(),
+                },
+                x: event.x,
+                y: event.y,
+                buttons: PointerButtons::from_bits_truncate(event.buttons.bits().into()),
+            };
+
+            let _ = self.engine.send_pointer_event(&pointer_event).trace_err();
+        }
+    }
+
+    fn on_touch_event(&self, event: window::TouchEvent) {
+        let phases: &[PointerPhase] = match event.action {
+            window::TouchAction::Down => &[PointerPhase::Add, PointerPhase::Down],
+            window::TouchAction::Up => &[PointerPhase::Up, PointerPhase::Remove],
+            window::TouchAction::Move => &[PointerPhase::Move],
         };
 
-        let hwnd = HWND(hwnd.get() as *mut c_void);
-
-        unsafe {
-            RemoveWindowSubclass(hwnd, Some(wnd_proc), 696969).unwrap();
-            drop(Box::from_raw(self.window_data));
+        for &phase in phases {
+            let _ = self
+                .engine
+                .send_pointer_event(&PointerEvent {
+                    device_kind: PointerDeviceKind::Touch,
+                    device_id: event.touch_id as i32,
+                    phase,
+                    x: event.x,
+                    y: event.y,
+                    ..Default::default()
+                })
+                .trace_err();
         }
     }
-}
 
-unsafe extern "system" fn wnd_proc(
-    window: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-    _uidsubclass: usize,
-    dwrefdata: usize,
-) -> LRESULT {
-    let data = (dwrefdata as *mut WindowData).as_mut().unwrap();
-    match msg {
-        WM_NCCALCSIZE => {
-            DefSubclassProc(window, msg, wparam, lparam);
-
-            let rect = lparam.0 as *const RECT;
-            let rect = rect.as_ref().unwrap();
-
-            if rect.right > rect.left && rect.bottom > rect.top {
-                let width = rect.right - rect.left;
-                let height = rect.bottom - rect.top;
-
-                data.resize_controller
-                    .begin_and_wait(width as u32, height as u32, || {
-                        (*data.engine)
-                            .send_window_metrics_event(
-                                width as usize,
-                                height as usize,
-                                data.scale_factor.get(),
-                            )
-                            .unwrap();
-                    });
-            }
-
-            return LRESULT(0);
-        }
-        WM_KEYDOWN | WM_CHAR | WM_DEADCHAR | WM_KEYUP => {
-            match data.keyboard.handle_message(window, msg, wparam, lparam) {
-                Ok(handled) => {
-                    if handled {
-                        return LRESULT(0);
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to handle keyboard event: {e:?}");
-                }
-            }
-        }
-        _ => {}
+    fn on_key_event(&self, event: window::KeyEvent) {
+        let _ = self.keyboard.handle_event(event).trace_err();
     }
-
-    DefSubclassProc(window, msg, wparam, lparam)
 }
 
 struct CompositionHandler {

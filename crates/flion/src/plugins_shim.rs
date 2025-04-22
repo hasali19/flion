@@ -1,18 +1,9 @@
 use std::ffi::{c_char, c_void, CStr};
 use std::mem;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use flutter_embedder::FlutterPlatformMessageResponseHandle;
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use windows::core::w;
-use windows::Win32::Foundation::{HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, RegisterClassExW, WNDCLASSEXW, WS_CHILD,
-    WS_EX_NOREDIRECTIONBITMAP,
-};
-use winit::window::Window;
+use windows::Win32::Foundation::HWND;
 
 use crate::engine::FlutterEngine;
 use crate::{BinaryMessageHandler, BinaryMessageReply};
@@ -23,53 +14,7 @@ pub struct FlutterPluginsEngine {
 }
 
 impl FlutterPluginsEngine {
-    pub fn new(engine: Rc<FlutterEngine>, window: &Window) -> eyre::Result<FlutterPluginsEngine> {
-        static IS_WINDOW_CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
-
-        if !IS_WINDOW_CLASS_REGISTERED.swap(true, Ordering::SeqCst) {
-            unsafe {
-                RegisterClassExW(&WNDCLASSEXW {
-                    cbSize: mem::size_of::<WNDCLASSEXW>() as u32,
-                    lpfnWndProc: Some(wnd_proc),
-                    lpszClassName: w!("PluginsViewWindow"),
-                    hInstance: mem::transmute::<HMODULE, HINSTANCE>(GetModuleHandleW(None)?),
-                    ..Default::default()
-                })
-            };
-        }
-
-        unsafe extern "system" fn wnd_proc(
-            hwnd: HWND,
-            msg: u32,
-            wparam: WPARAM,
-            lparam: LPARAM,
-        ) -> LRESULT {
-            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
-        }
-
-        let RawWindowHandle::Win32(parent_window_handle) = window.window_handle()?.as_raw() else {
-            unreachable!()
-        };
-
-        let parent_hwnd = HWND(parent_window_handle.hwnd.get() as *mut c_void);
-
-        let window = unsafe {
-            CreateWindowExW(
-                WS_EX_NOREDIRECTIONBITMAP,
-                w!("PluginsViewWindow"),
-                w!("PluginsViewWindow"),
-                WS_CHILD,
-                0,
-                0,
-                300,
-                300,
-                Some(parent_hwnd),
-                None,
-                None,
-                None,
-            )?
-        };
-
+    pub fn new(engine: Rc<FlutterEngine>, window: HWND) -> eyre::Result<FlutterPluginsEngine> {
         Ok(FlutterPluginsEngine {
             engine,
             child_window_hwnd: window,

@@ -4,9 +4,8 @@ use std::rc::Rc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::engine::{
-    BinaryMessageHandler, BinaryMessageReply, FlutterEngine, KeyEvent, KeyEventType,
-};
+use crate::engine::{BinaryMessageHandler, BinaryMessageReply, FlutterEngine};
+use crate::window::{KeyAction, KeyEvent};
 
 pub struct TextInputState {
     client: Option<u32>,
@@ -27,7 +26,7 @@ impl TextInputState {
         engine: &FlutterEngine,
     ) -> eyre::Result<()> {
         if let Some(client) = self.client {
-            if let KeyEventType::Down | KeyEventType::Repeat = event.event_type {
+            if let KeyAction::Down | KeyAction::Repeat = event.action {
                 if event.logical == Some(0x0010000000d) {
                     // TODO: Handle enter key
                     return Ok(());
