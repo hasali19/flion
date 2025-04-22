@@ -27,7 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     LoadCursorW, PeekMessageW, RegisterClassExW, SetCursor, SetWindowLongPtrW,
     SystemParametersInfoW, CREATESTRUCTW, GWLP_USERDATA, HCURSOR, HTCLIENT, HWND_MESSAGE,
     IDC_ARROW, PM_NOREMOVE, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    WHEEL_DELTA, WM_CHAR, WM_CLOSE, WM_DEADCHAR, WM_DPICHANGED_BEFOREPARENT, WM_KEYDOWN,
+    WHEEL_DELTA, WM_CHAR, WM_CLOSE, WM_CREATE, WM_DEADCHAR, WM_DPICHANGED_BEFOREPARENT, WM_KEYDOWN,
     WM_KEYFIRST, WM_KEYLAST, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
     WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_RBUTTONDOWN, WM_RBUTTONUP,
     WM_SETCURSOR, WM_SIZE, WM_TOUCH, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_CHILD,
@@ -366,7 +366,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             window_data.handler.on_close();
             return LRESULT(0);
         }
-        WM_DPICHANGED_BEFOREPARENT => {
+        WM_CREATE | WM_DPICHANGED_BEFOREPARENT => {
             let dpi = unsafe { GetDpiForWindow(hwnd) };
             window_data.scale_factor.set(dpi as f64 / DPI_BASE);
             window_data.dispatch_resize_event();
