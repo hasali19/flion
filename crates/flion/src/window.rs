@@ -23,15 +23,15 @@ use windows::Win32::UI::Input::Touch::{
     TOUCHEVENTF_MOVE, TOUCHEVENTF_UP, TOUCHINPUT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos, GetWindowLongPtrW,
-    LoadCursorW, PeekMessageW, RegisterClassExW, SetCursor, SetWindowLongPtrW,
-    SystemParametersInfoW, CREATESTRUCTW, GWLP_USERDATA, HCURSOR, HTCLIENT, HWND_MESSAGE,
-    IDC_ARROW, PM_NOREMOVE, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    WHEEL_DELTA, WM_CHAR, WM_CLOSE, WM_CREATE, WM_DEADCHAR, WM_DPICHANGED_BEFOREPARENT, WM_KEYDOWN,
-    WM_KEYFIRST, WM_KEYLAST, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SETCURSOR, WM_SIZE, WM_TOUCH, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_CHILD,
-    WS_EX_NOREDIRECTIONBITMAP, WS_VISIBLE, XBUTTON1, XBUTTON2,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos,
+    GetMessageExtraInfo, GetWindowLongPtrW, LoadCursorW, PeekMessageW, RegisterClassExW, SetCursor,
+    SetWindowLongPtrW, SystemParametersInfoW, CREATESTRUCTW, GWLP_USERDATA, HCURSOR, HTCLIENT,
+    HWND_MESSAGE, IDC_ARROW, PM_NOREMOVE, SPI_GETWHEELSCROLLLINES,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WM_CHAR, WM_CLOSE, WM_CREATE, WM_DEADCHAR,
+    WM_DPICHANGED_BEFOREPARENT, WM_KEYDOWN, WM_KEYFIRST, WM_KEYLAST, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCCREATE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_TOUCH, WM_XBUTTONDOWN,
+    WM_XBUTTONUP, WNDCLASSEXW, WS_CHILD, WS_EX_NOREDIRECTIONBITMAP, WS_VISIBLE, XBUTTON1, XBUTTON2,
 };
 
 use crate::error_utils::ResultExt;
@@ -386,7 +386,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 return LRESULT(1);
             }
         }
-        WM_MOUSEMOVE => {
+        WM_MOUSEMOVE if is_mouse_event() => {
             let x = loword!(lparam) as f64;
             let y = hiword!(lparam) as f64;
 
@@ -397,12 +397,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
 
             return LRESULT(0);
         }
-        WM_MOUSELEAVE => {
+        WM_MOUSELEAVE if is_mouse_event() => {
             window_data.dispatch_mouse_event(MouseAction::Exit);
             window_data.is_tracking_mouse_leave.set(false);
             return LRESULT(0);
         }
-        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN => {
+        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN if is_mouse_event() => {
             if msg == WM_LBUTTONDOWN {
                 unsafe { SetCapture(hwnd) };
             }
@@ -430,20 +430,9 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
 
             window_data.dispatch_mouse_event(MouseAction::Down);
 
-            // let _ = (*self.engine)
-            //     .send_pointer_event(&PointerEvent {
-            //         device_kind: PointerDeviceKind::Mouse,
-            //         device_id: 1,
-            //         phase: PointerPhase::Down,
-            //         x: x as f64,
-            //         y: y as f64,
-            //         buttons: self.buttons,
-            //     })
-            //     .trace_err();
-
             return LRESULT(0);
         }
-        WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP => {
+        WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP if is_mouse_event() => {
             if msg == WM_LBUTTONUP {
                 unsafe { ReleaseCapture().unwrap() };
             }
@@ -501,13 +490,16 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             } {
                 for touch in touch_points {
                     let touch_id = touch.dwID;
+
                     let mut point = POINT {
                         x: touch.x / 100,
                         y: touch.y / 100,
                     };
+
                     let _ = unsafe { ScreenToClient(hwnd, &mut point) };
-                    let x = touch.x as f64;
-                    let y = touch.y as f64;
+
+                    let x = point.x as f64;
+                    let y = point.y as f64;
 
                     let action = if touch.dwFlags.contains(TOUCHEVENTF_DOWN) {
                         TouchAction::Down
@@ -552,6 +544,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
     }
 
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+fn is_mouse_event() -> bool {
+    let LPARAM(info) = unsafe { GetMessageExtraInfo() };
+    info & 0xFFFFFF00 != 0xFF515700
 }
 
 #[derive(Clone)]
