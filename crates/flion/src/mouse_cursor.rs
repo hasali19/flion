@@ -1,20 +1,20 @@
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::rc::Weak;
 
 use windows::Win32::UI::WindowsAndMessaging::{
-    LoadCursorW, SetCursor, HCURSOR, IDC_ARROW, IDC_HAND, IDC_IBEAM,
+    LoadCursorW, HCURSOR, IDC_ARROW, IDC_HAND, IDC_IBEAM,
 };
 
 use crate::codec::EncodableValue;
 use crate::standard_method_channel::{StandardMethodHandler, StandardMethodReply};
+use crate::window::Window;
 
 pub struct MouseCursorHandler {
-    cursor_state: Rc<RefCell<Option<HCURSOR>>>,
+    window: Weak<Window>,
 }
 
 impl MouseCursorHandler {
-    pub fn new(cursor_state: Rc<RefCell<Option<HCURSOR>>>) -> MouseCursorHandler {
-        MouseCursorHandler { cursor_state }
+    pub fn new(window: Weak<Window>) -> MouseCursorHandler {
+        MouseCursorHandler { window }
     }
 }
 
@@ -29,11 +29,9 @@ impl StandardMethodHandler for MouseCursorHandler {
                     .as_string()
                     .unwrap();
 
-                let cursor = get_cursor(kind);
-
-                unsafe { SetCursor(cursor) };
-
-                *self.cursor_state.borrow_mut() = cursor;
+                if let Some(window) = self.window.upgrade() {
+                    window.set_cursor(get_cursor(kind));
+                }
 
                 reply.success(&EncodableValue::Null);
             }

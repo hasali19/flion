@@ -17,9 +17,12 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows::Win32::UI::WindowsAndMessaging::{MoveWindow, SetParent};
 use windows::core::Interface;
 use windows_numerics::Matrix3x2;
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalSize, PhysicalSize};
+use winit::event::WindowEvent;
 use winit::event_loop::EventLoopBuilder;
 use winit::platform::windows::WindowBuilderExtWindows;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -64,7 +67,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let env = FlionEngineEnvironment::init()?;
 
-    let mut engine = env
+    let engine = env
         .new_engine_builder()
         .with_plugins(PLUGINS)
         .with_platform_view_factory(
@@ -156,12 +159,37 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }))
             },
         )
-        .build(window.clone())?;
+        .build()?;
+
+    unsafe {
+        SetParent(engine.window_handle(), Some(hwnd))?;
+        SetFocus(Some(engine.window_handle()))?;
+    }
 
     event_loop.run(move |event, target| match event {
         winit::event::Event::WindowEvent { window_id, event } if window_id == window.id() => {
-            if let Err(e) = engine.handle_window_event(&event, target) {
-                tracing::error!("{e:?}");
+            match event {
+                WindowEvent::CloseRequested => {
+                    target.exit();
+                }
+
+                WindowEvent::Focused(true) => unsafe {
+                    SetFocus(Some(engine.window_handle())).unwrap();
+                },
+
+                WindowEvent::Resized(PhysicalSize { width, height }) => unsafe {
+                    MoveWindow(
+                        engine.window_handle(),
+                        0,
+                        0,
+                        width as i32,
+                        height as i32,
+                        false,
+                    )
+                    .unwrap();
+                },
+
+                _ => {}
             }
         }
 

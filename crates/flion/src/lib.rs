@@ -1,4 +1,4 @@
-#![feature(let_chains)]
+#![feature(default_field_values, let_chains)]
 
 mod compositor;
 mod egl;
@@ -13,28 +13,29 @@ mod resize_controller;
 mod settings;
 mod task_runner;
 mod text_input;
+mod window;
 
 pub mod codec;
 pub mod standard_method_channel;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::env;
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::{env, mem};
 
 use engine::{PointerButtons, PointerDeviceKind, PointerEvent};
 use eyre::OptionExt;
 use platform_views::{PlatformViewFactory, PlatformViewsMessageHandler};
 use plugins_shim::FlutterPluginsEngine;
-use raw_window_handle::{HasWindowHandle, RawWindowHandle, Win32WindowHandle};
 use resize_controller::ResizeController;
 use task_runner::FlutterTaskExecutor;
+use window::{MouseAction, Window, WindowHandler};
 use windows::core::Interface;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION,
@@ -43,29 +44,6 @@ use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice2, IDCompositionDevice, IDCompositionTarget,
 };
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
-use windows::Win32::Graphics::Gdi::ScreenToClient;
-use windows::Win32::UI::Controls::WM_MOUSELEAVE;
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
-};
-use windows::Win32::UI::Input::Touch::{
-    CloseTouchInputHandle, GetTouchInputInfo, RegisterTouchWindow, HTOUCHINPUT,
-    REGISTER_TOUCH_WINDOW_FLAGS, TOUCHEVENTF_DOWN, TOUCHEVENTF_MOVE, TOUCHEVENTF_UP, TOUCHINPUT,
-};
-use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, LoadCursorW, SetCursor, SystemParametersInfoW, HCURSOR, HTCLIENT, IDC_ARROW,
-    SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WM_CHAR,
-    WM_DEADCHAR, WM_DPICHANGED_BEFOREPARENT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
-    WM_NCCREATE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_TOUCH, WM_XBUTTONDOWN,
-    WM_XBUTTONUP, XBUTTON1, XBUTTON2,
-};
-use winit::dpi::PhysicalSize;
-use winit::event::WindowEvent;
-use winit::event_loop::EventLoopWindowTarget;
-use winit::window::Window;
 
 use crate::compositor::FlutterCompositor;
 use crate::egl::EglDevice;
@@ -83,79 +61,6 @@ macro_rules! include_plugins {
     () => {
         include!(concat!(env!("OUT_DIR"), "/plugin_registrant.rs"));
     };
-}
-
-struct WindowData {
-    engine: *const engine::FlutterEngine,
-    resize_controller: Arc<ResizeController>,
-    scale_factor: f64,
-    keyboard: Keyboard,
-    cursor: Rc<RefCell<Option<HCURSOR>>>,
-    cursor_position: (f64, f64),
-    buttons: PointerButtons,
-    is_tracking_mouse_leave: bool,
-}
-
-impl WindowData {
-    fn track_mouse_leave_event(&mut self, hwnd: HWND) {
-        if !self.is_tracking_mouse_leave {
-            let mut event = TRACKMOUSEEVENT {
-                cbSize: mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                hwndTrack: hwnd,
-                dwFlags: TME_LEAVE,
-                dwHoverTime: 0,
-            };
-
-            unsafe {
-                TrackMouseEvent(&mut event).unwrap();
-            }
-
-            self.is_tracking_mouse_leave = true;
-
-            unsafe {
-                tracing::info!("mouse added");
-                let _ = (*self.engine)
-                    .send_pointer_event(&PointerEvent {
-                        device_kind: PointerDeviceKind::Mouse,
-                        device_id: 1,
-                        phase: PointerPhase::Add,
-                        x: self.cursor_position.0,
-                        y: self.cursor_position.1,
-                        buttons: self.buttons,
-                    })
-                    .trace_err();
-            }
-        }
-    }
-
-    fn on_mouse_scroll(&mut self, hwnd: HWND, dx: f64, dy: f64) -> eyre::Result<()> {
-        let mut point = POINT::default();
-        let mut lines_per_scroll = 3u32;
-
-        unsafe {
-            GetCursorPos(&mut point)?;
-            ScreenToClient(hwnd, &mut point).ok()?;
-            SystemParametersInfoW(
-                SPI_GETWHEELSCROLLLINES,
-                0,
-                Some(&raw mut lines_per_scroll as *mut c_void),
-                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS::default(),
-            )?;
-        }
-
-        let scroll_multiplier = f64::from(lines_per_scroll) * 100.0 / 3.0;
-
-        let x = -dx * scroll_multiplier;
-        let y = -dy * scroll_multiplier;
-
-        unsafe {
-            let _ = (*self.engine)
-                .send_scroll_event(point.x as f64, point.y as f64, x, y)
-                .trace_err();
-        }
-
-        Ok(())
-    }
 }
 
 pub struct FlionEngineEnvironment;
@@ -226,15 +131,7 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
         self
     }
 
-    pub fn build(self, window: Rc<Window>) -> eyre::Result<FlionEngine<'e>> {
-        let RawWindowHandle::Win32(Win32WindowHandle { hwnd, .. }) =
-            window.window_handle()?.as_raw()
-        else {
-            unreachable!()
-        };
-
-        let hwnd = HWND(hwnd.get() as *mut c_void);
-
+    pub fn build(self) -> eyre::Result<FlionEngine<'e>> {
         let device = unsafe {
             let mut device = Default::default();
 
@@ -256,15 +153,7 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
         let composition_device: IDCompositionDevice =
             unsafe { DCompositionCreateDevice2(&device.cast::<IDXGIDevice>()?)? };
 
-        let composition_target = unsafe { composition_device.CreateTargetForHwnd(hwnd, true)? };
-
         let root_visual = unsafe { composition_device.CreateVisual()? };
-
-        let PhysicalSize { width, height } = window.inner_size();
-
-        unsafe {
-            composition_target.SetRoot(&root_visual)?;
-        }
 
         let egl = EglDevice::create(&device)?;
 
@@ -279,18 +168,13 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
             Box::new(CompositionHandler {
                 composition_device: composition_device.clone(),
                 resize_controller: resize_controller.clone(),
-                surface_size: (width, height),
+                surface_size: (0, 0),
             }),
         )?;
 
         let platform_views = compositor.platform_views();
-        let cursor_state = Rc::new(RefCell::new(Some(unsafe { LoadCursorW(None, IDC_ARROW)? })));
 
         let mut platform_message_handlers: Vec<(&str, Box<dyn BinaryMessageHandler>)> = vec![
-            (
-                "flutter/mousecursor",
-                Box::new(MouseCursorHandler::new(cursor_state.clone())),
-            ),
             (
                 "flutter/textinput",
                 Box::new(TextInputHandler::new(text_input.clone())),
@@ -300,7 +184,7 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
                 Box::new(PlatformViewsMessageHandler::new(
                     platform_views,
                     device,
-                    composition_device,
+                    composition_device.clone(),
                     self.platform_view_factories,
                 )),
             ),
@@ -337,7 +221,27 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
 
         task_executor.init(engine.clone());
 
-        let mut plugins_engine = Box::new(FlutterPluginsEngine::new(engine.clone(), &window)?);
+        let window = Rc::new(Window::new(
+            800,
+            600,
+            Box::new(FlutterWindowHandler {
+                engine: engine.clone(),
+                resize_controller,
+                keyboard: Keyboard::new(engine.clone(), text_input.clone()),
+            }),
+        )?);
+
+        engine.set_platform_message_handler(
+            "flutter/mousecursor",
+            MouseCursorHandler::new(Rc::downgrade(&window)),
+        );
+
+        let (width, height) = window.inner_size();
+
+        let mut plugins_engine = Box::new(FlutterPluginsEngine::new(
+            engine.clone(),
+            window.window_handle(),
+        )?);
 
         for init in self.plugin_initializers {
             unsafe {
@@ -345,32 +249,25 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
             }
         }
 
-        engine.send_window_metrics_event(width as usize, height as usize, window.scale_factor())?;
+        let scale_factor = window.scale_factor();
+
+        engine.send_window_metrics_event(width as usize, height as usize, scale_factor)?;
 
         settings::send_to_engine(&engine)?;
 
-        let scale_factor = unsafe { GetDpiForWindow(hwnd) } as f64 / 96.0;
-
-        let window_data = Box::into_raw(Box::new(WindowData {
-            engine: &*engine,
-            resize_controller,
-            scale_factor,
-            keyboard: Keyboard::new(engine.clone(), text_input.clone()),
-            cursor: cursor_state,
-            cursor_position: (0.0, 0.0),
-            buttons: PointerButtons::empty(),
-            is_tracking_mouse_leave: false,
-        }));
+        // TODO: Composition target should be attached to parent window instead. Use the child window
+        // just for input.
+        let composition_target =
+            unsafe { composition_device.CreateTargetForHwnd(window.window_handle(), true)? };
 
         unsafe {
-            SetWindowSubclass(hwnd, Some(wnd_proc), 696969, window_data as usize).ok()?;
+            composition_target.SetRoot(&root_visual)?;
         }
 
         Ok(FlionEngine {
             env: PhantomData,
             engine,
             window,
-            window_data,
             _plugins: plugins_engine,
             _composition_target: composition_target,
             _task_executor: task_executor,
@@ -382,7 +279,6 @@ pub struct FlionEngine<'e> {
     env: PhantomData<&'e FlionEngineEnvironment>,
     engine: Rc<FlutterEngine>,
     window: Rc<Window>,
-    window_data: *mut WindowData,
     _plugins: Box<FlutterPluginsEngine>,
     _composition_target: IDCompositionTarget,
     _task_executor: FlutterTaskExecutor,
@@ -401,283 +297,85 @@ impl FlionEngine<'_> {
         self.engine.set_platform_message_handler(name, handler)
     }
 
-    pub fn handle_window_event<T: 'static>(
-        &mut self,
-        event: &WindowEvent,
-        target: &EventLoopWindowTarget<T>,
-    ) -> eyre::Result<()> {
-        if *event == WindowEvent::CloseRequested {
-            target.exit();
-        }
-
-        Ok(())
+    pub fn window_handle(&self) -> HWND {
+        self.window.window_handle()
     }
 }
 
-impl Drop for FlionEngine<'_> {
-    fn drop(&mut self) {
-        let RawWindowHandle::Win32(Win32WindowHandle { hwnd, .. }) =
-            self.window.window_handle().unwrap().as_raw()
-        else {
-            unreachable!()
+struct FlutterWindowHandler {
+    engine: Rc<engine::FlutterEngine>,
+    resize_controller: Arc<ResizeController>,
+    keyboard: Keyboard,
+}
+
+impl WindowHandler for FlutterWindowHandler {
+    fn on_resized(&self, width: u32, height: u32, scale_factor: f64) {
+        // TODO: Consider moving this to WM_NCCALCSIZE on the parent window for smoother resizing.
+        self.resize_controller.begin_and_wait(width, height, || {
+            self.engine
+                .send_window_metrics_event(width as usize, height as usize, scale_factor)
+                .unwrap();
+        });
+    }
+
+    fn on_mouse_event(&self, event: window::MouseEvent) {
+        if event.action == MouseAction::Scroll {
+            let _ = self
+                .engine
+                .send_scroll_event(event.x, event.y, event.scroll_delta_x, event.scroll_delta_y)
+                .trace_err();
+        } else {
+            let pointer_event = PointerEvent {
+                device_kind: PointerDeviceKind::Mouse,
+                device_id: 1,
+                phase: match event.action {
+                    window::MouseAction::Enter => PointerPhase::Add,
+                    window::MouseAction::Exit => PointerPhase::Remove,
+                    window::MouseAction::Move => {
+                        if event.buttons.is_empty() {
+                            PointerPhase::Hover
+                        } else {
+                            PointerPhase::Move
+                        }
+                    }
+                    window::MouseAction::Down => PointerPhase::Down,
+                    window::MouseAction::Up => PointerPhase::Up,
+                    window::MouseAction::Scroll => unreachable!(),
+                },
+                x: event.x,
+                y: event.y,
+                buttons: PointerButtons::from_bits_truncate(event.buttons.bits().into()),
+            };
+
+            let _ = self.engine.send_pointer_event(&pointer_event).trace_err();
+        }
+    }
+
+    fn on_touch_event(&self, event: window::TouchEvent) {
+        let phases: &[PointerPhase] = match event.action {
+            window::TouchAction::Down => &[PointerPhase::Add, PointerPhase::Down],
+            window::TouchAction::Up => &[PointerPhase::Up, PointerPhase::Remove],
+            window::TouchAction::Move => &[PointerPhase::Move],
         };
 
-        let hwnd = HWND(hwnd.get() as *mut c_void);
-
-        unsafe {
-            RemoveWindowSubclass(hwnd, Some(wnd_proc), 696969).unwrap();
-            drop(Box::from_raw(self.window_data));
-        }
-    }
-}
-
-unsafe extern "system" fn wnd_proc(
-    window: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-    _uidsubclass: usize,
-    dwrefdata: usize,
-) -> LRESULT {
-    let data = (dwrefdata as *mut WindowData).as_mut().unwrap();
-    match msg {
-        WM_NCCREATE => {
-            RegisterTouchWindow(window, REGISTER_TOUCH_WINDOW_FLAGS::default()).unwrap();
-            return LRESULT(0);
-        }
-        WM_DPICHANGED_BEFOREPARENT => {
-            data.scale_factor = GetDpiForWindow(window) as f64 / 96.0;
-            return LRESULT(0);
-        }
-        WM_NCCALCSIZE => {
-            DefSubclassProc(window, msg, wparam, lparam);
-
-            let rect = lparam.0 as *const RECT;
-            let rect = rect.as_ref().unwrap();
-
-            if rect.right > rect.left && rect.bottom > rect.top {
-                let width = rect.right - rect.left;
-                let height = rect.bottom - rect.top;
-
-                data.resize_controller
-                    .begin_and_wait(width as u32, height as u32, || {
-                        (*data.engine)
-                            .send_window_metrics_event(
-                                width as usize,
-                                height as usize,
-                                data.scale_factor,
-                            )
-                            .unwrap();
-                    });
-            }
-
-            return LRESULT(0);
-        }
-        WM_SETCURSOR => {
-            let hit_test_result = lparam.0 & 0xffff;
-            if hit_test_result as u32 == HTCLIENT {
-                SetCursor(*data.cursor.borrow());
-                return LRESULT(1);
-            }
-        }
-        WM_MOUSEMOVE => {
-            data.track_mouse_leave_event(window);
-
-            let x = lparam.0 & 0xffff;
-            let y = (lparam.0 >> 16) & 0xffff;
-
-            data.cursor_position = (x as f64, y as f64);
-
-            let phase = if data.buttons.is_empty() {
-                PointerPhase::Hover
-            } else {
-                PointerPhase::Move
-            };
-
-            let _ = (*data.engine)
+        for &phase in phases {
+            let _ = self
+                .engine
                 .send_pointer_event(&PointerEvent {
-                    device_kind: PointerDeviceKind::Mouse,
-                    device_id: 1,
+                    device_kind: PointerDeviceKind::Touch,
+                    device_id: event.touch_id as i32,
                     phase,
-                    x: x as f64,
-                    y: y as f64,
-                    buttons: data.buttons,
+                    x: event.x,
+                    y: event.y,
+                    ..Default::default()
                 })
                 .trace_err();
-
-            return LRESULT(0);
         }
-        WM_MOUSELEAVE => {
-            tracing::info!("mouse removed");
-
-            let _ = (*data.engine)
-                .send_pointer_event(&PointerEvent {
-                    device_kind: PointerDeviceKind::Mouse,
-                    device_id: 1,
-                    phase: PointerPhase::Remove,
-                    x: data.cursor_position.0,
-                    y: data.cursor_position.1,
-                    buttons: data.buttons,
-                })
-                .trace_err();
-
-            data.is_tracking_mouse_leave = false;
-
-            return LRESULT(0);
-        }
-        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN => {
-            if msg == WM_LBUTTONDOWN {
-                SetCapture(window);
-            }
-
-            let x = lparam.0 & 0xffff;
-            let y = (lparam.0 >> 16) & 0xffff;
-
-            let button = match msg {
-                WM_LBUTTONDOWN => PointerButtons::PRIMARY,
-                WM_RBUTTONDOWN => PointerButtons::SECONDARY,
-                WM_MBUTTONDOWN => PointerButtons::MIDDLE,
-                WM_XBUTTONDOWN => match ((wparam.0 >> 16) & 0xffff) as u16 {
-                    XBUTTON1 => PointerButtons::BACK,
-                    XBUTTON2 => PointerButtons::FORWARD,
-                    _ => unreachable!(),
-                },
-                _ => unreachable!(),
-            };
-
-            data.buttons.insert(button);
-
-            let _ = (*data.engine)
-                .send_pointer_event(&PointerEvent {
-                    device_kind: PointerDeviceKind::Mouse,
-                    device_id: 1,
-                    phase: PointerPhase::Down,
-                    x: x as f64,
-                    y: y as f64,
-                    buttons: data.buttons,
-                })
-                .trace_err();
-
-            return LRESULT(0);
-        }
-        WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP => {
-            if msg == WM_LBUTTONUP {
-                ReleaseCapture().unwrap();
-            }
-
-            let x = lparam.0 & 0xffff;
-            let y = (lparam.0 >> 16) & 0xffff;
-
-            let button = match msg {
-                WM_LBUTTONUP => PointerButtons::PRIMARY,
-                WM_RBUTTONUP => PointerButtons::SECONDARY,
-                WM_MBUTTONUP => PointerButtons::MIDDLE,
-                WM_XBUTTONUP => match ((wparam.0 >> 16) & 0xffff) as u16 {
-                    XBUTTON1 => PointerButtons::BACK,
-                    XBUTTON2 => PointerButtons::FORWARD,
-                    _ => unreachable!(),
-                },
-                _ => unreachable!(),
-            };
-
-            data.buttons.remove(button);
-
-            let _ = (*data.engine)
-                .send_pointer_event(&PointerEvent {
-                    device_kind: PointerDeviceKind::Mouse,
-                    device_id: 1,
-                    phase: PointerPhase::Up,
-                    x: x as f64,
-                    y: y as f64,
-                    buttons: data.buttons,
-                })
-                .trace_err();
-
-            return LRESULT(0);
-        }
-        WM_MOUSEWHEEL => {
-            let delta = ((wparam.0 >> 16) & 0xffff) as i16 / WHEEL_DELTA as i16;
-            let _ = data.on_mouse_scroll(window, 0.0, delta.into()).trace_err();
-            return LRESULT(0);
-        }
-        WM_MOUSEHWHEEL => {
-            let delta = ((wparam.0 >> 16) & 0xffff) as i16 / WHEEL_DELTA as i16;
-            let _ = data.on_mouse_scroll(window, delta.into(), 0.0).trace_err();
-            return LRESULT(0);
-        }
-        WM_TOUCH => {
-            // TODO: Why doesn't this work?
-
-            let num_points = wparam.0 & 0xffff;
-            let touch_input_handle = HTOUCHINPUT(lparam.0 as _);
-
-            let mut touch_points = vec![TOUCHINPUT::default(); num_points];
-
-            if GetTouchInputInfo(
-                touch_input_handle,
-                &mut touch_points,
-                mem::size_of::<TOUCHINPUT>() as i32,
-            )
-            .is_ok()
-            {
-                for touch in touch_points {
-                    let touch_id = touch.dwID;
-
-                    let mut point = POINT {
-                        x: touch.x / 100,
-                        y: touch.y / 100,
-                    };
-
-                    let _ = ScreenToClient(window, &mut point);
-
-                    let x = touch.x as f64;
-                    let y = touch.y as f64;
-
-                    let phases: &[PointerPhase] = if touch.dwFlags.contains(TOUCHEVENTF_DOWN) {
-                        &[PointerPhase::Add, PointerPhase::Down]
-                    } else if touch.dwFlags.contains(TOUCHEVENTF_MOVE) {
-                        &[PointerPhase::Move]
-                    } else if touch.dwFlags.contains(TOUCHEVENTF_UP) {
-                        &[PointerPhase::Up, PointerPhase::Remove]
-                    } else {
-                        return LRESULT(0);
-                    };
-
-                    for &phase in phases {
-                        let _ = (*data.engine)
-                            .send_pointer_event(&PointerEvent {
-                                device_kind: PointerDeviceKind::Touch,
-                                device_id: touch_id as i32,
-                                phase,
-                                x,
-                                y,
-                                ..Default::default()
-                            })
-                            .trace_err();
-                    }
-                }
-            }
-
-            CloseTouchInputHandle(touch_input_handle).unwrap();
-
-            return LRESULT(0);
-        }
-        WM_KEYDOWN | WM_CHAR | WM_DEADCHAR | WM_KEYUP => {
-            match data.keyboard.handle_message(window, msg, wparam, lparam) {
-                Ok(handled) => {
-                    if handled {
-                        return LRESULT(0);
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to handle keyboard event: {e:?}");
-                }
-            }
-        }
-        _ => {}
     }
 
-    DefSubclassProc(window, msg, wparam, lparam)
+    fn on_key_event(&self, event: window::KeyEvent) {
+        let _ = self.keyboard.handle_event(event).trace_err();
+    }
 }
 
 struct CompositionHandler {
