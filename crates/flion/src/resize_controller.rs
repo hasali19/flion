@@ -1,4 +1,5 @@
 use std::sync::{Condvar, Mutex, MutexGuard};
+use std::time::Duration;
 
 pub struct ResizeController {
     resize: Mutex<Option<(u32, u32)>>,
@@ -22,7 +23,9 @@ impl ResizeController {
 
         let _unused = self
             .condvar
-            .wait_while(resize, |resize| resize.is_some())
+            .wait_timeout_while(resize, Duration::from_millis(300), |resize| {
+                resize.is_some()
+            })
             .unwrap();
 
         res
