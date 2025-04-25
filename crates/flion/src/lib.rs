@@ -192,7 +192,7 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
 
         platform_message_handlers.extend(self.platform_message_handlers);
 
-        let task_executor = FlutterTaskExecutor::new()?;
+        let task_executor = Rc::new(FlutterTaskExecutor::new()?);
         let task_queue = task_executor.queue().clone();
 
         // TODO: Disable environment variable lookup in release builds.
@@ -228,6 +228,7 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
                 engine: engine.clone(),
                 resize_controller,
                 keyboard: Keyboard::new(engine.clone(), text_input.clone()),
+                task_executor: task_executor.clone(),
             }),
         )?);
 
@@ -281,7 +282,7 @@ pub struct FlionEngine<'e> {
     window: Rc<Window>,
     _plugins: Box<FlutterPluginsEngine>,
     _composition_target: IDCompositionTarget,
-    _task_executor: FlutterTaskExecutor,
+    _task_executor: Rc<FlutterTaskExecutor>,
 }
 
 impl FlionEngine<'_> {
@@ -304,6 +305,7 @@ impl FlionEngine<'_> {
 
 struct FlutterWindowHandler {
     engine: Rc<engine::FlutterEngine>,
+    task_executor: Rc<FlutterTaskExecutor>,
     resize_controller: Arc<ResizeController>,
     keyboard: Keyboard,
 }
@@ -311,11 +313,13 @@ struct FlutterWindowHandler {
 impl WindowHandler for FlutterWindowHandler {
     fn on_resized(&self, width: u32, height: u32, scale_factor: f64) {
         // TODO: Consider moving this to WM_NCCALCSIZE on the parent window for smoother resizing.
-        self.resize_controller.begin_and_wait(width, height, || {
-            self.engine
-                .send_window_metrics_event(width as usize, height as usize, scale_factor)
-                .unwrap();
-        });
+        self.resize_controller
+            .begin_and_wait(width, height, &self.task_executor, || {
+                let _ = self
+                    .engine
+                    .send_window_metrics_event(width as usize, height as usize, scale_factor)
+                    .trace_err();
+            });
     }
 
     fn on_mouse_event(&self, event: window::MouseEvent) {

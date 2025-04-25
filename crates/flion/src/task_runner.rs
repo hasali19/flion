@@ -19,9 +19,9 @@ use windows::Win32::System::Threading::{
     THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_NORMAL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, PostMessageW,
-    RegisterClassW, SetTimer, SetWindowLongPtrW, GWLP_USERDATA, HWND_MESSAGE, WM_NULL, WM_TIMER,
-    WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+    GetWindowLongPtrW, KillTimer, PostMessageW, RegisterClassW, SetTimer, SetWindowLongPtrW,
+    TranslateMessage, GWLP_USERDATA, HWND_MESSAGE, MSG, WM_NULL, WM_TIMER, WNDCLASSW,
 };
 
 use crate::engine::FlutterEngine;
@@ -129,6 +129,23 @@ impl FlutterTaskExecutor {
 
     pub fn queue(&self) -> &Arc<FlutterTaskQueue> {
         &self.queue
+    }
+
+    /// Waits until the next task is executed, or `timeout` has elapsed.
+    pub fn poll_with_timeout(&self, timeout: Duration) {
+        let mut msg = Default::default();
+        unsafe {
+            // This will post a WM_TIMER to the message queue, so GetMessageW is guaranteed to
+            // return after `timeout`.
+            SetTimer(Some(self.hwnd), 1, timeout.as_millis() as u32, None);
+
+            if GetMessageW(&mut msg, Some(self.hwnd), 0, 0).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+
+            let _ = KillTimer(Some(self.hwnd), 1);
+        }
     }
 }
 

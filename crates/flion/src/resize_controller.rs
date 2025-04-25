@@ -1,5 +1,8 @@
-use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::Duration;
+
+use parking_lot::{Condvar, Mutex, MutexGuard};
+
+use crate::task_runner::FlutterTaskExecutor;
 
 pub struct ResizeController {
     resize: Mutex<Option<(u32, u32)>>,
@@ -14,25 +17,28 @@ impl ResizeController {
         }
     }
 
-    pub fn begin_and_wait<T>(&self, width: u32, height: u32, block: impl FnOnce() -> T) -> T {
-        let mut resize = self.resize.lock().unwrap();
-
-        *resize = Some((width, height));
+    pub fn begin_and_wait<T>(
+        &self,
+        width: u32,
+        height: u32,
+        platform_executor: &FlutterTaskExecutor,
+        block: impl FnOnce() -> T,
+    ) -> T {
+        *self.resize.lock() = Some((width, height));
 
         let res = block();
 
-        let _unused = self
-            .condvar
-            .wait_timeout_while(resize, Duration::from_millis(300), |resize| {
-                resize.is_some()
-            })
-            .unwrap();
+        // The Flutter famework may need to run tasks on the platform executor during the resize,
+        // so poll the executor instead of blocking to avoid a deadlock.
+        while self.resize.lock().is_some() {
+            platform_executor.poll_with_timeout(Duration::from_millis(100));
+        }
 
         res
     }
 
     pub fn current_resize(&self) -> Option<ResizeState> {
-        let value = self.resize.lock().unwrap();
+        let value = self.resize.lock();
         value.map(|size| ResizeState {
             size,
             value,
