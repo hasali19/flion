@@ -463,17 +463,13 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             return LRESULT(0);
         }
         WM_MOUSEWHEEL => {
-            let delta = hiword!(wparam) as i16 / WHEEL_DELTA as i16;
-            let _ = window_data
-                .on_mouse_scroll(hwnd, 0.0, delta.into())
-                .trace_err();
+            let delta = hiword!(wparam) as i16 as f64 / WHEEL_DELTA as f64;
+            let _ = window_data.on_mouse_scroll(hwnd, 0.0, delta).trace_err();
             return LRESULT(0);
         }
         WM_MOUSEHWHEEL => {
-            let delta = hiword!(wparam) as i16 / WHEEL_DELTA as i16;
-            let _ = window_data
-                .on_mouse_scroll(hwnd, delta.into(), 0.0)
-                .trace_err();
+            let delta = hiword!(wparam) as i16 as f64 / WHEEL_DELTA as f64;
+            let _ = window_data.on_mouse_scroll(hwnd, delta, 0.0).trace_err();
             return LRESULT(0);
         }
         WM_TOUCH => {
