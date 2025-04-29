@@ -55,6 +55,13 @@ use crate::text_input::{TextInputHandler, TextInputState};
 pub use crate::engine::{BinaryMessageHandler, BinaryMessageReply, BinaryMessenger};
 pub use crate::platform_views::{CompositorContext, PlatformView, PlatformViewUpdateArgs};
 
+#[doc(hidden)]
+pub use ::linkme;
+
+#[doc(hidden)]
+#[linkme::distributed_slice]
+pub static PLUGINS: [unsafe extern "C" fn(*mut c_void)];
+
 #[macro_export]
 macro_rules! include_plugins {
     () => {
@@ -64,7 +71,6 @@ macro_rules! include_plugins {
 
 pub struct FlionEngineBuilder<'a> {
     bundle_path: PathBuf,
-    plugin_initializers: &'a [unsafe extern "C" fn(*mut c_void)],
     platform_message_handlers: Vec<(&'a str, Box<dyn BinaryMessageHandler>)>,
     platform_view_factories: HashMap<String, Box<dyn PlatformViewFactory>>,
 }
@@ -81,7 +87,6 @@ impl<'a> FlionEngineBuilder<'a> {
 
         FlionEngineBuilder {
             bundle_path,
-            plugin_initializers: &[],
             platform_message_handlers: vec![],
             platform_view_factories: HashMap::new(),
         }
@@ -89,11 +94,6 @@ impl<'a> FlionEngineBuilder<'a> {
 
     pub fn with_bundle_path(mut self, path: &'a Path) -> Self {
         self.bundle_path = path.to_owned();
-        self
-    }
-
-    pub fn with_plugins(mut self, plugins: &'a [unsafe extern "C" fn(*mut c_void)]) -> Self {
-        self.plugin_initializers = plugins;
         self
     }
 
@@ -229,7 +229,7 @@ impl<'a> FlionEngineBuilder<'a> {
             window.window_handle(),
         )?);
 
-        for init in self.plugin_initializers {
+        for init in PLUGINS {
             unsafe {
                 (init)(&raw mut *plugins_engine as *mut c_void);
             }

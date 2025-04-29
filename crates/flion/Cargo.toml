@@ -13,6 +13,7 @@ eyre = "0.6"
 flutter-embedder = { path = "../flutter-embedder" }
 gl = "0.14"
 khronos-egl = { version = "6.0", features = ["static", "no-pkg-config"] }
+linkme = "0.3.32"
 parking_lot = "0.12.3"
 plugins-compat = { path = "../plugins-compat" }
 raw-window-handle = "0.6"

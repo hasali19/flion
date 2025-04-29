@@ -66,7 +66,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let engine = FlionEngine::builder()
-        .with_plugins(PLUGINS)
         .with_platform_view_factory(
             "example",
             |context: CompositorContext,

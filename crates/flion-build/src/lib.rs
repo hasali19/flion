@@ -22,7 +22,7 @@ pub fn generate_plugins_registrant(project_dir: &Path) -> Result<(), Box<dyn Err
     println!("cargo::rerun-if-changed={}", plugins_file.display());
 
     let mut externs = String::new();
-    let mut consts = String::new();
+    let mut statics = String::new();
 
     let plugins_file = BufReader::new(File::open(plugins_file)?);
     for line in plugins_file.lines().map_while(Result::ok) {
@@ -39,18 +39,19 @@ unsafe extern \"C\" {{
 }}"
         )?;
 
-        writeln!(consts, "{class_name}RegisterWithRegistrar,")?;
+        writeln!(statics, "#[allow(non_upper_case_globals)]")?;
+        writeln!(
+            statics,
+            "#[flion::linkme::distributed_slice(flion::PLUGINS)] #[linkme(crate = flion::linkme)] static {class_name}RegisterWithRegistrarPtr: unsafe extern \"C\" fn(*mut std::ffi::c_void) = {class_name}RegisterWithRegistrar;"
+        )?;
     }
 
     let mut plugin_registrant = File::create(out_dir.join("plugin_registrant.rs"))?;
 
+    writeln!(plugin_registrant, "const _: () = {{")?;
     writeln!(plugin_registrant, "{}", externs)?;
-    writeln!(
-        plugin_registrant,
-        "static PLUGINS: &[unsafe extern \"C\" fn(*mut std::ffi::c_void)] = &["
-    )?;
-    writeln!(plugin_registrant, "{}", consts)?;
-    writeln!(plugin_registrant, "];")?;
+    writeln!(plugin_registrant, "{}", statics)?;
+    writeln!(plugin_registrant, "}};")?;
 
     Ok(())
 }
