@@ -22,7 +22,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
 use std::ffi::c_void;
-use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -63,28 +62,15 @@ macro_rules! include_plugins {
     };
 }
 
-pub struct FlionEngineEnvironment;
-
-impl FlionEngineEnvironment {
-    pub fn init() -> eyre::Result<FlionEngineEnvironment> {
-        Ok(FlionEngineEnvironment)
-    }
-
-    pub fn new_engine_builder<'a>(&self) -> FlionEngineBuilder<'_, 'a> {
-        FlionEngineBuilder::new()
-    }
-}
-
-pub struct FlionEngineBuilder<'e, 'a> {
-    env: PhantomData<&'e FlionEngineEnvironment>,
+pub struct FlionEngineBuilder<'a> {
     bundle_path: PathBuf,
     plugin_initializers: &'a [unsafe extern "C" fn(*mut c_void)],
     platform_message_handlers: Vec<(&'a str, Box<dyn BinaryMessageHandler>)>,
     platform_view_factories: HashMap<String, Box<dyn PlatformViewFactory>>,
 }
 
-impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
-    fn new() -> FlionEngineBuilder<'e, 'a> {
+impl<'a> FlionEngineBuilder<'a> {
+    fn new() -> FlionEngineBuilder<'a> {
         let bundle_path = if let Ok(exe) = env::current_exe()
             && let Some(dir) = exe.parent()
         {
@@ -94,7 +80,6 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
         };
 
         FlionEngineBuilder {
-            env: PhantomData,
             bundle_path,
             plugin_initializers: &[],
             platform_message_handlers: vec![],
@@ -131,7 +116,7 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
         self
     }
 
-    pub fn build(self) -> eyre::Result<FlionEngine<'e>> {
+    pub fn build(self) -> eyre::Result<FlionEngine> {
         let device = unsafe {
             let mut device = Default::default();
 
@@ -266,7 +251,6 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
         }
 
         Ok(FlionEngine {
-            env: PhantomData,
             engine,
             window,
             _plugins: plugins_engine,
@@ -276,8 +260,7 @@ impl<'e, 'a> FlionEngineBuilder<'e, 'a> {
     }
 }
 
-pub struct FlionEngine<'e> {
-    env: PhantomData<&'e FlionEngineEnvironment>,
+pub struct FlionEngine {
     engine: Rc<FlutterEngine>,
     window: Rc<Window>,
     _plugins: Box<FlutterPluginsEngine>,
@@ -285,7 +268,11 @@ pub struct FlionEngine<'e> {
     _task_executor: Rc<FlutterTaskExecutor>,
 }
 
-impl FlionEngine<'_> {
+impl FlionEngine {
+    pub fn builder<'a>() -> FlionEngineBuilder<'a> {
+        FlionEngineBuilder::new()
+    }
+
     pub fn messenger(&self) -> BinaryMessenger {
         self.engine.messenger()
     }

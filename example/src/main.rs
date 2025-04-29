@@ -4,7 +4,7 @@ use std::os::raw::c_void;
 use std::rc::Rc;
 
 use flion::codec::EncodableValue;
-use flion::{CompositorContext, FlionEngineEnvironment, PlatformView, include_plugins};
+use flion::{CompositorContext, FlionEngine, PlatformView, include_plugins};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::Graphics::DirectComposition::{
@@ -65,10 +65,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         )?;
     }
 
-    let env = FlionEngineEnvironment::init()?;
-
-    let engine = env
-        .new_engine_builder()
+    let engine = FlionEngine::builder()
         .with_plugins(PLUGINS)
         .with_platform_view_factory(
             "example",
