@@ -21,7 +21,7 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetWindowLongPtrW, KillTimer, PostMessageW, RegisterClassW, SetTimer, SetWindowLongPtrW,
-    TranslateMessage, GWLP_USERDATA, HWND_MESSAGE, MSG, WM_NULL, WM_TIMER, WNDCLASSW,
+    TranslateMessage, GWLP_USERDATA, HWND_MESSAGE, WM_NULL, WM_TIMER, WNDCLASSW,
 };
 
 use crate::engine::FlutterEngine;
@@ -84,6 +84,7 @@ impl FlutterTaskExecutor {
             register_window_class()?;
         }
 
+        let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None)? }.0);
         let hwnd = unsafe {
             CreateWindowExW(
                 Default::default(),
@@ -96,9 +97,7 @@ impl FlutterTaskExecutor {
                 0,
                 Some(HWND_MESSAGE),
                 None,
-                Some(mem::transmute::<HMODULE, HINSTANCE>(GetModuleHandleW(
-                    None,
-                )?)),
+                Some(hinstance),
                 None,
             )?
         };
@@ -107,10 +106,6 @@ impl FlutterTaskExecutor {
             hwnd,
             tasks: Mutex::new(Vec::new()),
         });
-
-        unsafe {
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, Arc::as_ptr(&queue) as isize);
-        }
 
         Ok(FlutterTaskExecutor { hwnd, queue })
     }

@@ -20,16 +20,17 @@ pub mod standard_method_channel;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::env;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::{env, mem};
 
 use engine::{PointerButtons, PointerDeviceKind, PointerEvent};
 use eyre::OptionExt;
 use platform_views::{PlatformViewFactory, PlatformViewsMessageHandler};
 use plugins_shim::FlutterPluginsEngine;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use resize_controller::ResizeController;
 use task_runner::FlutterTaskExecutor;
 use window::{MouseAction, Window, WindowHandler};
@@ -40,9 +41,18 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION,
 };
 use windows::Win32::Graphics::DirectComposition::{
-    DCompositionCreateDevice2, IDCompositionDevice, IDCompositionTarget,
+    DCompositionCreateDevice2, IDCompositionDevice, IDCompositionVisual,
+};
+use windows::Win32::Graphics::Dwm::{
+    DwmSetWindowAttribute, DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWM_SYSTEMBACKDROP_TYPE,
 };
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows::Win32::UI::WindowsAndMessaging::{MoveWindow, SetParent};
+use winit::dpi::{LogicalSize, PhysicalSize};
+use winit::event_loop::EventLoopBuilder;
+use winit::platform::windows::WindowBuilderExtWindows;
+use winit::window::WindowBuilder;
 
 use crate::compositor::FlutterCompositor;
 use crate::egl::EglDevice;
@@ -143,7 +153,6 @@ impl<'a> FlionEngineBuilder<'a> {
         let egl = EglDevice::create(&device)?;
 
         let resize_controller = Arc::new(ResizeController::new());
-        let text_input = Rc::new(RefCell::new(TextInputState::new()));
 
         let compositor = FlutterCompositor::new(
             device.clone(),
@@ -159,21 +168,15 @@ impl<'a> FlionEngineBuilder<'a> {
 
         let platform_views = compositor.platform_views();
 
-        let mut platform_message_handlers: Vec<(&str, Box<dyn BinaryMessageHandler>)> = vec![
-            (
-                "flutter/textinput",
-                Box::new(TextInputHandler::new(text_input.clone())),
-            ),
-            (
-                "flion/platform_views",
-                Box::new(PlatformViewsMessageHandler::new(
-                    platform_views,
-                    device,
-                    composition_device.clone(),
-                    self.platform_view_factories,
-                )),
-            ),
-        ];
+        let mut platform_message_handlers: Vec<(&str, Box<dyn BinaryMessageHandler>)> = vec![(
+            "flion/platform_views",
+            Box::new(PlatformViewsMessageHandler::new(
+                platform_views,
+                device,
+                composition_device.clone(),
+                self.platform_view_factories,
+            )),
+        )];
 
         platform_message_handlers.extend(self.platform_message_handlers);
 
@@ -206,66 +209,24 @@ impl<'a> FlionEngineBuilder<'a> {
 
         task_executor.init(engine.clone());
 
-        let window = Rc::new(Window::new(
-            800,
-            600,
-            Box::new(FlutterWindowHandler {
-                engine: engine.clone(),
-                resize_controller,
-                keyboard: Keyboard::new(engine.clone(), text_input.clone()),
-                task_executor: task_executor.clone(),
-            }),
-        )?);
-
-        engine.set_platform_message_handler(
-            "flutter/mousecursor",
-            MouseCursorHandler::new(Rc::downgrade(&window)),
-        );
-
-        let (width, height) = window.inner_size();
-
-        let mut plugins_engine = Box::new(FlutterPluginsEngine::new(
-            engine.clone(),
-            window.window_handle(),
-        )?);
-
-        for init in PLUGINS {
-            unsafe {
-                (init)(&raw mut *plugins_engine as *mut c_void);
-            }
-        }
-
-        let scale_factor = window.scale_factor();
-
-        engine.send_window_metrics_event(width as usize, height as usize, scale_factor)?;
-
         settings::send_to_engine(&engine)?;
-
-        // TODO: Composition target should be attached to parent window instead. Use the child window
-        // just for input.
-        let composition_target =
-            unsafe { composition_device.CreateTargetForHwnd(window.window_handle(), true)? };
-
-        unsafe {
-            composition_target.SetRoot(&root_visual)?;
-        }
 
         Ok(FlionEngine {
             engine,
-            window,
-            _plugins: plugins_engine,
-            _composition_target: composition_target,
-            _task_executor: task_executor,
+            composition_device,
+            root_visual,
+            resize_controller,
+            task_executor,
         })
     }
 }
 
 pub struct FlionEngine {
     engine: Rc<FlutterEngine>,
-    window: Rc<Window>,
-    _plugins: Box<FlutterPluginsEngine>,
-    _composition_target: IDCompositionTarget,
-    _task_executor: Rc<FlutterTaskExecutor>,
+    composition_device: IDCompositionDevice,
+    root_visual: IDCompositionVisual,
+    resize_controller: Arc<ResizeController>,
+    task_executor: Rc<FlutterTaskExecutor>,
 }
 
 impl FlionEngine {
@@ -285,8 +246,114 @@ impl FlionEngine {
         self.engine.set_platform_message_handler(name, handler)
     }
 
-    pub fn window_handle(&self) -> HWND {
-        self.window.window_handle()
+    pub fn run_event_loop(self) -> eyre::Result<()> {
+        let event_loop = EventLoopBuilder::new().build()?;
+
+        let parent_window = WindowBuilder::new()
+            .with_inner_size(LogicalSize::new(1280, 720))
+            .with_no_redirection_bitmap(true)
+            .build(&event_loop)?;
+
+        let parent_windoww = Rc::new(parent_window);
+
+        let parent_hwnd = match parent_windoww.window_handle()?.as_raw() {
+            RawWindowHandle::Win32(handle) => HWND(handle.hwnd.get() as _),
+            _ => unreachable!(),
+        };
+
+        unsafe {
+            let backdrop_type = DWMSBT_MAINWINDOW;
+            DwmSetWindowAttribute(
+                parent_hwnd,
+                DWMWA_SYSTEMBACKDROP_TYPE,
+                &raw const backdrop_type as *const c_void,
+                mem::size_of::<DWM_SYSTEMBACKDROP_TYPE>() as u32,
+            )?;
+        }
+
+        let text_input = Rc::new(RefCell::new(TextInputState::new()));
+
+        let window = Rc::new(Window::new(
+            800,
+            600,
+            Box::new(FlutterWindowHandler {
+                engine: self.engine.clone(),
+                resize_controller: self.resize_controller.clone(),
+                keyboard: Keyboard::new(self.engine.clone(), text_input.clone()),
+                task_executor: self.task_executor.clone(),
+            }),
+        )?);
+
+        unsafe {
+            SetParent(window.window_handle(), Some(parent_hwnd))?;
+            SetFocus(Some(window.window_handle()))?;
+        }
+
+        self.engine.set_platform_message_handler(
+            "flutter/textinput",
+            TextInputHandler::new(text_input.clone()),
+        );
+
+        self.engine.set_platform_message_handler(
+            "flutter/mousecursor",
+            MouseCursorHandler::new(Rc::downgrade(&window)),
+        );
+
+        let mut plugins_engine = Box::new(FlutterPluginsEngine::new(
+            self.engine.clone(),
+            window.window_handle(),
+        )?);
+
+        for init in PLUGINS {
+            unsafe {
+                (init)(&raw mut *plugins_engine as *mut c_void);
+            }
+        }
+
+        // TODO: Composition target should be attached to parent window instead. Use the child window
+        // just for input.
+        let composition_target = unsafe {
+            self.composition_device
+                .CreateTargetForHwnd(window.window_handle(), true)?
+        };
+
+        unsafe {
+            composition_target.SetRoot(&self.root_visual)?;
+        }
+
+        event_loop.run(move |event, target| match event {
+            winit::event::Event::WindowEvent { window_id, event }
+                if window_id == parent_windoww.id() =>
+            {
+                match event {
+                    winit::event::WindowEvent::CloseRequested => {
+                        target.exit();
+                    }
+
+                    winit::event::WindowEvent::Focused(true) => unsafe {
+                        SetFocus(Some(window.window_handle())).unwrap();
+                    },
+
+                    winit::event::WindowEvent::Resized(PhysicalSize { width, height }) => unsafe {
+                        MoveWindow(
+                            window.window_handle(),
+                            0,
+                            0,
+                            width as i32,
+                            height as i32,
+                            false,
+                        )
+                        .unwrap();
+                    },
+
+                    _ => {}
+                }
+            }
+
+            _ => {}
+        })?;
+
+        Ok(())
     }
 }
 
