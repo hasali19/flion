@@ -2,6 +2,7 @@ use std::ffi::c_void;
 use std::mem;
 use std::sync::Arc;
 
+use eyre::bail;
 use flutter_embedder::{
     FlutterBackingStore, FlutterBackingStoreConfig,
     FlutterBackingStoreType_kFlutterBackingStoreTypeOpenGL, FlutterBackingStore__bindgen_ty_1,
@@ -12,6 +13,7 @@ use flutter_embedder::{
     FlutterPlatformViewMutationType_kFlutterPlatformViewMutationTypeTransformation,
 };
 use khronos_egl::{self as egl};
+use parking_lot::Mutex;
 use windows::core::{Interface, BOOL};
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 use windows::Win32::Graphics::DirectComposition::{IDCompositionDevice, IDCompositionVisual};
@@ -27,6 +29,7 @@ use windows_numerics::Matrix3x2;
 
 use crate::egl::EglDevice;
 use crate::platform_views::{PlatformViewUpdateArgs, PlatformViews};
+use crate::views::ViewManager;
 
 pub trait CompositionHandler: Send {
     /// Returns the current size of the rendering area.
@@ -40,7 +43,7 @@ pub trait CompositionHandler: Send {
 pub struct FlutterCompositor {
     device: ID3D11Device,
     composition_device: IDCompositionDevice,
-    root_visual: IDCompositionVisual,
+    view_manager: Arc<Mutex<ViewManager>>,
     egl: Arc<EglDevice>,
     layers: Vec<LayerId>,
     handler: Box<dyn CompositionHandler>,
@@ -65,7 +68,7 @@ impl FlutterCompositor {
     pub fn new(
         device: ID3D11Device,
         composition_device: IDCompositionDevice,
-        visual: IDCompositionVisual,
+        view_manager: Arc<Mutex<ViewManager>>,
         egl: Arc<EglDevice>,
         handler: Box<dyn CompositionHandler>,
     ) -> eyre::Result<FlutterCompositor> {
@@ -75,7 +78,7 @@ impl FlutterCompositor {
             device,
             composition_device,
             egl,
-            root_visual: visual,
+            view_manager,
             layers: vec![],
             handler,
             platform_views,
@@ -228,7 +231,7 @@ impl FlutterCompositor {
         Ok(())
     }
 
-    pub fn present_layers(&mut self, layers: &[&FlutterLayer]) -> eyre::Result<()> {
+    pub fn present_view(&mut self, view_id: i64, layers: &[&FlutterLayer]) -> eyre::Result<()> {
         // Composition layers need to be updated if flutter layers are added or removed.
         let mut should_update_composition_layers = self.layers.len() != layers.len();
         let mut should_flush_rendering = false;
@@ -324,7 +327,7 @@ impl FlutterCompositor {
             unsafe {
                 // Flush outstanding rendering commands if this is the first present. This is taken from Chromium:
                 // https://github.com/chromium/chromium/blob/2764576ca3ae948e9274da637b535b4113f421f2/ui/gl/swap_chain_presenter.cc#L1702-L1710.
-                // Seems to help avoid some flickering when the swapchain gets recreating while resizing.
+                // Seems to help avoid some flickering when the swapchain gets recreated while resizing.
                 // Interestingly the buffer copying Chromium uses in addition to this doesn't seem necessary here.
                 let event = CreateEventW(None, false, false, None)?;
                 let dxgi_device = self.device.cast::<IDXGIDevice2>()?;
@@ -336,8 +339,13 @@ impl FlutterCompositor {
         // Flutter layers have changed. We need to re-insert all layer visuals into the root visual in
         // the correct order.
         if should_update_composition_layers {
+            let views = self.view_manager.lock();
+            let Some(surface) = views.get(view_id) else {
+                bail!("View not found with id {view_id}");
+            };
+
             unsafe {
-                self.root_visual.RemoveAllVisuals()?;
+                surface.root_visual().RemoveAllVisuals()?;
             }
 
             self.layers.clear();
@@ -353,7 +361,8 @@ impl FlutterCompositor {
                     };
 
                     unsafe {
-                        self.root_visual
+                        surface
+                            .root_visual()
                             .AddVisual(&compositor_layer.visual, false, None)?;
                     }
 
@@ -369,13 +378,14 @@ impl FlutterCompositor {
                     };
 
                     unsafe {
-                        self.root_visual
+                        surface
+                            .root_visual()
                             .AddVisual(platform_view.visual(), false, None)?;
                     }
 
                     self.layers.push(LayerId::PlatformView(id));
                 } else {
-                    unimplemented!("unsupported layer type: {}", layer.type_);
+                    bail!("Unsupported layer type: {}", layer.type_);
                 }
             }
         }

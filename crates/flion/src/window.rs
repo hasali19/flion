@@ -23,15 +23,15 @@ use windows::Win32::UI::Input::Touch::{
     TOUCHEVENTF_MOVE, TOUCHEVENTF_UP, TOUCHINPUT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos,
-    GetMessageExtraInfo, GetWindowLongPtrW, LoadCursorW, PeekMessageW, RegisterClassExW, SetCursor,
-    SetWindowLongPtrW, SystemParametersInfoW, CREATESTRUCTW, GWLP_USERDATA, HCURSOR, HTCLIENT,
-    HWND_MESSAGE, IDC_ARROW, PM_NOREMOVE, SPI_GETWHEELSCROLLLINES,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WM_CHAR, WM_CLOSE, WM_CREATE, WM_DEADCHAR,
-    WM_DPICHANGED_BEFOREPARENT, WM_KEYDOWN, WM_KEYFIRST, WM_KEYLAST, WM_KEYUP, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCCREATE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_TOUCH, WM_XBUTTONDOWN,
-    WM_XBUTTONUP, WNDCLASSEXW, WS_CHILD, WS_EX_NOREDIRECTIONBITMAP, WS_VISIBLE, XBUTTON1, XBUTTON2,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetMessageExtraInfo,
+    GetWindowLongPtrW, LoadCursorW, PeekMessageW, RegisterClassExW, SetCursor, SetWindowLongPtrW,
+    SystemParametersInfoW, CREATESTRUCTW, GWLP_USERDATA, HCURSOR, HTCLIENT, HWND_MESSAGE,
+    IDC_ARROW, PM_NOREMOVE, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    WHEEL_DELTA, WM_CHAR, WM_CLOSE, WM_CREATE, WM_DEADCHAR, WM_DPICHANGED_BEFOREPARENT, WM_KEYDOWN,
+    WM_KEYFIRST, WM_KEYLAST, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SETCURSOR, WM_SIZE, WM_TOUCH, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_CHILD,
+    WS_EX_NOREDIRECTIONBITMAP, WS_VISIBLE, XBUTTON1, XBUTTON2,
 };
 
 use crate::error_utils::ResultExt;
@@ -92,19 +92,6 @@ impl Window {
 
     pub fn window_handle(&self) -> HWND {
         self.hwnd
-    }
-
-    pub fn inner_size(&self) -> (u32, u32) {
-        let mut rect = Default::default();
-        unsafe { GetClientRect(self.hwnd, &mut rect).expect("Failed to get window size") };
-        (
-            (rect.right - rect.left) as u32,
-            (rect.bottom - rect.top) as u32,
-        )
-    }
-
-    pub fn scale_factor(&self) -> f64 {
-        self.window_data.scale_factor.get()
     }
 
     pub fn set_cursor(&self, cursor: Option<HCURSOR>) {
@@ -207,7 +194,7 @@ pub struct KeyEvent {
 }
 
 pub trait WindowHandler {
-    fn on_resized(&self, width: u32, height: u32, scale_factor: f64);
+    fn on_resize(&self, width: u32, height: u32, scale_factor: f64);
 
     fn on_mouse_event(&self, event: MouseEvent);
 
@@ -233,7 +220,7 @@ impl WindowData {
     fn dispatch_resize_event(&self) {
         let (width, height) = self.size.get();
         let scale_factor = self.scale_factor.get();
-        self.handler.on_resized(width, height, scale_factor);
+        self.handler.on_resize(width, height, scale_factor);
     }
 
     fn track_mouse_leave_event(&self, hwnd: HWND) {

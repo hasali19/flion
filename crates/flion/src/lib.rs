@@ -9,10 +9,10 @@ mod keymap;
 mod mouse_cursor;
 mod platform_views;
 mod plugins_shim;
-mod resize_controller;
 mod settings;
 mod task_runner;
 mod text_input;
+mod views;
 mod window;
 
 pub mod codec;
@@ -24,15 +24,17 @@ use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 use std::{env, mem};
 
 use engine::{PointerButtons, PointerDeviceKind, PointerEvent};
 use eyre::OptionExt;
+use parking_lot::Mutex;
 use platform_views::{PlatformViewFactory, PlatformViewsMessageHandler};
 use plugins_shim::FlutterPluginsEngine;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use resize_controller::ResizeController;
-use task_runner::FlutterTaskExecutor;
+use task_runner::{FlutterTaskExecutor, FlutterTaskQueue};
+use views::ViewManager;
 use window::{MouseAction, Window, WindowHandler};
 use windows::core::Interface;
 use windows::Win32::Foundation::HWND;
@@ -40,9 +42,7 @@ use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION,
 };
-use windows::Win32::Graphics::DirectComposition::{
-    DCompositionCreateDevice2, IDCompositionDevice, IDCompositionVisual,
-};
+use windows::Win32::Graphics::DirectComposition::{DCompositionCreateDevice2, IDCompositionDevice};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWM_SYSTEMBACKDROP_TYPE,
 };
@@ -148,21 +148,21 @@ impl<'a> FlionEngineBuilder<'a> {
         let composition_device: IDCompositionDevice =
             unsafe { DCompositionCreateDevice2(&device.cast::<IDXGIDevice>()?)? };
 
-        let root_visual = unsafe { composition_device.CreateVisual()? };
-
         let egl = EglDevice::create(&device)?;
 
-        let resize_controller = Arc::new(ResizeController::new());
+        let task_executor = Rc::new(FlutterTaskExecutor::new()?);
+        let task_queue = task_executor.queue().clone();
 
+        let view_manager = Arc::new(Mutex::new(ViewManager::new()));
         let compositor = FlutterCompositor::new(
             device.clone(),
             composition_device.clone(),
-            root_visual.clone(),
+            view_manager.clone(),
             egl.clone(),
             Box::new(CompositionHandler {
                 composition_device: composition_device.clone(),
-                resize_controller: resize_controller.clone(),
-                surface_size: (0, 0),
+                view_manager: view_manager.clone(),
+                platform_task_queue: task_queue.clone(),
             }),
         )?;
 
@@ -179,9 +179,6 @@ impl<'a> FlionEngineBuilder<'a> {
         )];
 
         platform_message_handlers.extend(self.platform_message_handlers);
-
-        let task_executor = Rc::new(FlutterTaskExecutor::new()?);
-        let task_queue = task_executor.queue().clone();
 
         // TODO: Disable environment variable lookup in release builds.
         // These variables are provided by the flion cli during development, and are not intended
@@ -214,8 +211,7 @@ impl<'a> FlionEngineBuilder<'a> {
         Ok(FlionEngine {
             engine,
             composition_device,
-            root_visual,
-            resize_controller,
+            view_manager,
             task_executor,
         })
     }
@@ -224,8 +220,7 @@ impl<'a> FlionEngineBuilder<'a> {
 pub struct FlionEngine {
     engine: Rc<FlutterEngine>,
     composition_device: IDCompositionDevice,
-    root_visual: IDCompositionVisual,
-    resize_controller: Arc<ResizeController>,
+    view_manager: Arc<Mutex<ViewManager>>,
     task_executor: Rc<FlutterTaskExecutor>,
 }
 
@@ -271,6 +266,9 @@ impl FlionEngine {
             )?;
         }
 
+        let root_visual = unsafe { self.composition_device.CreateVisual()? };
+        self.view_manager.lock().insert(0, root_visual.clone());
+
         let text_input = Rc::new(RefCell::new(TextInputState::new()));
 
         let window = Rc::new(Window::new(
@@ -278,9 +276,9 @@ impl FlionEngine {
             600,
             Box::new(FlutterWindowHandler {
                 engine: self.engine.clone(),
-                resize_controller: self.resize_controller.clone(),
-                keyboard: Keyboard::new(self.engine.clone(), text_input.clone()),
                 task_executor: self.task_executor.clone(),
+                view_manager: self.view_manager.clone(),
+                keyboard: Keyboard::new(self.engine.clone(), text_input.clone()),
             }),
         )?);
 
@@ -317,9 +315,7 @@ impl FlionEngine {
                 .CreateTargetForHwnd(window.window_handle(), true)?
         };
 
-        unsafe {
-            composition_target.SetRoot(&self.root_visual)?;
-        }
+        unsafe { composition_target.SetRoot(&root_visual)? };
 
         event_loop.run(move |event, target| match event {
             winit::event::Event::WindowEvent { window_id, event }
@@ -360,20 +356,41 @@ impl FlionEngine {
 struct FlutterWindowHandler {
     engine: Rc<engine::FlutterEngine>,
     task_executor: Rc<FlutterTaskExecutor>,
-    resize_controller: Arc<ResizeController>,
+    view_manager: Arc<Mutex<ViewManager>>,
     keyboard: Keyboard,
 }
 
 impl WindowHandler for FlutterWindowHandler {
-    fn on_resized(&self, width: u32, height: u32, scale_factor: f64) {
+    fn on_resize(&self, width: u32, height: u32, scale_factor: f64) {
         // TODO: Consider moving this to WM_NCCALCSIZE on the parent window for smoother resizing.
-        self.resize_controller
-            .begin_and_wait(width, height, &self.task_executor, || {
-                let _ = self
-                    .engine
-                    .send_window_metrics_event(width as usize, height as usize, scale_factor)
-                    .trace_err();
-            });
+
+        {
+            let mut views = self.view_manager.lock();
+            let Some(view) = views.get_mut(0) else {
+                tracing::error!("Failed to resize non-existent view");
+                return;
+            };
+            view.begin_resize(width, height);
+        }
+
+        let _ = self
+            .engine
+            .send_window_metrics_event(width as usize, height as usize, scale_factor)
+            .trace_err();
+
+        // The Flutter famework may need to run tasks on the platform executor during the resize,
+        // so poll the executor instead of blocking to avoid a deadlock.
+        while is_view_resizing(&self.view_manager.lock(), 0) {
+            self.task_executor
+                .poll_with_timeout(Duration::from_millis(100));
+        }
+
+        fn is_view_resizing(views: &ViewManager, view_id: i64) -> bool {
+            match views.get(view_id) {
+                None => false,
+                Some(view) => view.is_resizing(),
+            }
+        }
     }
 
     fn on_mouse_event(&self, event: window::MouseEvent) {
@@ -438,34 +455,36 @@ impl WindowHandler for FlutterWindowHandler {
 
 struct CompositionHandler {
     composition_device: IDCompositionDevice,
-    resize_controller: Arc<ResizeController>,
-    surface_size: (u32, u32),
+    view_manager: Arc<Mutex<ViewManager>>,
+    platform_task_queue: Arc<FlutterTaskQueue>,
 }
 
 unsafe impl Send for CompositionHandler {}
 
 impl compositor::CompositionHandler for CompositionHandler {
     fn get_surface_size(&mut self) -> eyre::Result<(u32, u32)> {
-        if let Some(resize) = self.resize_controller.current_resize() {
-            self.surface_size = resize.size();
-        }
-        Ok(self.surface_size)
+        let views = self.view_manager.lock();
+        let surface = views.get(0).ok_or_eyre("View not found")?;
+        Ok(surface.size())
     }
 
     fn present(&mut self) -> eyre::Result<()> {
-        let commit_compositor = || unsafe { self.composition_device.Commit() };
+        let mut views = self.view_manager.lock();
+        let surface = views.get_mut(0).ok_or_eyre("View not found")?;
 
-        if let Some(resize) = self.resize_controller.current_resize() {
-            // Make sure the previous commit has completed. This reduces glitches while resizing.
+        if surface.is_resizing() {
             unsafe {
+                // Make sure the previous commit has completed. This reduces glitches while resizing.
                 self.composition_device.WaitForCommitCompletion()?;
+                self.composition_device.Commit()?;
             }
 
-            commit_compositor()?;
+            surface.end_resize();
 
-            resize.complete();
+            // Platform thread is waiting for the resize so send it a signal to wake up.
+            self.platform_task_queue.wake();
         } else {
-            commit_compositor()?;
+            unsafe { self.composition_device.Commit()? };
         }
 
         Ok(())

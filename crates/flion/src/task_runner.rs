@@ -222,6 +222,10 @@ unsafe impl Sync for FlutterTaskQueue {}
 impl FlutterTaskQueue {
     pub fn enqueue(&self, task: Task) {
         self.tasks.lock().push(task);
+        self.wake();
+    }
+
+    pub fn wake(&self) {
         unsafe {
             if let Err(e) = PostMessageW(
                 Some(self.hwnd),

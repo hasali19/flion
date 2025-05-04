@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::{mem, ptr};
 
 use bitflags::bitflags;
-use eyre::bail;
+use eyre::{bail, Context};
 use flutter_embedder::{
     FlutterBackingStore, FlutterBackingStoreConfig, FlutterCustomTaskRunners, FlutterEngineAOTData,
     FlutterEngineAOTDataSource,
@@ -34,9 +34,10 @@ use flutter_embedder::{
     FlutterPointerMouseButtons_kFlutterPointerButtonMouseSecondary, FlutterPointerPhase,
     FlutterPointerPhase_kAdd, FlutterPointerPhase_kDown, FlutterPointerPhase_kHover,
     FlutterPointerPhase_kMove, FlutterPointerPhase_kRemove, FlutterPointerPhase_kUp,
-    FlutterPointerSignalKind_kFlutterPointerSignalKindScroll, FlutterProjectArgs,
-    FlutterRendererConfig, FlutterRendererType_kOpenGL, FlutterTask, FlutterTaskRunnerDescription,
-    FlutterTransformation, FlutterWindowMetricsEvent, FLUTTER_ENGINE_VERSION,
+    FlutterPointerSignalKind_kFlutterPointerSignalKindScroll, FlutterPresentViewInfo,
+    FlutterProjectArgs, FlutterRendererConfig, FlutterRendererType_kOpenGL, FlutterTask,
+    FlutterTaskRunnerDescription, FlutterTransformation, FlutterWindowMetricsEvent,
+    FLUTTER_ENGINE_VERSION,
 };
 use parking_lot::Mutex;
 use smol_str::SmolStr;
@@ -77,7 +78,9 @@ pub enum PointerDeviceKind {
     Unknown = 0,
     Mouse = FlutterPointerDeviceKind_kFlutterPointerDeviceKindMouse,
     Touch = FlutterPointerDeviceKind_kFlutterPointerDeviceKindTouch,
+    #[expect(unused)]
     Stylus = FlutterPointerDeviceKind_kFlutterPointerDeviceKindStylus,
+    #[expect(unused)]
     Trackpad = FlutterPointerDeviceKind_kFlutterPointerDeviceKindTrackpad,
 }
 
@@ -179,8 +182,8 @@ impl FlutterEngine {
                 struct_size: mem::size_of::<FlutterCompositor>(),
                 create_backing_store_callback: Some(compositor_create_backing_store),
                 collect_backing_store_callback: Some(compositor_collect_backing_store),
-                present_layers_callback: Some(compositor_present_layers),
-                present_view_callback: None,
+                present_layers_callback: None,
+                present_view_callback: Some(compositor_present_view),
                 user_data: compositor.cast(),
                 avoid_backing_store_cache: false,
             },
@@ -811,24 +814,28 @@ pub unsafe extern "C" fn compositor_collect_backing_store(
     true
 }
 
-pub unsafe extern "C" fn compositor_present_layers(
-    layers: *mut *const FlutterLayer,
-    layers_count: usize,
-    user_data: *mut c_void,
-) -> bool {
-    let Some(compositor) = user_data.cast::<FlutterCompositor>().as_mut() else {
+pub unsafe extern "C" fn compositor_present_view(info: *const FlutterPresentViewInfo) -> bool {
+    let Some(info) = info.as_ref() else {
+        tracing::error!("FlutterPresentViewInfo is invalid");
+        return false;
+    };
+
+    let Some(compositor) = info.user_data.cast::<FlutterCompositor>().as_mut() else {
         tracing::error!("user_data is null");
         return false;
     };
 
-    if layers.is_null() {
+    if info.layers.is_null() {
         tracing::error!("layers is null");
         return false;
     }
 
-    let layers = std::slice::from_raw_parts(layers.cast::<&FlutterLayer>(), layers_count);
+    let layers = std::slice::from_raw_parts(info.layers.cast::<&FlutterLayer>(), info.layers_count);
 
-    if let Err(e) = compositor.present_layers(layers) {
+    if let Err(e) = compositor
+        .present_view(info.view_id, layers)
+        .wrap_err("Failed to present view")
+    {
         tracing::error!("{e:?}");
         return false;
     };
