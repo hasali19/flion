@@ -29,9 +29,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IDC_ARROW, PM_NOREMOVE, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     WHEEL_DELTA, WM_CHAR, WM_CLOSE, WM_CREATE, WM_DEADCHAR, WM_DPICHANGED_BEFOREPARENT, WM_KEYDOWN,
     WM_KEYFIRST, WM_KEYLAST, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SETCURSOR, WM_SIZE, WM_TOUCH, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_CHILD,
-    WS_EX_NOREDIRECTIONBITMAP, WS_VISIBLE, XBUTTON1, XBUTTON2,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_TOUCH, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW,
+    WS_CHILD, WS_EX_NOREDIRECTIONBITMAP, WS_VISIBLE, XBUTTON1, XBUTTON2,
 };
 
 use crate::error_utils::ResultExt;
@@ -83,7 +83,7 @@ impl Window {
                 Some(HWND_MESSAGE),
                 None,
                 Some(hinstance),
-                Some(Rc::as_ptr(&window_data).cast()),
+                Some(Rc::into_raw(window_data.clone()).cast()),
             )?
         };
 
@@ -103,9 +103,7 @@ impl Window {
 impl Drop for Window {
     fn drop(&mut self) {
         unsafe {
-            let window_data = GetWindowLongPtrW(self.hwnd, GWLP_USERDATA) as *const WindowData;
             DestroyWindow(self.hwnd).expect("Failed to destroy window");
-            drop(Rc::from_raw(window_data));
         }
     }
 }
@@ -347,6 +345,13 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         Rc::increment_strong_count(ptr);
         Rc::from_raw(ptr)
     };
+
+    if msg == WM_NCDESTROY {
+        unsafe {
+            drop(Rc::from_raw(ptr));
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+    }
 
     match msg {
         WM_CLOSE => {
