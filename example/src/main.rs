@@ -1,7 +1,7 @@
 use std::error::Error;
 
 use flion::codec::EncodableValue;
-use flion::{CompositorContext, FlionEngine, PlatformView, include_plugins};
+use flion::{CompositorContext, FlionApp, PlatformView, include_plugins};
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::Graphics::DirectComposition::{
     DCOMPOSITION_OPACITY_MODE_MULTIPLY, IDCompositionVisual, IDCompositionVisual2,
@@ -26,11 +26,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             .init();
     }
 
-    let engine = FlionEngine::builder()
+    let app = FlionApp::builder()
         .with_platform_view_factory("example", SolidColorView::create)
         .build()?;
 
-    engine.run_event_loop()?;
+    app.run_event_loop()?;
 
     Ok(())
 }

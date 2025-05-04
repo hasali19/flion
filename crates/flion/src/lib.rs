@@ -79,14 +79,14 @@ macro_rules! include_plugins {
     };
 }
 
-pub struct FlionEngineBuilder<'a> {
+pub struct FlionAppBuilder<'a> {
     bundle_path: PathBuf,
     platform_message_handlers: Vec<(&'a str, Box<dyn BinaryMessageHandler>)>,
     platform_view_factories: HashMap<String, Box<dyn PlatformViewFactory>>,
 }
 
-impl<'a> FlionEngineBuilder<'a> {
-    fn new() -> FlionEngineBuilder<'a> {
+impl<'a> FlionAppBuilder<'a> {
+    fn new() -> FlionAppBuilder<'a> {
         let bundle_path = if let Ok(exe) = env::current_exe()
             && let Some(dir) = exe.parent()
         {
@@ -95,7 +95,7 @@ impl<'a> FlionEngineBuilder<'a> {
             PathBuf::from("data")
         };
 
-        FlionEngineBuilder {
+        FlionAppBuilder {
             bundle_path,
             platform_message_handlers: vec![],
             platform_view_factories: HashMap::new(),
@@ -126,7 +126,7 @@ impl<'a> FlionEngineBuilder<'a> {
         self
     }
 
-    pub fn build(self) -> eyre::Result<FlionEngine> {
+    pub fn build(self) -> eyre::Result<FlionApp> {
         let device = unsafe {
             let mut device = Default::default();
 
@@ -208,7 +208,7 @@ impl<'a> FlionEngineBuilder<'a> {
 
         settings::send_to_engine(&engine)?;
 
-        Ok(FlionEngine {
+        Ok(FlionApp {
             engine,
             composition_device,
             view_manager,
@@ -217,16 +217,16 @@ impl<'a> FlionEngineBuilder<'a> {
     }
 }
 
-pub struct FlionEngine {
+pub struct FlionApp {
     engine: Rc<FlutterEngine>,
     composition_device: IDCompositionDevice,
     view_manager: Arc<Mutex<ViewManager>>,
     task_executor: Rc<FlutterTaskExecutor>,
 }
 
-impl FlionEngine {
-    pub fn builder<'a>() -> FlionEngineBuilder<'a> {
-        FlionEngineBuilder::new()
+impl FlionApp {
+    pub fn builder<'a>() -> FlionAppBuilder<'a> {
+        FlionAppBuilder::new()
     }
 
     pub fn messenger(&self) -> BinaryMessenger {
