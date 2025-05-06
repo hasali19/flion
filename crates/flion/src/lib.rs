@@ -47,8 +47,6 @@ use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWM_SYSTEMBACKDROP_TYPE,
 };
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
-use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
-use windows::Win32::UI::WindowsAndMessaging::{MoveWindow, SetParent};
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event_loop::EventLoopBuilder;
 use winit::platform::windows::WindowBuilderExtWindows;
@@ -249,9 +247,9 @@ impl FlionApp {
             .with_no_redirection_bitmap(true)
             .build(&event_loop)?;
 
-        let parent_windoww = Rc::new(parent_window);
+        let parent_window = Rc::new(parent_window);
 
-        let parent_hwnd = match parent_windoww.window_handle()?.as_raw() {
+        let parent_hwnd = match parent_window.window_handle()?.as_raw() {
             RawWindowHandle::Win32(handle) => HWND(handle.hwnd.get() as _),
             _ => unreachable!(),
         };
@@ -271,9 +269,10 @@ impl FlionApp {
 
         let text_input = Rc::new(RefCell::new(TextInputState::new()));
 
+        let size = parent_window.inner_size();
         let window = Rc::new(Window::new(
-            800,
-            600,
+            size.width,
+            size.height,
             Box::new(FlutterWindowHandler {
                 engine: self.engine.clone(),
                 task_executor: self.task_executor.clone(),
@@ -282,10 +281,16 @@ impl FlionApp {
             }),
         )?);
 
-        unsafe {
-            SetParent(window.window_handle(), Some(parent_hwnd))?;
-            SetFocus(Some(window.window_handle()))?;
-        }
+        window.set_parent(parent_hwnd);
+        window.request_focus();
+
+        window.show();
+
+        // The initial frame is scheduled by the send_window_metrics call when the window is resized
+        // during its creation. However, this frame doesn't seem to show up on the window for some
+        // reason. This workaround forces another frame which then is visible.
+        // TODO: Figure out why this is needed.
+        self.engine.schedule_frame();
 
         self.engine.set_platform_message_handler(
             "flutter/textinput",
@@ -319,28 +324,16 @@ impl FlionApp {
 
         event_loop.run(move |event, target| match event {
             winit::event::Event::WindowEvent { window_id, event }
-                if window_id == parent_windoww.id() =>
+                if window_id == parent_window.id() =>
             {
                 match event {
-                    winit::event::WindowEvent::CloseRequested => {
-                        target.exit();
+                    winit::event::WindowEvent::CloseRequested => target.exit(),
+
+                    winit::event::WindowEvent::Focused(true) => window.request_focus(),
+
+                    winit::event::WindowEvent::Resized(PhysicalSize { width, height }) => {
+                        window.set_position_and_size(0, 0, width, height)
                     }
-
-                    winit::event::WindowEvent::Focused(true) => unsafe {
-                        SetFocus(Some(window.window_handle())).unwrap();
-                    },
-
-                    winit::event::WindowEvent::Resized(PhysicalSize { width, height }) => unsafe {
-                        MoveWindow(
-                            window.window_handle(),
-                            0,
-                            0,
-                            width as i32,
-                            height as i32,
-                            false,
-                        )
-                        .unwrap();
-                    },
 
                     _ => {}
                 }

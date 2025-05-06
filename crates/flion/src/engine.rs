@@ -15,7 +15,7 @@ use flutter_embedder::{
     FlutterEngineAOTDataSource__bindgen_ty_1, FlutterEngineCreateAOTData,
     FlutterEngineGetCurrentTime, FlutterEngineInitialize, FlutterEngineResult_kSuccess,
     FlutterEngineRunInitialized, FlutterEngineRunTask, FlutterEngineRunsAOTCompiledDartCode,
-    FlutterEngineSendKeyEvent, FlutterEngineSendPlatformMessage,
+    FlutterEngineScheduleFrame, FlutterEngineSendKeyEvent, FlutterEngineSendPlatformMessage,
     FlutterEngineSendPlatformMessageResponse, FlutterEngineSendPointerEvent,
     FlutterEngineSendWindowMetricsEvent, FlutterEngineShutdown, FlutterKeyEvent,
     FlutterKeyEventDeviceType_kFlutterKeyEventDeviceTypeKeyboard,
@@ -394,6 +394,12 @@ impl FlutterEngine {
         BinaryMessenger {
             engine: self.inner.handle,
             engine_is_running: self.inner.is_running.clone(),
+        }
+    }
+
+    pub fn schedule_frame(&self) {
+        unsafe {
+            FlutterEngineScheduleFrame(self.inner.handle);
         }
     }
 }

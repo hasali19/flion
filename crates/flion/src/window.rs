@@ -15,7 +15,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VIRTUAL_KEY,
+    ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VIRTUAL_KEY,
     VK_CONTROL, VK_LCONTROL, VK_LSHIFT, VK_RCONTROL, VK_RSHIFT, VK_SHIFT,
 };
 use windows::Win32::UI::Input::Touch::{
@@ -24,14 +24,15 @@ use windows::Win32::UI::Input::Touch::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetMessageExtraInfo,
-    GetWindowLongPtrW, LoadCursorW, PeekMessageW, RegisterClassExW, SetCursor, SetWindowLongPtrW,
-    SystemParametersInfoW, CREATESTRUCTW, GWLP_USERDATA, HCURSOR, HTCLIENT, HWND_MESSAGE,
-    IDC_ARROW, PM_NOREMOVE, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    WHEEL_DELTA, WM_CHAR, WM_CLOSE, WM_CREATE, WM_DEADCHAR, WM_DPICHANGED_BEFOREPARENT, WM_KEYDOWN,
-    WM_KEYFIRST, WM_KEYLAST, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_TOUCH, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW,
-    WS_CHILD, WS_EX_NOREDIRECTIONBITMAP, WS_VISIBLE, XBUTTON1, XBUTTON2,
+    GetWindowLongPtrW, LoadCursorW, MoveWindow, PeekMessageW, RegisterClassExW, SetCursor,
+    SetParent, SetWindowLongPtrW, ShowWindow, SystemParametersInfoW, CREATESTRUCTW, GWLP_USERDATA,
+    HCURSOR, HTCLIENT, HWND_MESSAGE, IDC_ARROW, PM_NOREMOVE, SPI_GETWHEELSCROLLLINES, SW_SHOW,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WM_CHAR, WM_CLOSE, WM_CREATE, WM_DEADCHAR,
+    WM_DPICHANGED_BEFOREPARENT, WM_KEYDOWN, WM_KEYFIRST, WM_KEYLAST, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_TOUCH,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_CHILD, WS_EX_NOREDIRECTIONBITMAP, XBUTTON1,
+    XBUTTON2,
 };
 
 use crate::error_utils::ResultExt;
@@ -75,7 +76,7 @@ impl Window {
                 WS_EX_NOREDIRECTIONBITMAP,
                 w!("FlionWindow"),
                 w!("Flion Window"),
-                WS_CHILD | WS_VISIBLE,
+                WS_CHILD,
                 0,
                 0,
                 width as i32,
@@ -94,9 +95,39 @@ impl Window {
         self.hwnd
     }
 
+    pub fn set_parent(&self, hwnd: HWND) {
+        unsafe {
+            let _ = SetParent(self.hwnd, Some(hwnd));
+        }
+    }
+
+    pub fn set_position_and_size(&self, x: u32, y: u32, width: u32, height: u32) {
+        unsafe {
+            MoveWindow(
+                self.hwnd,
+                x as i32,
+                y as i32,
+                width as i32,
+                height as i32,
+                false,
+            )
+            .unwrap();
+        }
+    }
+
     pub fn set_cursor(&self, cursor: Option<HCURSOR>) {
         self.window_data.cursor.set(cursor);
         unsafe { SetCursor(cursor) };
+    }
+
+    pub fn request_focus(&self) {
+        unsafe {
+            let _ = SetFocus(Some(self.hwnd));
+        }
+    }
+
+    pub fn show(&self) {
+        let _ = unsafe { ShowWindow(self.hwnd, SW_SHOW) };
     }
 }
 
