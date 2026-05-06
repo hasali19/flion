@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::engine::{BinaryMessageHandler, BinaryMessageReply, FlutterEngine};
-use crate::window::{KeyAction, KeyEvent};
+use crate::input::{KeyAction, KeyEvent};
 
 pub struct TextInputState {
     client: Option<u32>,

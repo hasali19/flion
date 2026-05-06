@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::{FlutterEngine, KeyEvent, KeyEventType};
 use crate::error_utils::ResultExt;
+use crate::input;
 use crate::text_input::TextInputState;
-use crate::{keymap, window};
+use crate::keymap;
 
 pub struct Keyboard {
     engine: Rc<FlutterEngine>,
@@ -19,7 +20,7 @@ impl Keyboard {
         Keyboard { engine, text_input }
     }
 
-    pub fn handle_event(&self, event: window::KeyEvent) -> eyre::Result<()> {
+    pub fn handle_event(&self, event: input::KeyEvent) -> eyre::Result<()> {
         let text_input = self.text_input.clone();
 
         send_embedder_key_event(&self.engine, event, {
@@ -45,14 +46,14 @@ impl Keyboard {
 
 fn send_embedder_key_event(
     engine: &FlutterEngine,
-    event: window::KeyEvent,
-    next_handler: impl FnOnce(window::KeyEvent) + 'static,
+    event: input::KeyEvent,
+    next_handler: impl FnOnce(input::KeyEvent) + 'static,
 ) -> eyre::Result<()> {
     let key_event = KeyEvent {
         event_type: match event.action {
-            window::KeyAction::Up => KeyEventType::Up,
-            window::KeyAction::Down => KeyEventType::Down,
-            window::KeyAction::Repeat => KeyEventType::Repeat,
+            input::KeyAction::Up => KeyEventType::Up,
+            input::KeyAction::Down => KeyEventType::Down,
+            input::KeyAction::Repeat => KeyEventType::Repeat,
         },
         synthesized: false,
         character: event.character.clone(),
@@ -71,8 +72,8 @@ fn send_embedder_key_event(
 
 fn send_channel_key_event(
     engine: &FlutterEngine,
-    event: window::KeyEvent,
-    next_handler: impl FnOnce(window::KeyEvent) + 'static,
+    event: input::KeyEvent,
+    next_handler: impl FnOnce(input::KeyEvent) + 'static,
 ) -> eyre::Result<()> {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
@@ -107,9 +108,9 @@ fn send_channel_key_event(
     let message = Message {
         keymap: "windows",
         event_type: match event.action {
-            window::KeyAction::Up => "keyup",
-            window::KeyAction::Down => "keydown",
-            window::KeyAction::Repeat => "keydown",
+            input::KeyAction::Up => "keyup",
+            input::KeyAction::Down => "keydown",
+            input::KeyAction::Repeat => "keydown",
         },
         character_code_point: character,
         key_code: event.logical,

@@ -39,9 +39,6 @@ impl EglDevice {
             bail!("failed to create angle device");
         }
 
-        // let attribs = [egl::NONE as egl::Attrib];
-        // unsafe { eglDebugMessageControlKHR(debug_callback, attribs.as_ptr()) };
-
         let display = unsafe {
             egl.get_platform_display(EGL_PLATFORM_DEVICE_EXT, angle_device, &[egl::ATTRIB_NONE])?
         };
@@ -163,18 +160,6 @@ impl Drop for EglDevice {
 }
 
 extern "C" {
-    // fn eglDebugMessageControlKHR(
-    //     callback: extern "C" fn(
-    //         error: egl::Enum,
-    //         command: *const std::ffi::c_char,
-    //         message_type: egl::Int,
-    //         thread_label: *const c_void,
-    //         object_label: *const c_void,
-    //         message: *const std::ffi::c_char,
-    //     ),
-    //     attribs: *const egl::Attrib,
-    // ) -> egl::Int;
-
     fn eglCreateDeviceANGLE(
         device_type: egl::Int,
         native_device: *mut c_void,
@@ -183,17 +168,3 @@ extern "C" {
 
     fn eglReleaseDeviceANGLE(device: *mut c_void);
 }
-
-// extern "C" fn debug_callback(
-//     error: egl::Enum,
-//     command: *const std::ffi::c_char,
-//     message_type: egl::Int,
-//     thread_label: *const c_void,
-//     object_label: *const c_void,
-//     message: *const std::ffi::c_char,
-// ) {
-//     use std::ffi::CStr;
-//     let message = unsafe { CStr::from_ptr(message) };
-//     let message = message.to_str().unwrap_or("invalid");
-//     tracing::debug!("{message}");
-// }

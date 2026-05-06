@@ -27,7 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::engine::FlutterEngine;
 
 #[derive(Debug)]
-pub struct Task(u64, FlutterTask);
+pub struct Task(pub u64, pub FlutterTask);
 
 pub struct FlutterTaskRunner<F> {
     main_thread_id: ThreadId,

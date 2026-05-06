@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 use std::ffi::{c_char, c_void, CStr};
 use std::mem;
 use std::rc::Rc;

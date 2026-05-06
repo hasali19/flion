@@ -24,7 +24,7 @@ tracing = "0.1"
 windows-numerics = "0.1.1"
 winit = "0.29"
 
-[dependencies.windows]
+[target.'cfg(windows)'.dependencies.windows]
 version = "0.60"
 features = [
     "Win32_Foundation",

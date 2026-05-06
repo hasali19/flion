@@ -42,9 +42,12 @@ use flutter_embedder::{
 use parking_lot::Mutex;
 use smol_str::SmolStr;
 
-use crate::compositor::FlutterCompositor;
-use crate::egl::EglDevice;
-use crate::task_runner::{self, FlutterTaskRunner, Task};
+#[cfg(windows)]
+use crate::platform::windows::compositor::FlutterCompositor;
+#[cfg(windows)]
+use crate::platform::windows::egl::EglDevice;
+#[cfg(windows)]
+use crate::platform::windows::task_runner::{self, FlutterTaskRunner, Task};
 
 pub struct FlutterEngineConfig<'a> {
     pub assets_path: &'a str,
