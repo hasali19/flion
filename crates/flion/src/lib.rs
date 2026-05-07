@@ -1,19 +1,8 @@
 #![feature(default_field_values, let_chains)]
 
-mod compositor;
-mod egl;
 mod engine;
 mod error_utils;
-mod keyboard;
-mod keymap;
-mod mouse_cursor;
-mod platform_views;
-mod plugins_shim;
-mod settings;
-mod task_runner;
-mod text_input;
-mod views;
-mod window;
+pub mod platform;
 
 pub mod codec;
 pub mod standard_method_channel;
@@ -30,12 +19,15 @@ use std::{env, mem};
 use engine::{PointerButtons, PointerDeviceKind, PointerEvent};
 use eyre::OptionExt;
 use parking_lot::Mutex;
-use platform_views::{PlatformViewFactory, PlatformViewsMessageHandler};
-use plugins_shim::FlutterPluginsEngine;
+use platform::windows::platform_views::{PlatformViewFactory, PlatformViewsMessageHandler};
+use platform::windows::plugins_shim::FlutterPluginsEngine;
+use platform::windows::task_runner::{FlutterTaskExecutor, FlutterTaskQueue};
+use platform::windows::views::ViewManager;
+use platform::windows::window::{
+    KeyEvent as WindowKeyEvent, MouseAction, MouseEvent, TouchAction, TouchEvent, Window,
+    WindowHandler,
+};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use task_runner::{FlutterTaskExecutor, FlutterTaskQueue};
-use views::ViewManager;
-use window::{MouseAction, Window, WindowHandler};
 use windows::core::Interface;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
@@ -52,16 +44,18 @@ use winit::event_loop::EventLoopBuilder;
 use winit::platform::windows::WindowBuilderExtWindows;
 use winit::window::WindowBuilder;
 
-use crate::compositor::FlutterCompositor;
-use crate::egl::EglDevice;
 use crate::engine::{FlutterEngine, FlutterEngineConfig, PointerPhase};
 use crate::error_utils::ResultExt;
-use crate::keyboard::Keyboard;
-use crate::mouse_cursor::MouseCursorHandler;
-use crate::text_input::{TextInputHandler, TextInputState};
+use crate::platform::windows::compositor::{CompositionHandler as CompositorHandler, FlutterCompositor};
+use crate::platform::windows::egl::EglDevice;
+use crate::platform::windows::keyboard::Keyboard;
+use crate::platform::windows::mouse_cursor::MouseCursorHandler;
+use crate::platform::windows::text_input::{TextInputHandler, TextInputState};
 
 pub use crate::engine::{BinaryMessageHandler, BinaryMessageReply, BinaryMessenger};
-pub use crate::platform_views::{CompositorContext, PlatformView, PlatformViewUpdateArgs};
+pub use crate::platform::windows::platform_views::{
+    CompositorContext, PlatformView, PlatformViewUpdateArgs,
+};
 
 #[doc(hidden)]
 pub use ::linkme;
@@ -204,7 +198,7 @@ impl<'a> FlionAppBuilder<'a> {
 
         task_executor.init(engine.clone());
 
-        settings::send_to_engine(&engine)?;
+        platform::windows::settings::send_to_engine(&engine)?;
 
         Ok(FlionApp {
             engine,
@@ -386,7 +380,7 @@ impl WindowHandler for FlutterWindowHandler {
         }
     }
 
-    fn on_mouse_event(&self, event: window::MouseEvent) {
+    fn on_mouse_event(&self, event: MouseEvent) {
         if event.action == MouseAction::Scroll {
             let _ = self
                 .engine
@@ -397,18 +391,18 @@ impl WindowHandler for FlutterWindowHandler {
                 device_kind: PointerDeviceKind::Mouse,
                 device_id: 1,
                 phase: match event.action {
-                    window::MouseAction::Enter => PointerPhase::Add,
-                    window::MouseAction::Exit => PointerPhase::Remove,
-                    window::MouseAction::Move => {
+                    MouseAction::Enter => PointerPhase::Add,
+                    MouseAction::Exit => PointerPhase::Remove,
+                    MouseAction::Move => {
                         if event.buttons.is_empty() {
                             PointerPhase::Hover
                         } else {
                             PointerPhase::Move
                         }
                     }
-                    window::MouseAction::Down => PointerPhase::Down,
-                    window::MouseAction::Up => PointerPhase::Up,
-                    window::MouseAction::Scroll => unreachable!(),
+                    MouseAction::Down => PointerPhase::Down,
+                    MouseAction::Up => PointerPhase::Up,
+                    MouseAction::Scroll => unreachable!(),
                 },
                 x: event.x,
                 y: event.y,
@@ -419,11 +413,11 @@ impl WindowHandler for FlutterWindowHandler {
         }
     }
 
-    fn on_touch_event(&self, event: window::TouchEvent) {
+    fn on_touch_event(&self, event: TouchEvent) {
         let phases: &[PointerPhase] = match event.action {
-            window::TouchAction::Down => &[PointerPhase::Add, PointerPhase::Down],
-            window::TouchAction::Up => &[PointerPhase::Up, PointerPhase::Remove],
-            window::TouchAction::Move => &[PointerPhase::Move],
+            TouchAction::Down => &[PointerPhase::Add, PointerPhase::Down],
+            TouchAction::Up => &[PointerPhase::Up, PointerPhase::Remove],
+            TouchAction::Move => &[PointerPhase::Move],
         };
 
         for &phase in phases {
@@ -441,7 +435,7 @@ impl WindowHandler for FlutterWindowHandler {
         }
     }
 
-    fn on_key_event(&self, event: window::KeyEvent) {
+    fn on_key_event(&self, event: WindowKeyEvent) {
         let _ = self.keyboard.handle_event(event).trace_err();
     }
 }
@@ -454,7 +448,7 @@ struct CompositionHandler {
 
 unsafe impl Send for CompositionHandler {}
 
-impl compositor::CompositionHandler for CompositionHandler {
+impl CompositorHandler for CompositionHandler {
     fn get_surface_size(&mut self) -> eyre::Result<(u32, u32)> {
         let views = self.view_manager.lock();
         let surface = views.get(0).ok_or_eyre("View not found")?;

@@ -6,7 +6,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::codec::EncodableValue;
 use crate::standard_method_channel::{StandardMethodHandler, StandardMethodReply};
-use crate::window::Window;
+use super::window::Window;
 
 pub struct MouseCursorHandler {
     window: Weak<Window>,

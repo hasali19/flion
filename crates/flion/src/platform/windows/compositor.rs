@@ -27,9 +27,9 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
 use windows_numerics::Matrix3x2;
 
-use crate::egl::EglDevice;
-use crate::platform_views::{PlatformViewUpdateArgs, PlatformViews};
-use crate::views::ViewManager;
+use super::egl::EglDevice;
+use super::platform_views::{PlatformViewUpdateArgs, PlatformViews};
+use super::views::ViewManager;
 
 pub trait CompositionHandler: Send {
     /// Returns the current size of the rendering area.

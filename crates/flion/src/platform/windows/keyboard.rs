@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::{FlutterEngine, KeyEvent, KeyEventType};
 use crate::error_utils::ResultExt;
-use crate::text_input::TextInputState;
-use crate::{keymap, window};
+use super::text_input::TextInputState;
+use super::{keymap, window};
 
 pub struct Keyboard {
     engine: Rc<FlutterEngine>,
