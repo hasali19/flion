@@ -65,13 +65,6 @@ pub use ::linkme;
 #[linkme::distributed_slice]
 pub static PLUGINS: [unsafe extern "C" fn(*mut c_void)];
 
-#[macro_export]
-macro_rules! include_plugins {
-    () => {
-        include!(concat!(env!("OUT_DIR"), "/plugin_registrant.rs"));
-    };
-}
-
 pub struct FlionAppBuilder<'a> {
     bundle_path: PathBuf,
     platform_message_handlers: Vec<(&'a str, Box<dyn BinaryMessageHandler>)>,
