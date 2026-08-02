@@ -1,7 +1,7 @@
 use std::io::{Cursor, Write};
 
 use crate::codec::{self, EncodableValue};
-use crate::engine::{BinaryMessageHandler, BinaryMessageReply};
+use crate::messaging::{BinaryMessageHandler, BinaryMessageReply};
 
 pub trait StandardMethodHandler {
     fn handle(&self, method: &str, args: EncodableValue, reply: StandardMethodReply);

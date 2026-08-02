@@ -18,7 +18,7 @@ use flutter_embedder::{
     FlutterEngineScheduleFrame, FlutterEngineSendKeyEvent, FlutterEngineSendPlatformMessage,
     FlutterEngineSendPlatformMessageResponse, FlutterEngineSendPointerEvent,
     FlutterEngineSendWindowMetricsEvent, FlutterEngineShutdown, FlutterKeyEvent,
-    FlutterKeyEventDeviceType_kFlutterKeyEventDeviceTypeKeyboard,
+    FlutterKeyEventDeviceType_kFlutterKeyEventDeviceTypeKeyboard, FlutterKeyEventType,
     FlutterKeyEventType_kFlutterKeyEventTypeDown, FlutterKeyEventType_kFlutterKeyEventTypeRepeat,
     FlutterKeyEventType_kFlutterKeyEventTypeUp, FlutterLayer, FlutterOpenGLRendererConfig,
     FlutterPlatformMessage, FlutterPlatformMessageCreateResponseHandle,
@@ -72,7 +72,7 @@ struct FlutterEngineInner {
 }
 
 #[derive(Clone, Copy, Default)]
-#[repr(i32)]
+#[repr(u32)]
 pub enum PointerDeviceKind {
     #[default]
     Unknown = 0,
@@ -85,7 +85,7 @@ pub enum PointerDeviceKind {
 }
 
 #[derive(Clone, Copy, Default, Debug)]
-#[repr(i32)]
+#[repr(u32)]
 pub enum PointerPhase {
     #[default]
     Unknown = 0,
@@ -119,7 +119,7 @@ pub struct PointerEvent {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[repr(i32)]
+#[repr(u32)]
 pub enum KeyEventType {
     Up = FlutterKeyEventType_kFlutterKeyEventTypeUp,
     Down = FlutterKeyEventType_kFlutterKeyEventTypeDown,
@@ -351,7 +351,7 @@ impl FlutterEngine {
         let event = FlutterKeyEvent {
             struct_size: mem::size_of::<FlutterKeyEvent>(),
             timestamp: unsafe { FlutterEngineGetCurrentTime() as f64 },
-            type_: event.event_type as i32,
+            type_: event.event_type as FlutterKeyEventType,
             character: event
                 .character
                 .as_deref()

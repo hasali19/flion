@@ -1,3 +1,5 @@
+mod messaging;
+
 pub mod codec;
 pub mod standard_method_channel;
 
