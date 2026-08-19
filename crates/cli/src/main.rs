@@ -159,6 +159,8 @@ fn main() -> eyre::Result<()> {
 
     let embedder_path = engine_artifacts_dir.join(build_target.embedder_name(build_mode));
 
+    tracing::info!("embedder_path: {embedder_path:?}");
+
     let angle_path = flion_build_dir.join("angle-win64");
 
     let cargo_cmd = if run { "run" } else { "build" };

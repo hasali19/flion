@@ -1,26 +1,23 @@
-mod app;
-mod messaging;
+use std::marker::PhantomData;
 
-pub mod codec;
-pub mod standard_method_channel;
-
-#[cfg(target_os = "windows")]
-mod windows;
-
-#[cfg(target_os = "windows")]
-pub use windows::*;
-
-#[cfg(target_os = "linux")]
-mod linux;
-#[cfg(target_os = "linux")]
-pub use linux::*;
-
-#[macro_export]
-macro_rules! include_plugins {
-    () => {
-        #[cfg(target_os = "windows")]
-        include!(concat!(env!("OUT_DIR"), "/plugin_registrant.rs"));
-    };
+pub struct FlionAppBuilder<'a> {
+    _p: PhantomData<&'a ()>,
 }
 
-pub use app::{FlionApp, FlionAppBuilder};
+impl<'a> FlionAppBuilder<'a> {
+    pub fn build(self) -> eyre::Result<FlionApp> {
+        Ok(FlionApp)
+    }
+}
+
+pub struct FlionApp;
+
+impl FlionApp {
+    pub fn builder<'a>() -> FlionAppBuilder<'a> {
+        FlionAppBuilder { _p: PhantomData }
+    }
+
+    pub fn run_event_loop(self) -> eyre::Result<()> {
+        todo!()
+    }
+}
