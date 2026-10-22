@@ -7,9 +7,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Ok(embedder_path) = env::var("FLUTTER_EMBEDDER_PATH") {
         let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
 
+        println!("cargo::rustc-link-search=native={embedder_path}");
+
         if target_os == "windows" {
-            println!("cargo::rustc-link-search=native={embedder_path}");
             println!("cargo::rustc-link-lib=dylib=flutter_engine.dll");
+        } else {
+            println!("cargo::rustc-link-lib=dylib=flutter_engine");
         }
     }
 

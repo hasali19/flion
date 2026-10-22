@@ -1,18 +1,22 @@
+mod compositor;
 mod egl;
+mod engine;
 
+use std::env;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
-use gl::COLOR_BUFFER_BIT;
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
-use wayland_client::backend::{Backend, ObjectId};
-use wayland_client::protocol::wl_surface::WlSurface;
-use wayland_client::{Connection, Proxy};
+use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+use wayland_client::Connection;
+use wayland_client::backend::Backend;
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent::{self, CloseRequested};
+use winit::event::WindowEvent;
 use winit::event_loop::EventLoop;
 use winit::window::{Window, WindowAttributes};
 
-use crate::egl::{EglContext, EglSurface};
+use crate::compositor::OpenGLCompositor;
+use crate::egl::EglDisplay;
+use crate::engine::{FlutterEngine, FlutterEngineConfig};
 
 pub struct FlionAppBuilder<'a> {
     _p: PhantomData<&'a ()>,
@@ -44,13 +48,13 @@ impl FlionApp {
 
 #[derive(Default)]
 struct AppState {
-    egl: Option<EglContext>,
+    display: Option<EglDisplay>,
     main_window: Option<WindowState>,
 }
 
 struct WindowState {
-    window: Window,
-    egl_surface: EglSurface,
+    window: Arc<Window>,
+    engine: FlutterEngine,
 }
 
 impl ApplicationHandler for AppState {
@@ -67,53 +71,35 @@ impl ApplicationHandler for AppState {
             ))
         };
 
-        let egl = EglContext::new(&connection).unwrap();
+        let egl = EglDisplay::for_wayland_connection(&connection).unwrap();
 
-        let window = event_loop
-            .create_window(WindowAttributes::default())
-            .unwrap();
-
-        let RawWindowHandle::Wayland(window_handle) = window.window_handle().unwrap().as_raw()
-        else {
-            todo!()
-        };
-
-        let wl_surface = unsafe {
-            WlSurface::from_id(
-                &connection,
-                ObjectId::from_ptr(
-                    WlSurface::interface(),
-                    window_handle.surface.as_ptr().cast(),
-                )
+        let window = Arc::new(
+            event_loop
+                .create_window(WindowAttributes::default())
                 .unwrap(),
-            )
-            .unwrap()
-        };
+        );
 
+        let size = window.inner_size();
         let surface = egl
-            .create_surface(
-                &wl_surface,
-                window.inner_size().width,
-                window.inner_size().height,
-            )
+            .create_window_surface(window.clone(), size.width, size.height)
             .unwrap();
+
+        let engine = FlutterEngine::new(FlutterEngineConfig {
+            assets_path: &env::var("FLION_ASSETS_PATH").unwrap(),
+            aot_library_path: None,
+            compositor: OpenGLCompositor::new(egl.clone(), surface).unwrap(),
+        })
+        .unwrap();
 
         *self = AppState {
-            egl: Some(egl),
-            main_window: Some(WindowState {
-                window,
-                egl_surface: surface,
-            }),
+            display: Some(egl),
+            main_window: Some(WindowState { window, engine }),
         };
     }
 
     fn suspended(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        let egl = self.egl.take();
-        if let Some(window) = self.main_window.take()
-            && let Some(egl) = egl
-        {
-            egl.destroy_surface(window.egl_surface).unwrap();
-        }
+        drop(self.main_window.take());
+        drop(self.display.take());
     }
 
     fn window_event(
@@ -135,18 +121,18 @@ impl ApplicationHandler for AppState {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
-                main_window.egl_surface.resize(size.width, size.height);
-
-                let Some(egl) = &self.egl else { return };
-
-                egl.make_current(&main_window.egl_surface).unwrap();
-
-                unsafe {
-                    gl::ClearColor(1.0, 0.0, 0.0, 1.0);
-                    gl::Clear(COLOR_BUFFER_BIT);
-                }
-
-                egl.swap_buffers(&main_window.egl_surface).unwrap();
+                let scale_factor = main_window.window.scale_factor();
+                main_window
+                    .engine
+                    .send_window_metrics_event(size.width as _, size.height as _, scale_factor)
+                    .unwrap();
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                let size = main_window.window.inner_size();
+                main_window
+                    .engine
+                    .send_window_metrics_event(size.width as _, size.height as _, scale_factor)
+                    .unwrap();
             }
             _ => {}
         }

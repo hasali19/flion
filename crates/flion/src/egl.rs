@@ -1,44 +1,51 @@
-use std::cell::Cell;
 use std::ffi::c_void;
 
 use khronos_egl as egl;
-use wayland_client::protocol::wl_surface::WlSurface;
-use wayland_client::{Connection, Proxy};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use wayland_client::Connection;
 use wayland_egl::WlEglSurface;
 
-pub struct EglContext {
+#[derive(Clone)]
+pub struct EglDisplay {
     display: egl::Display,
-    config: egl::Config,
-    context: egl::Context,
-    gl_loaded: Cell<bool>,
 }
 
-pub struct EglSurface {
-    surface: egl::Surface,
-    wl_egl_surface: WlEglSurface,
-}
+unsafe impl Send for EglDisplay {}
 
-impl EglSurface {
-    pub fn resize(&self, width: u32, height: u32) {
-        self.wl_egl_surface
-            .resize(width as i32, height as i32, 0, 0);
-    }
-}
+unsafe impl Sync for EglDisplay {}
 
-static EGL: egl::Instance<egl::Static> = egl::Instance::new(egl::Static);
-
-impl EglContext {
-    pub fn new(conn: &Connection) -> eyre::Result<Self> {
+impl EglDisplay {
+    pub fn for_wayland_connection(conn: &Connection) -> eyre::Result<Self> {
+        // FIXME: Probably unsound?
         let display = unsafe { EGL.get_display(conn.backend().display_ptr() as *mut c_void) }
             .ok_or_else(|| eyre::eyre!("failed to get EGL display"))?;
 
+        // TODO: Call eglTerminate somwhere?
+
         EGL.initialize(display)?;
 
+        gl::load_with(|name| {
+            EGL.get_proc_address(name)
+                .map_or(std::ptr::null(), |f| f as *const c_void)
+        });
+
+        Ok(EglDisplay { display })
+    }
+
+    pub fn get_proc_address(&self, name: &str) -> Option<extern "system" fn()> {
+        EGL.get_proc_address(name)
+    }
+
+    pub fn create_context(&self) -> eyre::Result<EglContext> {
+        self.create_context_impl(None)
+    }
+
+    pub fn create_shared_context(&self, share_context: &EglContext) -> eyre::Result<EglContext> {
+        self.create_context_impl(Some(share_context))
+    }
+
+    fn create_context_impl(&self, share_context: Option<&EglContext>) -> eyre::Result<EglContext> {
         let config_attribs = [
-            egl::SURFACE_TYPE,
-            egl::WINDOW_BIT,
-            egl::RENDERABLE_TYPE,
-            egl::OPENGL_BIT,
             egl::RED_SIZE,
             8,
             egl::GREEN_SIZE,
@@ -51,73 +58,79 @@ impl EglContext {
         ];
 
         let config = EGL
-            .choose_first_config(display, &config_attribs)?
+            .choose_first_config(self.display, &config_attribs)?
             .ok_or_else(|| eyre::eyre!("failed to find a suitable EGL configuration"))?;
 
-        EGL.bind_api(egl::OPENGL_API)?;
+        let context_attribs = [egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE];
 
-        let context_attribs = [
-            egl::CONTEXT_MAJOR_VERSION,
-            4,
-            egl::CONTEXT_MINOR_VERSION,
-            5,
-            egl::CONTEXT_OPENGL_PROFILE_MASK,
-            egl::CONTEXT_OPENGL_CORE_PROFILE_BIT,
-            egl::NONE,
-        ];
-
-        let context = EGL.create_context(display, config, None, &context_attribs)?;
-
-        Ok(Self {
-            display,
+        let context = EGL.create_context(
+            self.display,
             config,
+            share_context.map(|c| c.context),
+            &context_attribs,
+        )?;
+
+        Ok(EglContext {
+            display: self.clone(),
             context,
-            gl_loaded: Cell::new(false),
         })
     }
 
-    pub fn create_surface(
+    pub fn create_window_surface(
         &self,
-        surface: &WlSurface,
+        window: impl HasWindowHandle + Send + Sync + 'static,
         width: u32,
         height: u32,
     ) -> eyre::Result<EglSurface> {
-        let wl_egl_surface = WlEglSurface::new(surface.id(), width as i32, height as i32)?;
+        let config_attribs = [
+            egl::RED_SIZE,
+            8,
+            egl::GREEN_SIZE,
+            8,
+            egl::BLUE_SIZE,
+            8,
+            egl::ALPHA_SIZE,
+            8,
+            egl::NONE,
+        ];
+
+        let config = EGL
+            .choose_first_config(self.display, &config_attribs)?
+            .ok_or_else(|| eyre::eyre!("failed to find a suitable EGL configuration"))?;
+
+        let RawWindowHandle::Wayland(handle) = window.window_handle()?.as_raw() else {
+            eyre::bail!("unsupported window handle");
+        };
+
+        let wl_egl_surface = unsafe {
+            WlEglSurface::new_from_raw(handle.surface.as_ptr().cast(), width as i32, height as i32)
+        }?;
 
         let egl_surface = unsafe {
             EGL.create_window_surface(
                 self.display,
-                self.config,
+                config,
                 wl_egl_surface.ptr() as egl::NativeWindowType,
                 None,
             )
         }?;
 
         Ok(EglSurface {
+            display: self.clone(),
             surface: egl_surface,
             wl_egl_surface,
+            _window: Box::new(window),
         })
     }
 
-    pub fn destroy_surface(&self, surface: EglSurface) -> eyre::Result<()> {
-        EGL.destroy_surface(self.display, surface.surface)?;
-        Ok(())
-    }
+    pub fn make_current(
+        &self,
+        context: Option<&EglContext>,
+        surface: Option<&EglSurface>,
+    ) -> eyre::Result<()> {
+        let surface = surface.map(|s| s.surface);
 
-    pub fn make_current(&self, surface: &EglSurface) -> eyre::Result<()> {
-        EGL.make_current(
-            self.display,
-            Some(surface.surface),
-            Some(surface.surface),
-            Some(self.context),
-        )?;
-
-        if !self.gl_loaded.replace(true) {
-            gl::load_with(|name| {
-                EGL.get_proc_address(name)
-                    .map_or(std::ptr::null(), |f| f as *const c_void)
-            });
-        }
+        EGL.make_current(self.display, surface, surface, context.map(|c| c.context))?;
 
         Ok(())
     }
@@ -125,5 +138,55 @@ impl EglContext {
     pub fn swap_buffers(&self, surface: &EglSurface) -> eyre::Result<()> {
         EGL.swap_buffers(self.display, surface.surface)?;
         Ok(())
+    }
+}
+
+pub struct EglContext {
+    display: EglDisplay,
+    context: egl::Context,
+}
+
+pub struct EglSurface {
+    display: EglDisplay,
+    surface: egl::Surface,
+    wl_egl_surface: WlEglSurface,
+    _window: Box<dyn HasWindowHandle + Send + Sync>,
+}
+
+impl EglSurface {
+    pub fn resize(&self, width: u32, height: u32) {
+        self.wl_egl_surface
+            .resize(width as i32, height as i32, 0, 0);
+    }
+}
+
+impl Drop for EglSurface {
+    fn drop(&mut self) {
+        if let Err(e) = EGL.destroy_surface(self.display.display, self.surface) {
+            tracing::error!("failed to destroy EGL surface: {e}");
+        }
+    }
+}
+
+static EGL: egl::Instance<egl::Static> = egl::Instance::new(egl::Static);
+
+impl EglContext {
+    pub fn make_current(&self) -> eyre::Result<()> {
+        EGL.make_current(
+            self.display.display,
+            EGL.get_current_surface(egl::DRAW),
+            EGL.get_current_surface(egl::READ),
+            Some(self.context),
+        )?;
+
+        Ok(())
+    }
+}
+
+impl Drop for EglContext {
+    fn drop(&mut self) {
+        if let Err(e) = EGL.destroy_context(self.display.display, self.context) {
+            tracing::error!("failed to destroy EGL context: {e}");
+        }
     }
 }
