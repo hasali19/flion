@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fmt::Write;
 use std::fs::File;
 use std::io::{self, BufWriter, Cursor};
@@ -364,14 +365,17 @@ fn flutter_build(
     cmd!(flutter_path, "build", "bundle").run()?;
 
     if build_mode == BuildMode::Release {
-        if build_target != BuildTarget::Windows {
-            todo!()
-        }
+        let exe_suffix = env::consts::EXE_SUFFIX;
 
         let dartaotruntime = flutter_path
             .parent()
             .unwrap()
-            .join("cache/dart-sdk/bin/dartaotruntime.exe");
+            .join(format!("cache/dart-sdk/bin/dartaotruntime{exe_suffix}"));
+
+        let target_os = match build_target {
+            BuildTarget::Linux => "linux",
+            BuildTarget::Windows => "windows",
+        };
 
         let frontend_server_snapshot = engine_artifacts_dir
             .join("artifacts")
@@ -404,45 +408,52 @@ fn flutter_build(
             .join("flutter_build")
             .join("dart_plugin_registrant.dart");
 
-        let d_dart_plugin_registrant = format!(
-            "-Dflutter.dart_plugin_registrant=file:///{}",
-            dart_plugin_registrant_path
-                .to_str()
-                .unwrap()
-                .replace("\\", "/"),
-        );
+        let mut args: Vec<OsString> = vec![
+            frontend_server_snapshot.into(),
+            "--sdk-root".into(),
+            sdk_root.into(),
+            "--target=flutter".into(),
+            "--no-print-incremental-dependencies".into(),
+            "-Ddart.vm.profile=false".into(),
+            "-Ddart.vm.product=true".into(),
+            "--delete-tostring-package-uri=dart:ui".into(),
+            "--delete-tostring-package-uri=package:flutter".into(),
+            "--aot".into(),
+            "--tfa".into(),
+            "--target-os".into(),
+            target_os.into(),
+            "--packages".into(),
+            package_config_path.into(),
+            "--output-dill".into(),
+            build_dir.join("kernel_snapshot.dill").into(),
+        ];
 
-        cmd!(
-            dartaotruntime,
-            frontend_server_snapshot,
-            "--sdk-root",
-            sdk_root,
-            "--target=flutter",
-            "--no-print-incremental-dependencies",
-            "-Ddart.vm.profile=false",
-            "-Ddart.vm.product=true",
-            "--delete-tostring-package-uri=dart:ui",
-            "--delete-tostring-package-uri=package:flutter",
-            "--aot",
-            "--tfa",
-            "--target-os",
-            "windows",
-            "--packages",
-            package_config_path,
-            "--output-dill",
-            build_dir.join("kernel_snapshot.dill"),
-            "--source",
-            dart_plugin_registrant_path,
-            "--source",
-            "package:flutter/src/dart_plugin_registrant.dart",
-            d_dart_plugin_registrant,
-            flutter_project_dir.join("lib").join("main.dart"),
-        )
-        .run()?;
+        if dart_plugin_registrant_path.exists() {
+            let d_dart_plugin_registrant = format!(
+                "-Dflutter.dart_plugin_registrant=file:///{}",
+                dart_plugin_registrant_path
+                    .to_str()
+                    .unwrap()
+                    .replace("\\", "/")
+                    .trim_start_matches('/'),
+            );
+
+            args.extend([
+                "--source".into(),
+                dart_plugin_registrant_path.into(),
+                "--source".into(),
+                "package:flutter/src/dart_plugin_registrant.dart".into(),
+                d_dart_plugin_registrant.into(),
+            ]);
+        }
+
+        args.push(flutter_project_dir.join("lib").join("main.dart").into());
+
+        duct::cmd(dartaotruntime, args).run()?;
 
         let gen_snapshot = engine_artifacts_dir
-            .join("windows-x64-embedder-release")
-            .join("gen_snapshot.exe");
+            .join(build_target.embedder_name(BuildMode::Release))
+            .join(format!("gen_snapshot{exe_suffix}"));
 
         tracing::info!("building aot library");
 

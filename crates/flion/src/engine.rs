@@ -1,12 +1,17 @@
 use std::ffi::{CStr, CString, c_char, c_void};
+use std::path::Path;
+use std::str::FromStr;
 use std::thread::{self, ThreadId};
 use std::{mem, ptr};
 
 use eyre::{Context, bail};
 use flutter_embedder::{
-    FlutterBackingStore, FlutterBackingStoreConfig, FlutterCustomTaskRunners,
-    FlutterEngineInitialize, FlutterEngineResult_kSuccess, FlutterEngineRunInitialized,
-    FlutterEngineRunTask, FlutterEngineSendWindowMetricsEvent, FlutterEngineShutdown, FlutterLayer,
+    FlutterBackingStore, FlutterBackingStoreConfig, FlutterCustomTaskRunners, FlutterEngineAOTData,
+    FlutterEngineAOTDataSource, FlutterEngineAOTDataSource__bindgen_ty_1,
+    FlutterEngineAOTDataSourceType_kFlutterEngineAOTDataSourceTypeElfPath,
+    FlutterEngineCreateAOTData, FlutterEngineInitialize, FlutterEngineResult_kSuccess,
+    FlutterEngineRunInitialized, FlutterEngineRunTask, FlutterEngineRunsAOTCompiledDartCode,
+    FlutterEngineSendWindowMetricsEvent, FlutterEngineShutdown, FlutterLayer,
     FlutterOpenGLRendererConfig, FlutterPresentViewInfo, FlutterProjectArgs, FlutterRendererConfig,
     FlutterRendererConfig__bindgen_ty_1, FlutterRendererType_kOpenGL, FlutterTaskRunnerDescription,
     FlutterWindowMetricsEvent,
@@ -84,11 +89,13 @@ impl FlutterEngine {
         }));
 
         let assets_path = CString::new(config.assets_path)?;
+        let aot_data = load_aot_data(config.aot_library_path)?.unwrap_or(ptr::null_mut());
 
         let project_args = FlutterProjectArgs {
             struct_size: mem::size_of::<FlutterProjectArgs>(),
             assets_path: assets_path.as_ptr(),
             icu_data_path: c"icudtl.dat".as_ptr(),
+            aot_data,
             log_message_callback: Some(log_message),
             compositor: &flutter_embedder::FlutterCompositor {
                 struct_size: mem::size_of::<flutter_embedder::FlutterCompositor>(),
@@ -112,13 +119,17 @@ impl FlutterEngine {
         let engine = unsafe {
             let mut engine_ptr = ptr::null_mut();
 
-            FlutterEngineInitialize(
+            let result = FlutterEngineInitialize(
                 FLUTTER_ENGINE_VERSION,
                 &renderer_config,
                 &project_args,
                 engine_state.cast(),
                 &mut engine_ptr,
             );
+
+            if result != FlutterEngineResult_kSuccess || engine_ptr.is_null() {
+                panic!("could not run the flutter engine");
+            }
 
             engine_ptr
         };
@@ -189,6 +200,39 @@ impl Drop for FlutterEngine {
             drop(Box::from_raw(self.inner));
         }
     }
+}
+
+fn load_aot_data(path: Option<&str>) -> eyre::Result<Option<FlutterEngineAOTData>> {
+    if !unsafe { FlutterEngineRunsAOTCompiledDartCode() } {
+        tracing::debug!("Engine does not support AOT dart code");
+        return Ok(None);
+    }
+
+    let Some(path) = path else {
+        bail!("No AOT library path was provided");
+    };
+
+    if !Path::new(path).exists() {
+        bail!("AOT library not found at {path}");
+    }
+
+    let c_path = CString::from_str(path)?;
+    let source = FlutterEngineAOTDataSource {
+        type_: FlutterEngineAOTDataSourceType_kFlutterEngineAOTDataSourceTypeElfPath,
+        __bindgen_anon_1: FlutterEngineAOTDataSource__bindgen_ty_1 {
+            elf_path: c_path.as_ptr(),
+        },
+    };
+
+    let mut aot_data = ptr::null_mut();
+    if unsafe { FlutterEngineCreateAOTData(&source, &mut aot_data) } != FlutterEngineResult_kSuccess
+    {
+        bail!("Failed to load AOT data from {path}");
+    }
+
+    tracing::info!("Loaded AOT data from {path}");
+
+    Ok(Some(aot_data))
 }
 
 fn create_task_runner<F: Fn(FlutterTask) + 'static>(

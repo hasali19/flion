@@ -5,6 +5,7 @@ mod task_queue;
 
 use std::env;
 use std::marker::PhantomData;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
@@ -91,9 +92,11 @@ impl ApplicationHandler<FlutterTask> for AppState {
             .create_window_surface(window.clone(), size.width, size.height)
             .unwrap();
 
+        let aot_library_path = env::var("FLION_AOT_LIBRARY_PATH").map(PathBuf::from).ok();
+
         let engine = FlutterEngine::new(FlutterEngineConfig {
             assets_path: &env::var("FLION_ASSETS_PATH").unwrap(),
-            aot_library_path: None,
+            aot_library_path: aot_library_path.as_deref().and_then(|p| p.to_str()),
             compositor: OpenGLCompositor::new(egl.clone(), surface).unwrap(),
             platform_task_handler: Box::new({
                 let proxy = self.proxy.clone();
