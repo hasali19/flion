@@ -5,26 +5,29 @@ mod engine;
 mod mouse_cursor;
 mod standard_method_channel;
 mod task_queue;
-mod window;
 
 use std::env;
 use std::marker::PhantomData;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::ptr::NonNull;
+use std::time::Instant;
 
-use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
-use wayland_client::Connection;
-use wayland_client::backend::Backend;
-use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::window::WindowAttributes;
+use calloop::EventLoop;
+use calloop_wayland_source::WaylandSource;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle, WaylandWindowHandle, WindowHandle};
+use tracing::debug;
+use wayland_client::protocol::wl_compositor::{self, WlCompositor};
+use wayland_client::protocol::wl_registry::{self, WlRegistry};
+use wayland_client::protocol::wl_seat;
+use wayland_client::protocol::wl_surface::{self, WlSurface};
+use wayland_client::{Connection, Dispatch, Proxy};
+use wayland_protocols::xdg::shell::client::xdg_wm_base::{self, XdgWmBase};
+use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel};
 
 use crate::compositor::OpenGLCompositor;
 use crate::egl::EglDisplay;
-use crate::engine::{BinaryMessageHandler, FlutterEngine, FlutterEngineConfig, FlutterTask};
-use crate::mouse_cursor::MouseCursorHandler;
-use crate::window::FlutterWindow;
+use crate::engine::{BinaryMessageHandler, FlutterEngine, FlutterEngineConfig};
+use crate::task_queue::FlutterTaskQueue;
 
 pub struct FlionAppBuilder<'a> {
     _p: PhantomData<&'a ()>,
@@ -44,51 +47,67 @@ impl FlionApp {
     }
 
     pub fn run_event_loop(self) -> eyre::Result<()> {
-        let event_loop = EventLoop::with_user_event().build()?;
+        let conn = Connection::connect_to_env()?;
 
-        let mut app = AppState {
-            proxy: event_loop.create_proxy(),
-            display: None,
-            main_window: None,
-        };
+        let (globals, event_queue) = wayland_client::globals::registry_queue_init(&conn)?;
 
-        event_loop.run_app(&mut app)?;
+        globals.contents().with_list(|globals| {
+            for global in globals {
+                let wayland_client::globals::Global {
+                    interface,
+                    name,
+                    version,
+                } = global;
 
-        Ok(())
-    }
-}
+                debug!("[{name}] {interface} (v{version})");
+            }
+        });
 
-struct AppState {
-    proxy: EventLoopProxy<FlutterTask>,
-    display: Option<EglDisplay>,
-    main_window: Option<FlutterWindow>,
-}
+        let qh = event_queue.handle();
 
-impl ApplicationHandler<FlutterTask> for AppState {
-    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        let display_handle = event_loop.display_handle().unwrap().as_raw();
+        let compositor: WlCompositor = globals.bind(&qh, 1..=4, ())?;
+        let xdg_wm_base: XdgWmBase = globals.bind(&qh, 7..=7, ())?;
 
-        let RawDisplayHandle::Wayland(display_handle) = display_handle else {
-            todo!()
-        };
+        let mut event_loop: EventLoop<'_, AppState> = EventLoop::try_new()?;
 
-        let connection = unsafe {
-            Connection::from_backend(Backend::from_foreign_display(
-                display_handle.display.as_ptr().cast(),
-            ))
-        };
+        let egl = EglDisplay::for_wayland_connection(&conn)?;
 
-        let egl = EglDisplay::for_wayland_connection(&connection).unwrap();
+        WaylandSource::new(conn, event_queue).insert(event_loop.handle())?;
 
-        let window = Arc::new(
-            event_loop
-                .create_window(WindowAttributes::default())
-                .unwrap(),
-        );
+        let surface = compositor.create_surface(&qh, ());
+        let xdg_surface = xdg_wm_base.get_xdg_surface(&surface, &qh, ());
+        let top_level = xdg_surface.get_toplevel(&qh, ());
 
-        let size = window.inner_size();
-        let surface = egl
-            .create_window_surface(window.clone(), size.width, size.height)
+        surface.commit();
+
+        struct Window(WlSurface);
+
+        impl HasWindowHandle for Window {
+            fn window_handle(
+                &self,
+            ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError>
+            {
+                Ok(unsafe {
+                    WindowHandle::borrow_raw(RawWindowHandle::Wayland(WaylandWindowHandle::new(
+                        NonNull::new_unchecked(self.0.id().as_ptr()).cast(),
+                    )))
+                })
+            }
+        }
+
+        let (task_sender, task_receiver) = calloop::channel::channel();
+
+        event_loop
+            .handle()
+            .insert_source(task_receiver, |event, _, app| {
+                if let calloop::channel::Event::Msg(task) = event {
+                    app.task_queue.push(task);
+                }
+            })
+            .unwrap();
+
+        let egl_surface = egl
+            .create_window_surface(Window(surface.clone()), 1, 1)
             .unwrap();
 
         let platform_message_handlers: Vec<(&str, Box<dyn BinaryMessageHandler>)> = vec![];
@@ -98,80 +117,182 @@ impl ApplicationHandler<FlutterTask> for AppState {
         let engine = FlutterEngine::new(FlutterEngineConfig {
             assets_path: &env::var("FLION_ASSETS_PATH").unwrap(),
             aot_library_path: aot_library_path.as_deref().and_then(|p| p.to_str()),
-            compositor: OpenGLCompositor::new(egl.clone(), surface).unwrap(),
-            platform_task_handler: Box::new({
-                let proxy = self.proxy.clone();
-                move |task| {
-                    let _ = proxy.send_event(task);
-                }
+            compositor: OpenGLCompositor::new(egl.clone(), egl_surface).unwrap(),
+            platform_task_handler: Box::new(move |task| {
+                let _ = task_sender.send(task);
             }),
             platform_message_handlers,
-        })
-        .unwrap();
+        })?;
 
-        engine.set_platform_message_handler(
-            "flutter/mousecursor",
-            MouseCursorHandler::new(Arc::downgrade(&window)),
-        );
-
-        self.display = Some(egl);
-        self.main_window = Some(FlutterWindow::new(window, engine));
-    }
-
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, task: FlutterTask) {
-        if let Some(main_window) = &mut self.main_window {
-            main_window.push_platform_task(task);
-        }
-    }
-
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(main_window) = &mut self.main_window else {
-            event_loop.set_control_flow(ControlFlow::Wait);
-            return;
+        let mut app = AppState {
+            task_queue: FlutterTaskQueue::new(),
+            engine,
+            close_requested: false,
+            window_size: (0, 0),
         };
 
-        event_loop.set_control_flow(match main_window.run_platform_tasks() {
-            Some(deadline) => ControlFlow::WaitUntil(deadline),
-            None => ControlFlow::Wait,
-        });
-    }
+        while !app.close_requested {
+            let timeout = app
+                .task_queue
+                .next_deadline()
+                .map(|deadline| deadline - Instant::now());
 
-    fn suspended(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        drop(self.main_window.take());
-        drop(self.display.take());
-    }
+            event_loop.dispatch(timeout, &mut app)?;
 
-    fn window_event(
-        &mut self,
-        event_loop: &winit::event_loop::ActiveEventLoop,
-        window_id: winit::window::WindowId,
-        event: winit::event::WindowEvent,
+            app.task_queue.run_tasks(&app.engine);
+        }
+
+        top_level.destroy();
+        xdg_surface.destroy();
+        surface.destroy();
+
+        xdg_wm_base.destroy();
+        compositor.release();
+
+        Ok(())
+    }
+}
+
+struct AppState {
+    task_queue: FlutterTaskQueue,
+    engine: FlutterEngine,
+    close_requested: bool,
+    window_size: (u32, u32),
+}
+
+impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListContents> for AppState {
+    fn event(
+        state: &mut Self,
+        proxy: &WlRegistry,
+        event: <WlRegistry as wayland_client::Proxy>::Event,
+        data: &wayland_client::globals::GlobalListContents,
+        conn: &Connection,
+        qhandle: &wayland_client::QueueHandle<Self>,
     ) {
-        let Some(main_window) = &mut self.main_window else {
-            return;
-        };
-
-        if main_window.id() != window_id {
-            return;
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
+            debug!(name, interface, version);
         }
+    }
+}
 
+impl Dispatch<wl_compositor::WlCompositor, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        proxy: &wl_compositor::WlCompositor,
+        event: <wl_compositor::WlCompositor as Proxy>::Event,
+        data: &(),
+        conn: &Connection,
+        qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        todo!()
+    }
+}
+
+impl Dispatch<wl_surface::WlSurface, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        proxy: &wl_surface::WlSurface,
+        event: <wl_surface::WlSurface as Proxy>::Event,
+        data: &(),
+        conn: &Connection,
+        qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        todo!()
+    }
+}
+
+impl Dispatch<xdg_wm_base::XdgWmBase, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        proxy: &xdg_wm_base::XdgWmBase,
+        event: <xdg_wm_base::XdgWmBase as Proxy>::Event,
+        data: &(),
+        conn: &Connection,
+        qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
         match event {
-            WindowEvent::CloseRequested => {
-                event_loop.exit();
-            }
-            WindowEvent::Resized(size) => main_window.on_resized(size),
-            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                main_window.on_scale_factor_changed(scale_factor)
-            }
-            WindowEvent::CursorEntered { .. } => main_window.on_cursor_entered(),
-            WindowEvent::CursorLeft { .. } => main_window.on_cursor_left(),
-            WindowEvent::CursorMoved { position, .. } => main_window.on_cursor_moved(position),
-            WindowEvent::MouseInput { state, button, .. } => {
-                main_window.on_mouse_input(state, button)
-            }
-            WindowEvent::MouseWheel { delta, .. } => main_window.on_mouse_wheel(delta),
-            WindowEvent::Touch(touch) => main_window.on_touch(touch),
+            xdg_wm_base::Event::Ping { serial } => proxy.pong(serial),
             _ => {}
+        }
+    }
+}
+
+impl Dispatch<xdg_surface::XdgSurface, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        proxy: &xdg_surface::XdgSurface,
+        event: <xdg_surface::XdgSurface as Proxy>::Event,
+        data: &(),
+        conn: &Connection,
+        qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        match event {
+            xdg_surface::Event::Configure { serial } => {
+                let (width, height) = state.window_size;
+
+                state
+                    .engine
+                    .send_window_metrics_event(width as usize, height as usize, 1.0)
+                    .unwrap();
+
+                proxy.ack_configure(serial);
+            }
+            _ => todo!(),
+        }
+    }
+}
+
+impl Dispatch<xdg_toplevel::XdgToplevel, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        proxy: &xdg_toplevel::XdgToplevel,
+        event: <xdg_toplevel::XdgToplevel as Proxy>::Event,
+        data: &(),
+        conn: &Connection,
+        qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        match event {
+            xdg_toplevel::Event::Configure {
+                width,
+                height,
+                states,
+            } => {
+                let width = if width == 0 { 1280 } else { width };
+                let height = if height == 0 { 800 } else { height };
+                state.window_size = (width as u32, height as u32);
+            }
+            xdg_toplevel::Event::Close => {
+                state.close_requested = true;
+            }
+            xdg_toplevel::Event::ConfigureBounds { width, height } => {}
+            xdg_toplevel::Event::WmCapabilities { capabilities } => {}
+            _ => todo!(),
+        }
+    }
+}
+
+impl Dispatch<wl_seat::WlSeat, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        proxy: &wl_seat::WlSeat,
+        event: <wl_seat::WlSeat as Proxy>::Event,
+        data: &(),
+        conn: &Connection,
+        qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        match event {
+            wl_seat::Event::Capabilities { capabilities } => {
+                debug!("Seat capabilities: {capabilities:?}");
+            }
+            wl_seat::Event::Name { name } => {
+                debug!("Seat {name}");
+            }
+            _ => todo!(),
         }
     }
 }
