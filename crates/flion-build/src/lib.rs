@@ -2,7 +2,7 @@ use std::env;
 use std::error::Error;
 use std::fmt::Write as _;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write as _};
+use std::io::{BufRead, BufReader, ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 
 pub fn generate_plugins_registrant(project_dir: &Path) -> Result<(), Box<dyn Error>> {
@@ -24,8 +24,7 @@ pub fn generate_plugins_registrant(project_dir: &Path) -> Result<(), Box<dyn Err
     let mut externs = String::new();
     let mut statics = String::new();
 
-    let plugins_file = BufReader::new(File::open(plugins_file)?);
-    for line in plugins_file.lines().map_while(Result::ok) {
+    for line in read_plugins(&plugins_file)? {
         let Some((name, class_name)) = line.split_once(',') else {
             continue;
         };
@@ -54,4 +53,16 @@ unsafe extern \"C\" {{
     writeln!(plugin_registrant, "}};")?;
 
     Ok(())
+}
+
+fn read_plugins(filename: &Path) -> Result<Box<dyn Iterator<Item = String>>, Box<dyn Error>> {
+    let plugins_file = match File::open(filename) {
+        Ok(file) => file,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Box::new(std::iter::empty())),
+        Err(e) => return Err(Box::new(e)),
+    };
+
+    let plugins_file = BufReader::new(plugins_file);
+
+    Ok(Box::new(plugins_file.lines().map_while(Result::ok)))
 }
