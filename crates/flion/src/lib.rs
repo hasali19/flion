@@ -7,10 +7,12 @@ mod mouse_cursor;
 mod standard_method_channel;
 mod task_queue;
 
+use std::cell::RefCell;
 use std::env;
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::ptr::NonNull;
+use std::rc::Rc;
 use std::time::Instant;
 
 use calloop::EventLoop;
@@ -23,6 +25,10 @@ use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::protocol::wl_seat::{self, Capability, WlSeat};
 use wayland_client::protocol::wl_surface::{self, WlSurface};
 use wayland_client::{Connection, Dispatch, Proxy};
+use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1;
+use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_manager_v1::{
+    self, WpCursorShapeManagerV1,
+};
 use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::{
     self, WpFractionalScaleManagerV1,
 };
@@ -36,6 +42,7 @@ use crate::compositor::OpenGLCompositor;
 use crate::egl::EglDisplay;
 use crate::engine::{BinaryMessageHandler, FlutterEngine, FlutterEngineConfig};
 use crate::mouse::MouseState;
+use crate::mouse_cursor::{MouseCursor, MouseCursorHandler};
 use crate::task_queue::FlutterTaskQueue;
 
 pub struct FlionAppBuilder<'a> {
@@ -79,6 +86,8 @@ impl FlionApp {
         let viewporter: WpViewporter = globals.bind(&qh, 1..=1, ())?;
         let fractional_scale_manager: WpFractionalScaleManagerV1 = globals.bind(&qh, 1..=1, ())?;
         let seat: WlSeat = globals.bind(&qh, 5..=11, ())?;
+        let cursor_shape_manager: Option<WpCursorShapeManagerV1> =
+            globals.bind(&qh, 1..=1, ()).ok();
 
         let mut event_loop: EventLoop<'_, AppState> = EventLoop::try_new()?;
 
@@ -124,7 +133,12 @@ impl FlionApp {
             .create_window_surface(Window(surface.clone()), 1, 1)
             .unwrap();
 
-        let platform_message_handlers: Vec<(&str, Box<dyn BinaryMessageHandler>)> = vec![];
+        let mouse_cursor = Rc::new(RefCell::new(MouseCursor::new()));
+
+        let platform_message_handlers: Vec<(&str, Box<dyn BinaryMessageHandler>)> = vec![(
+            "flutter/mousecursor",
+            Box::new(MouseCursorHandler::new(mouse_cursor.clone())),
+        )];
 
         let aot_library_path = env::var("FLION_AOT_LIBRARY_PATH").map(PathBuf::from).ok();
 
@@ -147,6 +161,8 @@ impl FlionApp {
             viewport,
             pointer: None,
             mouse: MouseState::default(),
+            mouse_cursor,
+            cursor_shape_manager,
         };
 
         while !app.close_requested {
@@ -166,6 +182,13 @@ impl FlionApp {
         xdg_surface.destroy();
         surface.destroy();
 
+        app.mouse_cursor.borrow_mut().set_pointer(None, None);
+
+        if let Some(manager) = app.cursor_shape_manager.take() {
+            manager.destroy();
+        }
+
+        seat.release();
         fractional_scale.destroy();
         viewporter.destroy();
         xdg_wm_base.destroy();
@@ -184,6 +207,8 @@ struct AppState {
     viewport: WpViewport,
     pointer: Option<WlPointer>,
     mouse: MouseState,
+    mouse_cursor: Rc<RefCell<MouseCursor>>,
+    cursor_shape_manager: Option<WpCursorShapeManagerV1>,
 }
 
 impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListContents> for AppState {
@@ -369,9 +394,21 @@ impl Dispatch<wl_seat::WlSeat, ()> for AppState {
                 wayland_client::WEnum::Value(capabilities) => {
                     if capabilities.contains(Capability::Pointer) {
                         if state.pointer.is_none() {
-                            state.pointer = Some(seat.get_pointer(qh, ()));
+                            let pointer = seat.get_pointer(qh, ());
+                            let shape_device = state
+                                .cursor_shape_manager
+                                .as_ref()
+                                .map(|manager| manager.get_pointer(&pointer, qh, ()));
+
+                            state
+                                .mouse_cursor
+                                .borrow_mut()
+                                .set_pointer(Some(pointer.clone()), shape_device);
+
+                            state.pointer = Some(pointer);
                         }
                     } else if let Some(pointer) = state.pointer.take() {
+                        state.mouse_cursor.borrow_mut().set_pointer(None, None);
                         pointer.release();
                     }
                 }
@@ -390,8 +427,38 @@ impl Dispatch<wl_pointer::WlPointer, ()> for AppState {
         _conn: &Connection,
         _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
+        if let wl_pointer::Event::Enter { serial, .. } = &event {
+            state.mouse_cursor.borrow_mut().on_enter(*serial);
+        } else if let wl_pointer::Event::Leave { .. } = &event {
+            state.mouse_cursor.borrow_mut().on_leave();
+        }
+
         state
             .mouse
             .handle_event(&state.engine, state.scale_factor, event);
+    }
+}
+
+impl Dispatch<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
+        _event: <wp_cursor_shape_manager_v1::WpCursorShapeManagerV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wp_cursor_shape_device_v1::WpCursorShapeDeviceV1,
+        _event: <wp_cursor_shape_device_v1::WpCursorShapeDeviceV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
     }
 }
