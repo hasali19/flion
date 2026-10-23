@@ -21,6 +21,12 @@ use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::protocol::wl_seat;
 use wayland_client::protocol::wl_surface::{self, WlSurface};
 use wayland_client::{Connection, Dispatch, Proxy};
+use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::{
+    self, WpFractionalScaleManagerV1,
+};
+use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1;
+use wayland_protocols::wp::viewporter::client::wp_viewport::{self, WpViewport};
+use wayland_protocols::wp::viewporter::client::wp_viewporter::{self, WpViewporter};
 use wayland_protocols::xdg::shell::client::xdg_wm_base::{self, XdgWmBase};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel};
 
@@ -67,6 +73,8 @@ impl FlionApp {
 
         let compositor: WlCompositor = globals.bind(&qh, 1..=4, ())?;
         let xdg_wm_base: XdgWmBase = globals.bind(&qh, 7..=7, ())?;
+        let viewporter: WpViewporter = globals.bind(&qh, 1..=1, ())?;
+        let fractional_scale_manager: WpFractionalScaleManagerV1 = globals.bind(&qh, 1..=1, ())?;
 
         let mut event_loop: EventLoop<'_, AppState> = EventLoop::try_new()?;
 
@@ -77,6 +85,8 @@ impl FlionApp {
         let surface = compositor.create_surface(&qh, ());
         let xdg_surface = xdg_wm_base.get_xdg_surface(&surface, &qh, ());
         let top_level = xdg_surface.get_toplevel(&qh, ());
+        let viewport = viewporter.get_viewport(&surface, &qh, ());
+        let fractional_scale = fractional_scale_manager.get_fractional_scale(&surface, &qh, ());
 
         surface.commit();
 
@@ -129,6 +139,8 @@ impl FlionApp {
             engine,
             close_requested: false,
             window_size: (0, 0),
+            scale_factor: 1.0,
+            viewport,
         };
 
         while !app.close_requested {
@@ -142,10 +154,14 @@ impl FlionApp {
             app.task_queue.run_tasks(&app.engine);
         }
 
+        fractional_scale.destroy();
+        app.viewport.destroy();
         top_level.destroy();
         xdg_surface.destroy();
         surface.destroy();
 
+        fractional_scale.destroy();
+        viewporter.destroy();
         xdg_wm_base.destroy();
         compositor.release();
 
@@ -158,6 +174,8 @@ struct AppState {
     engine: FlutterEngine,
     close_requested: bool,
     window_size: (u32, u32),
+    scale_factor: f64,
+    viewport: WpViewport,
 }
 
 impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListContents> for AppState {
@@ -208,16 +226,15 @@ impl Dispatch<wl_surface::WlSurface, ()> for AppState {
 
 impl Dispatch<xdg_wm_base::XdgWmBase, ()> for AppState {
     fn event(
-        state: &mut Self,
+        _state: &mut Self,
         proxy: &xdg_wm_base::XdgWmBase,
         event: <xdg_wm_base::XdgWmBase as Proxy>::Event,
-        data: &(),
-        conn: &Connection,
-        qhandle: &wayland_client::QueueHandle<Self>,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
-        match event {
-            xdg_wm_base::Event::Ping { serial } => proxy.pong(serial),
-            _ => {}
+        if let xdg_wm_base::Event::Ping { serial } = event {
+            proxy.pong(serial)
         }
     }
 }
@@ -227,22 +244,24 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for AppState {
         state: &mut Self,
         proxy: &xdg_surface::XdgSurface,
         event: <xdg_surface::XdgSurface as Proxy>::Event,
-        data: &(),
-        conn: &Connection,
-        qhandle: &wayland_client::QueueHandle<Self>,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
-        match event {
-            xdg_surface::Event::Configure { serial } => {
-                let (width, height) = state.window_size;
+        if let xdg_surface::Event::Configure { serial } = event {
+            let (width, height) = state.window_size;
 
-                state
-                    .engine
-                    .send_window_metrics_event(width as usize, height as usize, 1.0)
-                    .unwrap();
+            state.viewport.set_destination(width as i32, height as i32);
 
-                proxy.ack_configure(serial);
-            }
-            _ => todo!(),
+            let width = f64::from(width) * state.scale_factor;
+            let height = f64::from(height) * state.scale_factor;
+
+            state
+                .engine
+                .send_window_metrics_event(width as usize, height as usize, state.scale_factor)
+                .unwrap();
+
+            proxy.ack_configure(serial);
         }
     }
 }
@@ -271,28 +290,74 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for AppState {
             }
             xdg_toplevel::Event::ConfigureBounds { width, height } => {}
             xdg_toplevel::Event::WmCapabilities { capabilities } => {}
-            _ => todo!(),
+            _ => {}
         }
     }
 }
 
 impl Dispatch<wl_seat::WlSeat, ()> for AppState {
     fn event(
-        state: &mut Self,
-        proxy: &wl_seat::WlSeat,
+        _state: &mut Self,
+        _proxy: &wl_seat::WlSeat,
         event: <wl_seat::WlSeat as Proxy>::Event,
-        data: &(),
-        conn: &Connection,
-        qhandle: &wayland_client::QueueHandle<Self>,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
-        match event {
-            wl_seat::Event::Capabilities { capabilities } => {
-                debug!("Seat capabilities: {capabilities:?}");
-            }
-            wl_seat::Event::Name { name } => {
-                debug!("Seat {name}");
-            }
-            _ => todo!(),
+        if let wl_seat::Event::Capabilities { capabilities } = event {
+            debug!("Seat capabilities: {capabilities:?}");
+        }
+    }
+}
+
+impl Dispatch<wp_viewporter::WpViewporter, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wp_viewporter::WpViewporter,
+        _event: <wp_viewporter::WpViewporter as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wp_viewport::WpViewport, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wp_viewport::WpViewport,
+        _event: <wp_viewport::WpViewport as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+        _event: <wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        _proxy: &wp_fractional_scale_v1::WpFractionalScaleV1,
+        event: <wp_fractional_scale_v1::WpFractionalScaleV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
+            state.scale_factor = f64::from(scale) / 120.0;
+            // TODO: Probably need to send a window metrics event to flutter
         }
     }
 }
