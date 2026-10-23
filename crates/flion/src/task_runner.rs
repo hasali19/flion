@@ -56,7 +56,7 @@ where
     }
 }
 
-pub unsafe extern "C" fn set_thread_priority(thread_priority: i32) {
+pub unsafe extern "C" fn set_thread_priority(thread_priority: u32) {
     #[expect(non_upper_case_globals)]
     let priority = match thread_priority {
         FlutterThreadPriority_kBackground => THREAD_PRIORITY_BELOW_NORMAL,
