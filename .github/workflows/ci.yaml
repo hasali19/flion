@@ -35,6 +35,8 @@ jobs:
         with:
           channel: stable
 
+      - uses: Swatinem/rust-cache@v2
+
       - name: Build example
         working-directory: example
         run: cargo flion build
