@@ -2,6 +2,7 @@ mod codec;
 mod compositor;
 mod egl;
 mod engine;
+mod mouse;
 mod mouse_cursor;
 mod standard_method_channel;
 mod task_queue;
@@ -17,8 +18,9 @@ use calloop_wayland_source::WaylandSource;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle, WaylandWindowHandle, WindowHandle};
 use tracing::debug;
 use wayland_client::protocol::wl_compositor::{self, WlCompositor};
+use wayland_client::protocol::wl_pointer::{self, WlPointer};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
-use wayland_client::protocol::wl_seat;
+use wayland_client::protocol::wl_seat::{self, Capability, WlSeat};
 use wayland_client::protocol::wl_surface::{self, WlSurface};
 use wayland_client::{Connection, Dispatch, Proxy};
 use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::{
@@ -33,6 +35,7 @@ use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel};
 use crate::compositor::OpenGLCompositor;
 use crate::egl::EglDisplay;
 use crate::engine::{BinaryMessageHandler, FlutterEngine, FlutterEngineConfig};
+use crate::mouse::MouseState;
 use crate::task_queue::FlutterTaskQueue;
 
 pub struct FlionAppBuilder<'a> {
@@ -75,6 +78,7 @@ impl FlionApp {
         let xdg_wm_base: XdgWmBase = globals.bind(&qh, 7..=7, ())?;
         let viewporter: WpViewporter = globals.bind(&qh, 1..=1, ())?;
         let fractional_scale_manager: WpFractionalScaleManagerV1 = globals.bind(&qh, 1..=1, ())?;
+        let seat: WlSeat = globals.bind(&qh, 5..=11, ())?;
 
         let mut event_loop: EventLoop<'_, AppState> = EventLoop::try_new()?;
 
@@ -141,6 +145,8 @@ impl FlionApp {
             window_size: (0, 0),
             scale_factor: 1.0,
             viewport,
+            pointer: None,
+            mouse: MouseState::default(),
         };
 
         while !app.close_requested {
@@ -176,6 +182,8 @@ struct AppState {
     window_size: (u32, u32),
     scale_factor: f64,
     viewport: WpViewport,
+    pointer: Option<WlPointer>,
+    mouse: MouseState,
 }
 
 impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListContents> for AppState {
@@ -295,21 +303,6 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for AppState {
     }
 }
 
-impl Dispatch<wl_seat::WlSeat, ()> for AppState {
-    fn event(
-        _state: &mut Self,
-        _proxy: &wl_seat::WlSeat,
-        event: <wl_seat::WlSeat as Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qhandle: &wayland_client::QueueHandle<Self>,
-    ) {
-        if let wl_seat::Event::Capabilities { capabilities } = event {
-            debug!("Seat capabilities: {capabilities:?}");
-        }
-    }
-}
-
 impl Dispatch<wp_viewporter::WpViewporter, ()> for AppState {
     fn event(
         _state: &mut Self,
@@ -359,5 +352,46 @@ impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for AppState {
             state.scale_factor = f64::from(scale) / 120.0;
             // TODO: Probably need to send a window metrics event to flutter
         }
+    }
+}
+
+impl Dispatch<wl_seat::WlSeat, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        seat: &wl_seat::WlSeat,
+        event: <wl_seat::WlSeat as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        qh: &wayland_client::QueueHandle<Self>,
+    ) {
+        if let wl_seat::Event::Capabilities { capabilities } = event {
+            match capabilities {
+                wayland_client::WEnum::Value(capabilities) => {
+                    if capabilities.contains(Capability::Pointer) {
+                        if state.pointer.is_none() {
+                            state.pointer = Some(seat.get_pointer(qh, ()));
+                        }
+                    } else if let Some(pointer) = state.pointer.take() {
+                        pointer.release();
+                    }
+                }
+                wayland_client::WEnum::Unknown(_) => {}
+            }
+        }
+    }
+}
+
+impl Dispatch<wl_pointer::WlPointer, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_pointer::WlPointer,
+        event: <wl_pointer::WlPointer as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        state
+            .mouse
+            .handle_event(&state.engine, state.scale_factor, event);
     }
 }
