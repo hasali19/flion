@@ -2,6 +2,7 @@ mod compositor;
 mod egl;
 mod engine;
 mod task_queue;
+mod window;
 
 use std::env;
 use std::marker::PhantomData;
@@ -14,12 +15,12 @@ use wayland_client::backend::Backend;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::window::{Window, WindowAttributes};
+use winit::window::WindowAttributes;
 
 use crate::compositor::OpenGLCompositor;
 use crate::egl::EglDisplay;
 use crate::engine::{FlutterEngine, FlutterEngineConfig, FlutterTask};
-use crate::task_queue::FlutterTaskQueue;
+use crate::window::FlutterWindow;
 
 pub struct FlionAppBuilder<'a> {
     _p: PhantomData<&'a ()>,
@@ -56,13 +57,7 @@ impl FlionApp {
 struct AppState {
     proxy: EventLoopProxy<FlutterTask>,
     display: Option<EglDisplay>,
-    main_window: Option<WindowState>,
-}
-
-struct WindowState {
-    window: Arc<Window>,
-    engine: FlutterEngine,
-    platform_tasks: FlutterTaskQueue,
+    main_window: Option<FlutterWindow>,
 }
 
 impl ApplicationHandler<FlutterTask> for AppState {
@@ -108,16 +103,12 @@ impl ApplicationHandler<FlutterTask> for AppState {
         .unwrap();
 
         self.display = Some(egl);
-        self.main_window = Some(WindowState {
-            window,
-            engine,
-            platform_tasks: FlutterTaskQueue::new(),
-        });
+        self.main_window = Some(FlutterWindow::new(window, engine));
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, task: FlutterTask) {
         if let Some(main_window) = &mut self.main_window {
-            main_window.platform_tasks.push(task);
+            main_window.push_platform_task(task);
         }
     }
 
@@ -127,9 +118,7 @@ impl ApplicationHandler<FlutterTask> for AppState {
             return;
         };
 
-        main_window.platform_tasks.run_tasks(&main_window.engine);
-
-        event_loop.set_control_flow(match main_window.platform_tasks.next_deadline() {
+        event_loop.set_control_flow(match main_window.run_platform_tasks() {
             Some(deadline) => ControlFlow::WaitUntil(deadline),
             None => ControlFlow::Wait,
         });
@@ -146,11 +135,11 @@ impl ApplicationHandler<FlutterTask> for AppState {
         window_id: winit::window::WindowId,
         event: winit::event::WindowEvent,
     ) {
-        let Some(main_window) = &self.main_window else {
+        let Some(main_window) = &mut self.main_window else {
             return;
         };
 
-        if main_window.window.id() != window_id {
+        if main_window.id() != window_id {
             return;
         }
 
@@ -158,20 +147,18 @@ impl ApplicationHandler<FlutterTask> for AppState {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
             }
-            WindowEvent::Resized(size) => {
-                let scale_factor = main_window.window.scale_factor();
-                main_window
-                    .engine
-                    .send_window_metrics_event(size.width as _, size.height as _, scale_factor)
-                    .unwrap();
-            }
+            WindowEvent::Resized(size) => main_window.on_resized(size),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                let size = main_window.window.inner_size();
-                main_window
-                    .engine
-                    .send_window_metrics_event(size.width as _, size.height as _, scale_factor)
-                    .unwrap();
+                main_window.on_scale_factor_changed(scale_factor)
             }
+            WindowEvent::CursorEntered { .. } => main_window.on_cursor_entered(),
+            WindowEvent::CursorLeft { .. } => main_window.on_cursor_left(),
+            WindowEvent::CursorMoved { position, .. } => main_window.on_cursor_moved(position),
+            WindowEvent::MouseInput { state, button, .. } => {
+                main_window.on_mouse_input(state, button)
+            }
+            WindowEvent::MouseWheel { delta, .. } => main_window.on_mouse_wheel(delta),
+            WindowEvent::Touch(touch) => main_window.on_touch(touch),
             _ => {}
         }
     }

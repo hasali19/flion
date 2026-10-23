@@ -4,18 +4,36 @@ use std::str::FromStr;
 use std::thread::{self, ThreadId};
 use std::{mem, ptr};
 
+use bitflags::bitflags;
 use eyre::{Context, bail};
 use flutter_embedder::{
     FlutterBackingStore, FlutterBackingStoreConfig, FlutterCustomTaskRunners, FlutterEngineAOTData,
     FlutterEngineAOTDataSource, FlutterEngineAOTDataSource__bindgen_ty_1,
     FlutterEngineAOTDataSourceType_kFlutterEngineAOTDataSourceTypeElfPath,
-    FlutterEngineCreateAOTData, FlutterEngineInitialize, FlutterEngineResult_kSuccess,
-    FlutterEngineRunInitialized, FlutterEngineRunTask, FlutterEngineRunsAOTCompiledDartCode,
-    FlutterEngineSendWindowMetricsEvent, FlutterEngineShutdown, FlutterLayer,
-    FlutterOpenGLRendererConfig, FlutterPresentViewInfo, FlutterProjectArgs, FlutterRendererConfig,
-    FlutterRendererConfig__bindgen_ty_1, FlutterRendererType_kOpenGL, FlutterTaskRunnerDescription,
-    FlutterWindowMetricsEvent,
+    FlutterEngineCreateAOTData, FlutterEngineGetCurrentTime, FlutterEngineInitialize,
+    FlutterEngineResult_kSuccess, FlutterEngineRunInitialized, FlutterEngineRunTask,
+    FlutterEngineRunsAOTCompiledDartCode, FlutterEngineSendKeyEvent, FlutterEngineSendPointerEvent,
+    FlutterEngineSendWindowMetricsEvent, FlutterEngineShutdown, FlutterKeyEvent,
+    FlutterKeyEventDeviceType_kFlutterKeyEventDeviceTypeKeyboard,
+    FlutterKeyEventType_kFlutterKeyEventTypeDown, FlutterKeyEventType_kFlutterKeyEventTypeRepeat,
+    FlutterKeyEventType_kFlutterKeyEventTypeUp, FlutterLayer, FlutterOpenGLRendererConfig,
+    FlutterPointerDeviceKind, FlutterPointerDeviceKind_kFlutterPointerDeviceKindMouse,
+    FlutterPointerDeviceKind_kFlutterPointerDeviceKindStylus,
+    FlutterPointerDeviceKind_kFlutterPointerDeviceKindTouch,
+    FlutterPointerDeviceKind_kFlutterPointerDeviceKindTrackpad, FlutterPointerEvent,
+    FlutterPointerMouseButtons, FlutterPointerMouseButtons_kFlutterPointerButtonMouseBack,
+    FlutterPointerMouseButtons_kFlutterPointerButtonMouseForward,
+    FlutterPointerMouseButtons_kFlutterPointerButtonMouseMiddle,
+    FlutterPointerMouseButtons_kFlutterPointerButtonMousePrimary,
+    FlutterPointerMouseButtons_kFlutterPointerButtonMouseSecondary, FlutterPointerPhase,
+    FlutterPointerPhase_kAdd, FlutterPointerPhase_kCancel, FlutterPointerPhase_kDown,
+    FlutterPointerPhase_kHover, FlutterPointerPhase_kMove, FlutterPointerPhase_kRemove,
+    FlutterPointerPhase_kUp, FlutterPointerSignalKind_kFlutterPointerSignalKindNone,
+    FlutterPointerSignalKind_kFlutterPointerSignalKindScroll, FlutterPresentViewInfo,
+    FlutterProjectArgs, FlutterRendererConfig, FlutterRendererConfig__bindgen_ty_1,
+    FlutterRendererType_kOpenGL, FlutterTaskRunnerDescription, FlutterWindowMetricsEvent,
 };
+use smol_str::SmolStr;
 
 const FLUTTER_ENGINE_VERSION: usize = flutter_embedder::FLUTTER_ENGINE_VERSION as usize;
 
@@ -48,6 +66,81 @@ pub trait FlutterOpenGLCompositor: Send + Sync + 'static {
     fn release_backing_store(&self, backing_store: &FlutterBackingStore) -> eyre::Result<()>;
 
     fn present_view(&self, view_id: i64, layers: &[&FlutterLayer]) -> eyre::Result<()>;
+}
+
+#[derive(Clone, Copy, Default)]
+#[repr(u32)]
+pub enum PointerDeviceKind {
+    #[default]
+    Unknown = 0,
+    Mouse = FlutterPointerDeviceKind_kFlutterPointerDeviceKindMouse,
+    Touch = FlutterPointerDeviceKind_kFlutterPointerDeviceKindTouch,
+    #[expect(unused)]
+    Stylus = FlutterPointerDeviceKind_kFlutterPointerDeviceKindStylus,
+    #[expect(unused)]
+    Trackpad = FlutterPointerDeviceKind_kFlutterPointerDeviceKindTrackpad,
+}
+
+#[derive(Clone, Copy, Default, Debug)]
+#[repr(u32)]
+pub enum PointerPhase {
+    #[default]
+    Cancel = FlutterPointerPhase_kCancel,
+    Up = FlutterPointerPhase_kUp,
+    Down = FlutterPointerPhase_kDown,
+    Add = FlutterPointerPhase_kAdd,
+    Remove = FlutterPointerPhase_kRemove,
+    Hover = FlutterPointerPhase_kHover,
+    Move = FlutterPointerPhase_kMove,
+}
+
+bitflags! {
+    #[derive(Clone, Copy, Default)]
+    pub struct PointerButtons: FlutterPointerMouseButtons {
+        const PRIMARY = FlutterPointerMouseButtons_kFlutterPointerButtonMousePrimary;
+        const SECONDARY = FlutterPointerMouseButtons_kFlutterPointerButtonMouseSecondary;
+        const MIDDLE = FlutterPointerMouseButtons_kFlutterPointerButtonMouseMiddle;
+        const BACK = FlutterPointerMouseButtons_kFlutterPointerButtonMouseBack;
+        const FORWARD = FlutterPointerMouseButtons_kFlutterPointerButtonMouseForward;
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub enum PointerSignal {
+    #[default]
+    None,
+    Scroll {
+        delta_x: f64,
+        delta_y: f64,
+    },
+}
+
+#[derive(Default)]
+pub struct PointerEvent {
+    pub device_kind: PointerDeviceKind,
+    pub device_id: i32,
+    pub phase: PointerPhase,
+    pub x: f64,
+    pub y: f64,
+    pub buttons: PointerButtons,
+    pub signal: PointerSignal,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum KeyEventType {
+    Up = FlutterKeyEventType_kFlutterKeyEventTypeUp,
+    Down = FlutterKeyEventType_kFlutterKeyEventTypeDown,
+    Repeat = FlutterKeyEventType_kFlutterKeyEventTypeRepeat,
+}
+
+#[derive(Clone)]
+pub struct KeyEvent {
+    pub event_type: KeyEventType,
+    pub synthesized: bool,
+    pub character: Option<SmolStr>,
+    pub logical: Option<u64>,
+    pub physical: Option<u64>,
 }
 
 pub struct FlutterEngine {
@@ -175,6 +268,93 @@ impl FlutterEngine {
 
         if result != FlutterEngineResult_kSuccess {
             bail!("failed to run task: {result}");
+        }
+
+        Ok(())
+    }
+
+    pub fn send_pointer_event(&self, event: &PointerEvent) -> eyre::Result<()> {
+        let (signal_kind, scroll_delta_x, scroll_delta_y) = match event.signal {
+            PointerSignal::None => (
+                FlutterPointerSignalKind_kFlutterPointerSignalKindNone,
+                0.0,
+                0.0,
+            ),
+            PointerSignal::Scroll { delta_x, delta_y } => (
+                FlutterPointerSignalKind_kFlutterPointerSignalKindScroll,
+                delta_x,
+                delta_y,
+            ),
+        };
+
+        let result = unsafe {
+            FlutterEngineSendPointerEvent(
+                self.engine(),
+                &FlutterPointerEvent {
+                    struct_size: mem::size_of::<FlutterPointerEvent>(),
+                    device_kind: event.device_kind as FlutterPointerDeviceKind,
+                    device: event.device_id,
+                    phase: event.phase as FlutterPointerPhase,
+                    x: event.x,
+                    y: event.y,
+                    buttons: event.buttons.bits() as i64,
+                    signal_kind,
+                    scroll_delta_x,
+                    scroll_delta_y,
+                    timestamp: FlutterEngineGetCurrentTime() as usize,
+                    ..Default::default()
+                },
+                1,
+            )
+        };
+
+        if result != FlutterEngineResult_kSuccess {
+            bail!("failed to send pointer event: {result}");
+        }
+
+        Ok(())
+    }
+
+    pub fn send_key_event<F>(&self, event: &KeyEvent, callback: F) -> eyre::Result<()>
+    where
+        F: FnOnce(bool) + 'static,
+    {
+        unsafe extern "C" fn _callback<F: FnOnce(bool)>(
+            handled: bool,
+            user_data: *mut ::std::os::raw::c_void,
+        ) {
+            unsafe { Box::from_raw(user_data.cast::<F>())(handled) };
+        }
+
+        // This is freed above when the calback invoked.
+        let reply = Box::into_raw(Box::new(callback));
+
+        let event = FlutterKeyEvent {
+            struct_size: mem::size_of::<FlutterKeyEvent>(),
+            timestamp: unsafe { FlutterEngineGetCurrentTime() as f64 },
+            type_: event.event_type as u32,
+            character: event
+                .character
+                .as_deref()
+                .map(|c| c.as_ptr().cast())
+                .unwrap_or(ptr::null()),
+            synthesized: event.synthesized,
+            logical: event.logical.unwrap_or(0),
+            physical: event.physical.unwrap_or(0),
+            device_type: FlutterKeyEventDeviceType_kFlutterKeyEventDeviceTypeKeyboard,
+        };
+
+        unsafe {
+            let result = FlutterEngineSendKeyEvent(
+                self.engine(),
+                &event,
+                Some(_callback::<F>),
+                reply.cast(),
+            );
+
+            if result != FlutterEngineResult_kSuccess {
+                bail!("failed to send key event: {result}");
+            }
         }
 
         Ok(())
