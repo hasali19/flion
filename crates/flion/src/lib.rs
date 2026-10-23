@@ -1,6 +1,9 @@
+mod codec;
 mod compositor;
 mod egl;
 mod engine;
+mod mouse_cursor;
+mod standard_method_channel;
 mod task_queue;
 mod window;
 
@@ -19,7 +22,8 @@ use winit::window::WindowAttributes;
 
 use crate::compositor::OpenGLCompositor;
 use crate::egl::EglDisplay;
-use crate::engine::{FlutterEngine, FlutterEngineConfig, FlutterTask};
+use crate::engine::{BinaryMessageHandler, FlutterEngine, FlutterEngineConfig, FlutterTask};
+use crate::mouse_cursor::MouseCursorHandler;
 use crate::window::FlutterWindow;
 
 pub struct FlionAppBuilder<'a> {
@@ -87,6 +91,8 @@ impl ApplicationHandler<FlutterTask> for AppState {
             .create_window_surface(window.clone(), size.width, size.height)
             .unwrap();
 
+        let platform_message_handlers: Vec<(&str, Box<dyn BinaryMessageHandler>)> = vec![];
+
         let aot_library_path = env::var("FLION_AOT_LIBRARY_PATH").map(PathBuf::from).ok();
 
         let engine = FlutterEngine::new(FlutterEngineConfig {
@@ -99,8 +105,14 @@ impl ApplicationHandler<FlutterTask> for AppState {
                     let _ = proxy.send_event(task);
                 }
             }),
+            platform_message_handlers,
         })
         .unwrap();
+
+        engine.set_platform_message_handler(
+            "flutter/mousecursor",
+            MouseCursorHandler::new(Arc::downgrade(&window)),
+        );
 
         self.display = Some(egl);
         self.main_window = Some(FlutterWindow::new(window, engine));

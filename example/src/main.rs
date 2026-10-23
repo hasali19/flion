@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         tracing_subscriber::fmt()
             .with_span_events(FmtSpan::ENTER)
             .with_thread_names(true)
-            .with_max_level(tracing::Level::DEBUG)
+            .with_env_filter("info,flion=debug,example=debug")
             .init();
     }
 
