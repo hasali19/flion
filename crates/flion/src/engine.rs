@@ -757,8 +757,6 @@ extern "C" fn log_message(tag: *const c_char, message: *const c_char, _: *mut c_
 }
 
 extern "C" fn gl_make_current(user_data: *mut c_void) -> bool {
-    tracing::info!("make_current");
-
     let engine = user_data.cast::<FlutterEngineState>();
     let compositor = unsafe { (*engine).compositor.as_ref() };
 
