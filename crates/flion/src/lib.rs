@@ -1,6 +1,7 @@
 mod compositor;
 mod egl;
 mod engine;
+mod task_queue;
 
 use std::env;
 use std::marker::PhantomData;
@@ -11,12 +12,13 @@ use wayland_client::Connection;
 use wayland_client::backend::Backend;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
-use winit::event_loop::EventLoop;
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowAttributes};
 
 use crate::compositor::OpenGLCompositor;
 use crate::egl::EglDisplay;
-use crate::engine::{FlutterEngine, FlutterEngineConfig};
+use crate::engine::{FlutterEngine, FlutterEngineConfig, FlutterTask};
+use crate::task_queue::FlutterTaskQueue;
 
 pub struct FlionAppBuilder<'a> {
     _p: PhantomData<&'a ()>,
@@ -36,9 +38,13 @@ impl FlionApp {
     }
 
     pub fn run_event_loop(self) -> eyre::Result<()> {
-        let event_loop = EventLoop::new()?;
+        let event_loop = EventLoop::with_user_event().build()?;
 
-        let mut app = AppState::default();
+        let mut app = AppState {
+            proxy: event_loop.create_proxy(),
+            display: None,
+            main_window: None,
+        };
 
         event_loop.run_app(&mut app)?;
 
@@ -46,8 +52,8 @@ impl FlionApp {
     }
 }
 
-#[derive(Default)]
 struct AppState {
+    proxy: EventLoopProxy<FlutterTask>,
     display: Option<EglDisplay>,
     main_window: Option<WindowState>,
 }
@@ -55,9 +61,10 @@ struct AppState {
 struct WindowState {
     window: Arc<Window>,
     engine: FlutterEngine,
+    platform_tasks: FlutterTaskQueue,
 }
 
-impl ApplicationHandler for AppState {
+impl ApplicationHandler<FlutterTask> for AppState {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         let display_handle = event_loop.display_handle().unwrap().as_raw();
 
@@ -88,13 +95,41 @@ impl ApplicationHandler for AppState {
             assets_path: &env::var("FLION_ASSETS_PATH").unwrap(),
             aot_library_path: None,
             compositor: OpenGLCompositor::new(egl.clone(), surface).unwrap(),
+            platform_task_handler: Box::new({
+                let proxy = self.proxy.clone();
+                move |task| {
+                    let _ = proxy.send_event(task);
+                }
+            }),
         })
         .unwrap();
 
-        *self = AppState {
-            display: Some(egl),
-            main_window: Some(WindowState { window, engine }),
+        self.display = Some(egl);
+        self.main_window = Some(WindowState {
+            window,
+            engine,
+            platform_tasks: FlutterTaskQueue::new(),
+        });
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, task: FlutterTask) {
+        if let Some(main_window) = &mut self.main_window {
+            main_window.platform_tasks.push(task);
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(main_window) = &mut self.main_window else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
         };
+
+        main_window.platform_tasks.run_tasks(&main_window.engine);
+
+        event_loop.set_control_flow(match main_window.platform_tasks.next_deadline() {
+            Some(deadline) => ControlFlow::WaitUntil(deadline),
+            None => ControlFlow::Wait,
+        });
     }
 
     fn suspended(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {

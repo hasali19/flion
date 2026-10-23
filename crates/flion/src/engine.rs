@@ -1,13 +1,15 @@
 use std::ffi::{CStr, CString, c_char, c_void};
+use std::thread::{self, ThreadId};
 use std::{mem, ptr};
 
 use eyre::{Context, bail};
 use flutter_embedder::{
-    FlutterBackingStore, FlutterBackingStoreConfig, FlutterEngineInitialize,
-    FlutterEngineResult_kSuccess, FlutterEngineRunInitialized, FlutterEngineSendWindowMetricsEvent,
-    FlutterEngineShutdown, FlutterLayer, FlutterOpenGLRendererConfig, FlutterPresentViewInfo,
-    FlutterProjectArgs, FlutterRendererConfig, FlutterRendererConfig__bindgen_ty_1,
-    FlutterRendererType_kOpenGL, FlutterWindowMetricsEvent,
+    FlutterBackingStore, FlutterBackingStoreConfig, FlutterCustomTaskRunners,
+    FlutterEngineInitialize, FlutterEngineResult_kSuccess, FlutterEngineRunInitialized,
+    FlutterEngineRunTask, FlutterEngineSendWindowMetricsEvent, FlutterEngineShutdown, FlutterLayer,
+    FlutterOpenGLRendererConfig, FlutterPresentViewInfo, FlutterProjectArgs, FlutterRendererConfig,
+    FlutterRendererConfig__bindgen_ty_1, FlutterRendererType_kOpenGL, FlutterTaskRunnerDescription,
+    FlutterWindowMetricsEvent,
 };
 
 const FLUTTER_ENGINE_VERSION: usize = flutter_embedder::FLUTTER_ENGINE_VERSION as usize;
@@ -16,6 +18,7 @@ pub struct FlutterEngineConfig<'a, C> {
     pub assets_path: &'a str,
     pub aot_library_path: Option<&'a str>,
     pub compositor: C,
+    pub platform_task_handler: Box<dyn Fn(FlutterTask)>,
 }
 
 pub trait FlutterCompositor {
@@ -50,6 +53,11 @@ impl FlutterEngine {
     pub fn new<C: FlutterCompositor + FlutterOpenGLCompositor>(
         config: FlutterEngineConfig<'_, C>,
     ) -> eyre::Result<FlutterEngine> {
+        let platform_task_runner = create_task_runner(
+            1,
+            FlutterTaskRunner::new(move |task| (config.platform_task_handler)(task)),
+        );
+
         let renderer_config = FlutterRendererConfig {
             type_: FlutterRendererType_kOpenGL,
             __bindgen_anon_1: FlutterRendererConfig__bindgen_ty_1 {
@@ -90,6 +98,13 @@ impl FlutterEngine {
                 present_layers_callback: None,
                 present_view_callback: Some(compositor_present_view),
                 user_data: engine_state.cast(),
+            },
+            custom_task_runners: &FlutterCustomTaskRunners {
+                struct_size: mem::size_of::<FlutterCustomTaskRunners>(),
+                platform_task_runner: &platform_task_runner,
+                render_task_runner: ptr::null(),
+                ui_task_runner: ptr::null(),
+                thread_priority_setter: None,
             },
             ..Default::default()
         };
@@ -144,6 +159,16 @@ impl FlutterEngine {
         Ok(())
     }
 
+    pub fn run_task(&self, task: &FlutterTask) -> eyre::Result<()> {
+        let result = unsafe { FlutterEngineRunTask(self.engine(), &raw const task.task) };
+
+        if result != FlutterEngineResult_kSuccess {
+            bail!("failed to run task: {result}");
+        }
+
+        Ok(())
+    }
+
     unsafe fn engine(&self) -> flutter_embedder::FlutterEngine {
         unsafe { (*self.inner).engine }
     }
@@ -166,9 +191,86 @@ impl Drop for FlutterEngine {
     }
 }
 
+fn create_task_runner<F: Fn(FlutterTask) + 'static>(
+    id: usize,
+    runner: FlutterTaskRunner<F>,
+) -> FlutterTaskRunnerDescription {
+    unsafe extern "C" fn runs_tasks_on_current_thread<F>(task_runner: *mut c_void) -> bool {
+        unsafe { task_runner.cast::<FlutterTaskRunner<F>>().as_ref().unwrap() }
+            .runs_tasks_on_current_thread()
+    }
+
+    unsafe extern "C" fn post_task_callback<F: Fn(FlutterTask)>(
+        task: flutter_embedder::FlutterTask,
+        target_time_nanos: u64,
+        user_data: *mut c_void,
+    ) {
+        let runner = unsafe { user_data.cast::<FlutterTaskRunner<F>>().as_ref().unwrap() };
+        runner.post_task(task, target_time_nanos);
+    }
+
+    unsafe extern "C" fn destruction_callback<F: Fn(FlutterTask)>(user_data: *mut c_void) {
+        unsafe { drop(Box::from_raw(user_data.cast::<FlutterTaskRunner<F>>())) };
+    }
+
+    // This is freed by the above destruction_callback.
+    let runner = Box::into_raw(Box::new(runner));
+
+    FlutterTaskRunnerDescription {
+        struct_size: mem::size_of::<FlutterTaskRunnerDescription>(),
+        identifier: id,
+        user_data: runner.cast(),
+        runs_task_on_current_thread_callback: Some(runs_tasks_on_current_thread::<F>),
+        post_task_callback: Some(post_task_callback::<F>),
+        destruction_callback: Some(destruction_callback::<F>),
+    }
+}
+
 struct FlutterEngineState {
     engine: flutter_embedder::FlutterEngine,
     compositor: Box<dyn FlutterOpenGLCompositor>,
+}
+
+#[derive(Debug)]
+pub struct FlutterTask {
+    target_time: u64,
+    task: flutter_embedder::FlutterTask,
+}
+
+impl FlutterTask {
+    pub fn target_time_nanos(&self) -> u64 {
+        self.target_time
+    }
+}
+
+pub struct FlutterTaskRunner<F> {
+    main_thread_id: ThreadId,
+    handler: F,
+}
+
+impl<F> FlutterTaskRunner<F> {
+    pub fn new(handler: F) -> FlutterTaskRunner<F> {
+        FlutterTaskRunner {
+            main_thread_id: thread::current().id(),
+            handler,
+        }
+    }
+
+    pub fn runs_tasks_on_current_thread(&self) -> bool {
+        self.main_thread_id == thread::current().id()
+    }
+}
+
+impl<F> FlutterTaskRunner<F>
+where
+    F: Fn(FlutterTask),
+{
+    pub fn post_task(&self, task: flutter_embedder::FlutterTask, target_time_nanos: u64) {
+        (self.handler)(FlutterTask {
+            target_time: target_time_nanos,
+            task,
+        });
+    }
 }
 
 extern "C" fn log_message(tag: *const c_char, message: *const c_char, _: *mut c_void) {
