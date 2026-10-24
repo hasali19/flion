@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::Path;
+use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::thread::{self, ThreadId};
@@ -166,10 +167,9 @@ impl FlutterEngine {
     pub fn new<C: FlutterCompositor + FlutterOpenGLCompositor>(
         config: FlutterEngineConfig<'_, C>,
     ) -> eyre::Result<FlutterEngine> {
-        let platform_task_runner = create_task_runner(
-            1,
-            FlutterTaskRunner::new(move |task| (config.platform_task_handler)(task)),
-        );
+        let platform_runner = Rc::new(FlutterTaskRunner::new(move |task| {
+            (config.platform_task_handler)(task)
+        }));
 
         let renderer_config = FlutterRendererConfig {
             type_: FlutterRendererType_kOpenGL,
@@ -215,9 +215,9 @@ impl FlutterEngine {
             aot_data,
             custom_task_runners: &FlutterCustomTaskRunners {
                 struct_size: mem::size_of::<FlutterCustomTaskRunners>(),
-                platform_task_runner: &platform_task_runner,
+                platform_task_runner: &create_task_runner(1, platform_runner.clone()),
                 render_task_runner: ptr::null(),
-                ui_task_runner: ptr::null(),
+                ui_task_runner: &create_task_runner(1, platform_runner),
                 thread_priority_setter: None,
             },
             compositor: &flutter_embedder::FlutterCompositor {
@@ -480,7 +480,7 @@ fn load_aot_data(path: Option<&str>) -> eyre::Result<Option<FlutterEngineAOTData
 
 fn create_task_runner<F: Fn(FlutterTask) + 'static>(
     id: usize,
-    runner: FlutterTaskRunner<F>,
+    runner: Rc<FlutterTaskRunner<F>>,
 ) -> FlutterTaskRunnerDescription {
     unsafe extern "C" fn runs_tasks_on_current_thread<F>(task_runner: *mut c_void) -> bool {
         unsafe { task_runner.cast::<FlutterTaskRunner<F>>().as_ref().unwrap() }
@@ -497,11 +497,10 @@ fn create_task_runner<F: Fn(FlutterTask) + 'static>(
     }
 
     unsafe extern "C" fn destruction_callback<F: Fn(FlutterTask)>(user_data: *mut c_void) {
-        unsafe { drop(Box::from_raw(user_data.cast::<FlutterTaskRunner<F>>())) };
+        unsafe { drop(Rc::from_raw(user_data.cast::<FlutterTaskRunner<F>>())) };
     }
 
-    // This is freed by the above destruction_callback.
-    let runner = Box::into_raw(Box::new(runner));
+    let runner = Rc::into_raw(runner).cast_mut();
 
     FlutterTaskRunnerDescription {
         struct_size: mem::size_of::<FlutterTaskRunnerDescription>(),
