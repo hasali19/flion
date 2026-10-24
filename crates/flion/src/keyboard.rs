@@ -12,7 +12,7 @@ use calloop::{LoopHandle, RegistrationToken};
 use eyre::{Context, OptionExt};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
-use tracing::{debug, error};
+use tracing::error;
 use wayland_client::WEnum;
 use wayland_client::protocol::wl_keyboard;
 use xkbcommon::xkb;

@@ -582,7 +582,7 @@ impl BinaryMessenger {
                 Ok(())
             }
         } else {
-            bail!("engine is not running")
+            bail!("engine is not running");
         }
     }
 
@@ -658,7 +658,7 @@ impl BinaryMessenger {
 
             Ok(())
         } else {
-            bail!("engine is not running")
+            bail!("engine is not running");
         }
     }
 }
@@ -686,19 +686,6 @@ impl BinaryMessageReply {
         }
     }
 
-    pub(crate) fn for_engine(
-        engine: &FlutterEngine,
-        response_handle: *const FlutterPlatformMessageResponseHandle,
-    ) -> BinaryMessageReply {
-        unsafe {
-            BinaryMessageReply::new(
-                engine.engine(),
-                (*engine.inner).is_running.clone(),
-                response_handle,
-            )
-        }
-    }
-
     pub fn send(self, message: &[u8]) {
         self.send_raw(message.as_ptr(), message.len());
     }
@@ -720,10 +707,6 @@ impl BinaryMessageReply {
         } else {
             tracing::error!("send called on a stopped engine");
         }
-    }
-
-    pub(crate) fn into_raw(self) -> *const FlutterPlatformMessageResponseHandle {
-        self.response_handle
     }
 }
 

@@ -1,5 +1,4 @@
 mod clipboard;
-mod codec;
 mod compositor;
 mod egl;
 mod engine;
@@ -11,6 +10,8 @@ mod standard_method_channel;
 mod task_queue;
 mod text_input;
 mod touch;
+
+pub mod codec;
 
 use std::cell::RefCell;
 use std::env;
@@ -268,12 +269,12 @@ struct AppState {
 
 impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListContents> for AppState {
     fn event(
-        state: &mut Self,
-        proxy: &WlRegistry,
+        _state: &mut Self,
+        _proxy: &WlRegistry,
         event: <WlRegistry as wayland_client::Proxy>::Event,
-        data: &wayland_client::globals::GlobalListContents,
-        conn: &Connection,
-        qhandle: &wayland_client::QueueHandle<Self>,
+        _data: &wayland_client::globals::GlobalListContents,
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         if let wl_registry::Event::Global {
             name,
@@ -288,12 +289,12 @@ impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListConten
 
 impl Dispatch<wl_compositor::WlCompositor, ()> for AppState {
     fn event(
-        state: &mut Self,
-        proxy: &wl_compositor::WlCompositor,
-        event: <wl_compositor::WlCompositor as Proxy>::Event,
-        data: &(),
-        conn: &Connection,
-        qhandle: &wayland_client::QueueHandle<Self>,
+        _state: &mut Self,
+        _proxy: &wl_compositor::WlCompositor,
+        _event: <wl_compositor::WlCompositor as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         todo!()
     }
@@ -301,12 +302,12 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for AppState {
 
 impl Dispatch<wl_surface::WlSurface, ()> for AppState {
     fn event(
-        state: &mut Self,
-        proxy: &wl_surface::WlSurface,
-        event: <wl_surface::WlSurface as Proxy>::Event,
-        data: &(),
-        conn: &Connection,
-        qhandle: &wayland_client::QueueHandle<Self>,
+        _state: &mut Self,
+        _proxy: &wl_surface::WlSurface,
+        _event: <wl_surface::WlSurface as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         todo!()
     }
@@ -357,18 +358,14 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for AppState {
 impl Dispatch<xdg_toplevel::XdgToplevel, ()> for AppState {
     fn event(
         state: &mut Self,
-        proxy: &xdg_toplevel::XdgToplevel,
+        _proxy: &xdg_toplevel::XdgToplevel,
         event: <xdg_toplevel::XdgToplevel as Proxy>::Event,
-        data: &(),
-        conn: &Connection,
-        qhandle: &wayland_client::QueueHandle<Self>,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         match event {
-            xdg_toplevel::Event::Configure {
-                width,
-                height,
-                states,
-            } => {
+            xdg_toplevel::Event::Configure { width, height, .. } => {
                 let width = if width == 0 { 1280 } else { width };
                 let height = if height == 0 { 800 } else { height };
                 state.window_size = (width as u32, height as u32);
@@ -376,8 +373,8 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for AppState {
             xdg_toplevel::Event::Close => {
                 state.close_requested = true;
             }
-            xdg_toplevel::Event::ConfigureBounds { width, height } => {}
-            xdg_toplevel::Event::WmCapabilities { capabilities } => {}
+            xdg_toplevel::Event::ConfigureBounds { .. } => {}
+            xdg_toplevel::Event::WmCapabilities { .. } => {}
             _ => {}
         }
     }
