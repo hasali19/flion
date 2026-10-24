@@ -725,6 +725,10 @@ pub struct BinaryMessageReply {
     response_handle: *const FlutterPlatformMessageResponseHandle,
 }
 
+// SAFETY: Docs don't mention whether we can send a response from a different thread, but I'm
+// pretty sure we can...
+unsafe impl Send for BinaryMessageReply {}
+
 impl BinaryMessageReply {
     pub(crate) fn new(
         engine: flutter_embedder::FlutterEngine,

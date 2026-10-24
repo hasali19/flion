@@ -60,6 +60,7 @@ use crate::engine::{FlutterEngine, FlutterEngineConfig};
 use crate::keyboard::KeyboardState;
 use crate::mouse::MouseState;
 use crate::mouse_cursor::{MouseCursor, MouseCursorHandler};
+use crate::standard_method_channel::StandardMethodHandler;
 use crate::task_queue::FlutterTaskQueue;
 use crate::text_input::{TextInputHandler, TextInputState};
 use crate::touch::TouchState;
@@ -180,16 +181,51 @@ impl FlionApp {
             MouseCursorHandler::new(mouse_cursor.clone()),
         );
 
+        let (create_view_sender, create_view_receiver) = calloop::channel::channel();
         let (add_view_result_sender, add_view_result_receiver) = calloop::channel::channel();
 
-        engine.add_view(1, 1, 1, 1.0, |success| {
-            let _ = add_view_result_sender.send((1, success));
-        })?;
+        struct ViewsHandler {
+            sender: calloop::channel::Sender<standard_method_channel::StandardMethodReply>,
+        }
+
+        event_loop
+            .handle()
+            .insert_source(create_view_receiver, move |event, _, app| {
+                if let calloop::channel::Event::Msg(reply) = event {
+                    let next_view_id = app.windows.keys().max().copied().unwrap_or_default() + 1;
+                    app.engine
+                        .add_view(next_view_id, 0, 0, 1.0, |success| {
+                            let _ = add_view_result_sender.send((next_view_id, success, reply));
+                        })
+                        .unwrap();
+                }
+            })
+            .unwrap();
+
+        impl StandardMethodHandler for ViewsHandler {
+            fn handle(
+                &self,
+                method: &str,
+                _args: codec::EncodableValue,
+                reply: standard_method_channel::StandardMethodReply,
+            ) {
+                if method == "addView" {
+                    self.sender.send(reply).unwrap();
+                }
+            }
+        }
+
+        engine.set_platform_message_handler(
+            "flion/views",
+            ViewsHandler {
+                sender: create_view_sender,
+            },
+        );
 
         event_loop
             .handle()
             .insert_source(add_view_result_receiver, |event, _, app| {
-                if let calloop::channel::Event::Msg((view_id, success)) = event {
+                if let calloop::channel::Event::Msg((view_id, success, reply)) = event {
                     if success {
                         debug!("View added successfully");
 
@@ -210,6 +246,10 @@ impl FlionApp {
                         );
 
                         app.windows.insert(view_id, window);
+
+                        reply.success(&codec::EncodableValue::I64(view_id));
+                    } else {
+                        reply.success(&codec::EncodableValue::Null);
                     }
                 }
             })

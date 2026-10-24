@@ -3,10 +3,16 @@ import 'dart:ui';
 import 'package:dynamic_system_colors/dynamic_system_colors.dart';
 import 'package:flion/flion.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
-void main() {
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  final view = PlatformDispatcher.instance.view(id: 1)!;
+
+  const viewsChannel = MethodChannel('flion/views');
+  final viewId = await viewsChannel.invokeMethod('addView');
+
+  final view = PlatformDispatcher.instance.view(id: viewId)!;
+
   runWidget(ViewCollection(views: [
     View(view: view, child: const MyApp()),
   ]));
