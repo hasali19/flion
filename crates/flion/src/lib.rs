@@ -227,8 +227,6 @@ impl FlionApp {
             .insert_source(add_view_result_receiver, |event, _, app| {
                 if let calloop::channel::Event::Msg((view_id, success, reply)) = event {
                     if success {
-                        debug!("View added successfully");
-
                         let window = Window::new(
                             view_id,
                             &app.qh,
@@ -478,8 +476,6 @@ impl Dispatch<xdg_surface::XdgSurface, WindowId> for AppState {
 
             let width = f64::from(width) * scale_factor;
             let height = f64::from(height) * scale_factor;
-
-            debug!("Window resized {window_id}");
 
             state
                 .engine
