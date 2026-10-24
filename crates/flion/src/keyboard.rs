@@ -22,6 +22,7 @@ use crate::codec::EncodableValue;
 use crate::engine::{FlutterEngine, KeyEvent, KeyEventType};
 use crate::keymap;
 use crate::standard_method_channel::{StandardMethodHandler, StandardMethodReply};
+use crate::text_input::{TextInputKeyEvent, TextInputState};
 
 /// Plane used by the GTK embedder for keys that have no Flutter mapping.
 const GTK_PLANE: u64 = 0x01500000000;
@@ -55,10 +56,11 @@ pub struct KeyboardState {
     repeat_delay: Duration,
     /// Tracks the current pressed key and an event loop timer registration for repeats.
     active_repeat: Option<(xkb::Keycode, RegistrationToken)>,
+    text_input: Rc<RefCell<TextInputState>>,
 }
 
 impl KeyboardState {
-    pub fn new() -> KeyboardState {
+    pub fn new(text_input: Rc<RefCell<TextInputState>>) -> KeyboardState {
         KeyboardState {
             context: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
             state: None,
@@ -67,6 +69,7 @@ impl KeyboardState {
             repeat_rate: 25,
             repeat_delay: Duration::from_millis(600),
             active_repeat: None,
+            text_input,
         }
     }
 
@@ -212,6 +215,14 @@ impl KeyboardState {
             unicode_scalar_values: xkb::keysym_to_utf32(keysym),
         };
 
+        let text_input = self.text_input.clone();
+        let messenger = engine.messenger();
+        let text_input_event = TextInputKeyEvent {
+            event_type,
+            logical,
+            character: character.clone(),
+        };
+
         send_key_event(
             engine,
             KeyEvent {
@@ -222,6 +233,14 @@ impl KeyboardState {
                 physical: Some(physical),
             },
             Some(raw_message),
+            move |handled| {
+                // If the raw key event was unhandled, pass it on to the text input plugin.
+                if !handled {
+                    text_input
+                        .borrow_mut()
+                        .handle_event(&messenger, &text_input_event);
+                }
+            },
         );
     }
 
@@ -253,6 +272,7 @@ impl KeyboardState {
                         physical: Some(physical),
                     },
                     None,
+                    |_| {},
                 );
             }
         }
@@ -287,6 +307,7 @@ impl KeyboardState {
                 physical: Some(physical),
             },
             None,
+            |_| {},
         );
     }
 
@@ -302,6 +323,7 @@ impl KeyboardState {
                     physical: Some(physical),
                 },
                 None,
+                |_| {},
             );
         }
     }
@@ -440,10 +462,13 @@ struct RawKeyResponse {
     handled: bool,
 }
 
-fn send_key_event(engine: &FlutterEngine, event: KeyEvent, raw_message: Option<RawKeyMessage>) {
-    let responses = KeyResponses::new(|_handled| {
-        // TODO: Pass unhandled events on to the text input plugin.
-    });
+fn send_key_event(
+    engine: &FlutterEngine,
+    event: KeyEvent,
+    raw_message: Option<RawKeyMessage>,
+    on_response: impl FnOnce(bool) + 'static,
+) {
+    let responses = KeyResponses::new(on_response);
 
     let response_handle = responses.handle();
     if let Err(e) = engine.send_key_event(&event, move |handled| response_handle.respond(handled)) {

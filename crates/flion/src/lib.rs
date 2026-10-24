@@ -8,6 +8,7 @@ mod mouse;
 mod mouse_cursor;
 mod standard_method_channel;
 mod task_queue;
+mod text_input;
 
 use std::cell::RefCell;
 use std::env;
@@ -48,6 +49,7 @@ use crate::keyboard::KeyboardState;
 use crate::mouse::MouseState;
 use crate::mouse_cursor::{MouseCursor, MouseCursorHandler};
 use crate::task_queue::FlutterTaskQueue;
+use crate::text_input::{TextInputHandler, TextInputState};
 
 pub struct FlionAppBuilder<'a> {
     _p: PhantomData<&'a ()>,
@@ -140,7 +142,8 @@ impl FlionApp {
         let mouse_cursor = Rc::new(RefCell::new(MouseCursor::new()));
 
         let mouse_state = MouseState::default();
-        let keyboard_state = KeyboardState::new();
+        let text_input = Rc::new(RefCell::new(TextInputState::default()));
+        let keyboard_state = KeyboardState::new(text_input.clone());
 
         let platform_message_handlers: Vec<(&str, Box<dyn BinaryMessageHandler>)> = vec![(
             "flutter/mousecursor",
@@ -160,6 +163,7 @@ impl FlionApp {
         })?;
 
         engine.set_platform_message_handler("flutter/keyboard", keyboard_state.channel_handler());
+        engine.set_platform_message_handler("flutter/textinput", TextInputHandler::new(text_input));
 
         let mut app = AppState {
             task_queue: FlutterTaskQueue::new(),
