@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::Path;
-use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::thread::{self, ThreadId};
@@ -49,7 +48,7 @@ pub struct FlutterEngineConfig<'a, C> {
     pub assets_path: &'a str,
     pub aot_library_path: Option<&'a str>,
     pub compositor: C,
-    pub platform_task_handler: Box<dyn Fn(FlutterTask)>,
+    pub platform_task_handler: Box<dyn Fn(FlutterTask) + Send + Sync>,
     pub platform_message_handlers: Vec<(&'a str, Box<dyn BinaryMessageHandler + 'static>)>,
 }
 
@@ -167,7 +166,7 @@ impl FlutterEngine {
     pub fn new<C: FlutterCompositor + FlutterOpenGLCompositor>(
         config: FlutterEngineConfig<'_, C>,
     ) -> eyre::Result<FlutterEngine> {
-        let platform_runner = Rc::new(FlutterTaskRunner::new(move |task| {
+        let platform_runner = Arc::new(FlutterTaskRunner::new(move |task| {
             (config.platform_task_handler)(task)
         }));
 
@@ -478,9 +477,9 @@ fn load_aot_data(path: Option<&str>) -> eyre::Result<Option<FlutterEngineAOTData
     Ok(Some(aot_data))
 }
 
-fn create_task_runner<F: Fn(FlutterTask) + 'static>(
+fn create_task_runner<F: Fn(FlutterTask) + Send + Sync + 'static>(
     id: usize,
-    runner: Rc<FlutterTaskRunner<F>>,
+    runner: Arc<FlutterTaskRunner<F>>,
 ) -> FlutterTaskRunnerDescription {
     unsafe extern "C" fn runs_tasks_on_current_thread<F>(task_runner: *mut c_void) -> bool {
         unsafe { task_runner.cast::<FlutterTaskRunner<F>>().as_ref().unwrap() }
@@ -497,10 +496,10 @@ fn create_task_runner<F: Fn(FlutterTask) + 'static>(
     }
 
     unsafe extern "C" fn destruction_callback<F: Fn(FlutterTask)>(user_data: *mut c_void) {
-        unsafe { drop(Rc::from_raw(user_data.cast::<FlutterTaskRunner<F>>())) };
+        unsafe { drop(Arc::from_raw(user_data.cast::<FlutterTaskRunner<F>>())) };
     }
 
-    let runner = Rc::into_raw(runner).cast_mut();
+    let runner = Arc::into_raw(runner).cast_mut();
 
     FlutterTaskRunnerDescription {
         struct_size: mem::size_of::<FlutterTaskRunnerDescription>(),
@@ -517,6 +516,10 @@ pub struct FlutterTask {
     target_time: u64,
     task: flutter_embedder::FlutterTask,
 }
+
+// SAFETY: The `flutter_embedder::FlutterTask` is basically an opaque task handle from our
+// perspective. The engine expects it to be sent between threads.
+unsafe impl Send for FlutterTask {}
 
 impl FlutterTask {
     pub fn target_time_nanos(&self) -> u64 {
