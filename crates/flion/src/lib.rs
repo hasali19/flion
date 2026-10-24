@@ -2,6 +2,8 @@ mod codec;
 mod compositor;
 mod egl;
 mod engine;
+mod keyboard;
+mod keymap;
 mod mouse;
 mod mouse_cursor;
 mod standard_method_channel;
@@ -15,11 +17,12 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::time::Instant;
 
-use calloop::EventLoop;
+use calloop::{EventLoop, LoopHandle};
 use calloop_wayland_source::WaylandSource;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle, WaylandWindowHandle, WindowHandle};
 use tracing::debug;
 use wayland_client::protocol::wl_compositor::{self, WlCompositor};
+use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
 use wayland_client::protocol::wl_pointer::{self, WlPointer};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::protocol::wl_seat::{self, Capability, WlSeat};
@@ -41,6 +44,7 @@ use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel};
 use crate::compositor::OpenGLCompositor;
 use crate::egl::EglDisplay;
 use crate::engine::{BinaryMessageHandler, FlutterEngine, FlutterEngineConfig};
+use crate::keyboard::KeyboardState;
 use crate::mouse::MouseState;
 use crate::mouse_cursor::{MouseCursor, MouseCursorHandler};
 use crate::task_queue::FlutterTaskQueue;
@@ -135,6 +139,9 @@ impl FlionApp {
 
         let mouse_cursor = Rc::new(RefCell::new(MouseCursor::new()));
 
+        let mouse_state = MouseState::default();
+        let keyboard_state = KeyboardState::new();
+
         let platform_message_handlers: Vec<(&str, Box<dyn BinaryMessageHandler>)> = vec![(
             "flutter/mousecursor",
             Box::new(MouseCursorHandler::new(mouse_cursor.clone())),
@@ -152,6 +159,8 @@ impl FlionApp {
             platform_message_handlers,
         })?;
 
+        engine.set_platform_message_handler("flutter/keyboard", keyboard_state.channel_handler());
+
         let mut app = AppState {
             task_queue: FlutterTaskQueue::new(),
             engine,
@@ -159,8 +168,11 @@ impl FlionApp {
             window_size: (0, 0),
             scale_factor: 1.0,
             viewport,
+            loop_handle: event_loop.handle(),
             pointer: None,
-            mouse: MouseState::default(),
+            mouse: mouse_state,
+            keyboard: None,
+            keyboard_state,
             mouse_cursor,
             cursor_shape_manager,
         };
@@ -184,6 +196,10 @@ impl FlionApp {
 
         app.mouse_cursor.borrow_mut().set_pointer(None, None);
 
+        if let Some(keyboard) = app.keyboard.take() {
+            keyboard.release();
+        }
+
         if let Some(manager) = app.cursor_shape_manager.take() {
             manager.destroy();
         }
@@ -205,8 +221,11 @@ struct AppState {
     window_size: (u32, u32),
     scale_factor: f64,
     viewport: WpViewport,
+    loop_handle: LoopHandle<'static, AppState>,
     pointer: Option<WlPointer>,
     mouse: MouseState,
+    keyboard: Option<WlKeyboard>,
+    keyboard_state: KeyboardState,
     mouse_cursor: Rc<RefCell<MouseCursor>>,
     cursor_shape_manager: Option<WpCursorShapeManagerV1>,
 }
@@ -411,6 +430,14 @@ impl Dispatch<wl_seat::WlSeat, ()> for AppState {
                         state.mouse_cursor.borrow_mut().set_pointer(None, None);
                         pointer.release();
                     }
+
+                    if capabilities.contains(Capability::Keyboard) {
+                        if state.keyboard.is_none() {
+                            state.keyboard = Some(seat.get_keyboard(qh, ()));
+                        }
+                    } else if let Some(keyboard) = state.keyboard.take() {
+                        keyboard.release();
+                    }
                 }
                 wayland_client::WEnum::Unknown(_) => {}
             }
@@ -460,5 +487,20 @@ impl Dispatch<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1, ()> for AppState
         _conn: &Connection,
         _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
+    }
+}
+
+impl Dispatch<wl_keyboard::WlKeyboard, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_keyboard::WlKeyboard,
+        event: <wl_keyboard::WlKeyboard as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        state
+            .keyboard_state
+            .handle_event(&state.engine, &state.loop_handle, event);
     }
 }

@@ -59,12 +59,8 @@ enum BuildTarget {
 impl BuildTarget {
     pub fn platform_default() -> BuildTarget {
         cfg_select! {
-            target_os = "windows" => {
-                BuildTarget::Windows
-            }
-            target_os = "linux" => {
-                BuildTarget::Linux
-            }
+            target_os = "windows" => BuildTarget::Windows,
+            target_os = "linux" => BuildTarget::Linux,
         }
     }
 
@@ -740,11 +736,7 @@ fn copy_if_newer(src: &Path, dst: &Path) -> eyre::Result<()> {
 
 fn symlink_dir(original: impl AsRef<Path>, link: impl AsRef<Path>) -> std::io::Result<()> {
     cfg_select! {
-        target_os = "linux" => {
-            std::os::unix::fs::symlink(original, link)
-        }
-        target_os = "windows" => {
-            std::os::windows::fs::symlink_dir(original, link)
-        }
+        target_os = "linux" => std::os::unix::fs::symlink(original, link),
+        target_os = "windows" => std::os::windows::fs::symlink_dir(original, link),
     }
 }

@@ -355,14 +355,18 @@ impl FlutterEngine {
         // This is freed above when the calback invoked.
         let reply = Box::into_raw(Box::new(callback));
 
+        let character = event
+            .character
+            .as_deref()
+            .and_then(|c| CString::new(c).ok());
+
         let event = FlutterKeyEvent {
             struct_size: mem::size_of::<FlutterKeyEvent>(),
             timestamp: unsafe { FlutterEngineGetCurrentTime() as f64 },
             type_: event.event_type as u32,
-            character: event
-                .character
+            character: character
                 .as_deref()
-                .map(|c| c.as_ptr().cast())
+                .map(|c| c.as_ptr())
                 .unwrap_or(ptr::null()),
             synthesized: event.synthesized,
             logical: event.logical.unwrap_or(0),
@@ -379,6 +383,7 @@ impl FlutterEngine {
             );
 
             if result != FlutterEngineResult_kSuccess {
+                drop(Box::from_raw(reply));
                 bail!("failed to send key event: {result}");
             }
         }
@@ -611,6 +616,7 @@ impl BinaryMessenger {
             };
 
             if result != FlutterEngineResult_kSuccess {
+                drop(unsafe { Box::from_raw(reply) });
                 bail!("failed to create response handle: {result}");
             }
 
@@ -628,6 +634,10 @@ impl BinaryMessenger {
             };
 
             if result != FlutterEngineResult_kSuccess {
+                unsafe {
+                    FlutterPlatformMessageReleaseResponseHandle(self.engine, response_handle);
+                    drop(Box::from_raw(reply));
+                }
                 bail!("failed to send platform message: {result}");
             }
 
