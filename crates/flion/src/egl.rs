@@ -153,6 +153,9 @@ pub struct EglSurface {
     _window: Box<dyn HasWindowHandle + Send + Sync>,
 }
 
+// SAFETY: All fields implement Send except egl::Surface, which is safe to send between threads.
+unsafe impl Send for EglSurface {}
+
 impl EglSurface {
     pub fn resize(&self, width: u32, height: u32) {
         self.wl_egl_surface

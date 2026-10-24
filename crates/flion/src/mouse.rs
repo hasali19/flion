@@ -1,7 +1,7 @@
 use std::mem;
 
-use wayland_client::WEnum;
 use wayland_client::protocol::wl_pointer;
+use wayland_client::{WEnum, protocol::wl_surface::WlSurface};
 
 use crate::engine::{
     FlutterEngine, PointerButtons, PointerDeviceKind, PointerEvent, PointerPhase, PointerSignal,
@@ -23,6 +23,8 @@ const BTN_BACK: u32 = 0x116;
 
 #[derive(Default)]
 pub struct MouseState {
+    /// The view that the pointer is currently over (or was last over).
+    view_id: Option<i64>,
     added: bool,
     entered: bool,
     x: f64,
@@ -46,9 +48,18 @@ impl MouseState {
     pub fn handle_event(
         &mut self,
         engine: &FlutterEngine,
-        scale_factor: f64,
+        view_id_for_surface: impl Fn(&WlSurface) -> Option<i64>,
+        scale_factor_for_view: impl Fn(i64) -> Option<f64>,
         event: wl_pointer::Event,
     ) {
+        if let wl_pointer::Event::Enter { surface, .. } = &event {
+            self.view_id = view_id_for_surface(surface);
+        }
+
+        let Some(scale_factor) = self.view_id.and_then(scale_factor_for_view) else {
+            return;
+        };
+
         match event {
             wl_pointer::Event::Enter {
                 surface_x,
@@ -195,6 +206,7 @@ impl MouseState {
 
     fn pointer_event(&self, phase: PointerPhase) -> PointerEvent {
         PointerEvent {
+            view_id: self.view_id.expect("Pointer must have entered a surface"),
             device_kind: PointerDeviceKind::Mouse,
             device_id: MOUSE_DEVICE_ID,
             phase,

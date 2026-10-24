@@ -1,9 +1,15 @@
+import 'dart:ui';
+
 import 'package:dynamic_system_colors/dynamic_system_colors.dart';
 import 'package:flion/flion.dart';
 import 'package:flutter/material.dart';
 
 void main() {
-  runApp(const MyApp());
+  WidgetsFlutterBinding.ensureInitialized();
+  final view = PlatformDispatcher.instance.view(id: 1)!;
+  runWidget(ViewCollection(views: [
+    View(view: view, child: const MyApp()),
+  ]));
 }
 
 class MyApp extends StatelessWidget {
@@ -120,7 +126,10 @@ class _MyHomePageState extends State<MyHomePage> {
               // horizontal).
               mainAxisAlignment: MainAxisAlignment.center,
               children: <Widget>[
-                TextField(controller: _textController),
+                Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: TextField(controller: _textController),
+                ),
                 const Text('You have pushed the button this many times:'),
                 Text(
                   '$_counter',

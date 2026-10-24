@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::ffi::{CStr, c_char};
+use std::sync::Arc;
 use std::{mem, ptr};
 
 use eyre::bail;
@@ -9,6 +11,7 @@ use flutter_embedder::{
     FlutterOpenGLTargetType_kFlutterOpenGLTargetTypeFramebuffer,
 };
 use parking_lot::Mutex;
+use tracing::warn;
 
 use crate::egl::{EglContext, EglDisplay, EglSurface};
 use crate::engine::{FlutterCompositor, FlutterOpenGLCompositor};
@@ -17,25 +20,52 @@ pub struct OpenGLCompositor {
     display: EglDisplay,
     resources: EglResources,
     renderer: LayerRenderer,
-    surface_size: Mutex<Option<(u32, u32)>>,
+    surfaces: Arc<ViewSurfaceRegistry>,
 }
 
 struct EglResources {
     context: EglContext,
     resource_context: EglContext,
     composite_context: EglContext,
-    surface: EglSurface,
+}
+
+#[derive(Default)]
+pub struct ViewSurfaceRegistry {
+    map: Mutex<HashMap<i64, ViewSurface>>,
+}
+
+struct ViewSurface {
+    egl_surface: EglSurface,
+    size: Option<(u32, u32)>,
+}
+
+impl ViewSurfaceRegistry {
+    pub fn add(&self, view_id: i64, surface: EglSurface) {
+        self.map.lock().insert(
+            view_id,
+            ViewSurface {
+                egl_surface: surface,
+                size: None,
+            },
+        );
+    }
+
+    pub fn remove(&self, view_id: i64) -> Option<EglSurface> {
+        self.map
+            .lock()
+            .remove(&view_id)
+            .map(|view| view.egl_surface)
+    }
 }
 
 impl OpenGLCompositor {
-    pub fn new(display: EglDisplay, surface: EglSurface) -> eyre::Result<Self> {
+    pub fn new(display: EglDisplay, surfaces: Arc<ViewSurfaceRegistry>) -> eyre::Result<Self> {
         let context = display.create_context()?;
 
         let resources = EglResources {
             resource_context: display.create_shared_context(&context)?,
             composite_context: display.create_shared_context(&context)?,
             context,
-            surface,
         };
 
         display.make_current(Some(&resources.composite_context), None)?;
@@ -46,7 +76,7 @@ impl OpenGLCompositor {
             display,
             resources,
             renderer,
-            surface_size: Mutex::default(),
+            surfaces,
         })
     }
 
@@ -149,32 +179,35 @@ impl FlutterOpenGLCompositor for OpenGLCompositor {
 
     fn present_view(
         &self,
-        _view_id: i64,
+        view_id: i64,
         layers: &[&flutter_embedder::FlutterLayer],
     ) -> eyre::Result<()> {
-        let size = {
-            let mut surface_size = self.surface_size.lock();
+        let mut surfaces = self.surfaces.map.lock();
 
-            let Some(size) = get_view_size_for_layers(layers).or(*surface_size) else {
-                return Ok(());
-            };
-
-            if *surface_size != Some(size) {
-                self.resources.surface.resize(size.0, size.1);
-                *surface_size = Some(size);
-            }
-
-            size
+        let Some(surface) = surfaces.get_mut(&view_id) else {
+            warn!("Could not present view {view_id}: no surface");
+            return Ok(());
         };
+
+        let Some(size) = get_view_size_for_layers(layers).or(surface.size) else {
+            return Ok(());
+        };
+
+        if surface.size != Some(size) {
+            // TODO: Should this resize be done here?
+            surface.egl_surface.resize(size.0, size.1);
+            surface.size = Some(size);
+        }
 
         self.display.make_current(
             Some(&self.resources.composite_context),
-            Some(&self.resources.surface),
+            Some(&surface.egl_surface),
         )?;
 
         self.composite_layers(size, layers);
 
-        self.display.swap_buffers(&self.resources.surface)?;
+        // TODO: This blocks waiting on vsync which will be a problem for multiple views
+        self.display.swap_buffers(&surface.egl_surface)?;
 
         self.display.make_current(None, None)?;
 

@@ -14,11 +14,13 @@ mod touch;
 pub mod codec;
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::env;
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use calloop::{EventLoop, LoopHandle};
@@ -36,7 +38,7 @@ use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::protocol::wl_seat::{self, Capability, WlSeat};
 use wayland_client::protocol::wl_surface::{self, WlSurface};
 use wayland_client::protocol::wl_touch::{self, WlTouch};
-use wayland_client::{Connection, Dispatch, Proxy};
+use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1;
 use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_manager_v1::{
     self, WpCursorShapeManagerV1,
@@ -47,11 +49,12 @@ use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_man
 use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1;
 use wayland_protocols::wp::viewporter::client::wp_viewport::{self, WpViewport};
 use wayland_protocols::wp::viewporter::client::wp_viewporter::{self, WpViewporter};
+use wayland_protocols::xdg::shell::client::xdg_surface::{self, XdgSurface};
+use wayland_protocols::xdg::shell::client::xdg_toplevel::{self, XdgToplevel};
 use wayland_protocols::xdg::shell::client::xdg_wm_base::{self, XdgWmBase};
-use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel};
 
 use crate::clipboard::{Clipboard, OfferData, PlatformHandler};
-use crate::compositor::OpenGLCompositor;
+use crate::compositor::{OpenGLCompositor, ViewSurfaceRegistry};
 use crate::egl::EglDisplay;
 use crate::engine::{FlutterEngine, FlutterEngineConfig};
 use crate::keyboard::KeyboardState;
@@ -112,17 +115,9 @@ impl FlionApp {
 
         WaylandSource::new(conn, event_queue).insert(event_loop.handle())?;
 
-        let surface = compositor.create_surface(&qh, ());
-        let xdg_surface = xdg_wm_base.get_xdg_surface(&surface, &qh, ());
-        let top_level = xdg_surface.get_toplevel(&qh, ());
-        let viewport = viewporter.get_viewport(&surface, &qh, ());
-        let fractional_scale = fractional_scale_manager.get_fractional_scale(&surface, &qh, ());
+        struct SurfaceHandle(WlSurface);
 
-        surface.commit();
-
-        struct Window(WlSurface);
-
-        impl HasWindowHandle for Window {
+        impl HasWindowHandle for SurfaceHandle {
             fn window_handle(
                 &self,
             ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError>
@@ -146,10 +141,6 @@ impl FlionApp {
             })
             .unwrap();
 
-        let egl_surface = egl
-            .create_window_surface(Window(surface.clone()), 1, 1)
-            .unwrap();
-
         let mouse_cursor = Rc::new(RefCell::new(MouseCursor::new()));
 
         let mouse_state = MouseState::default();
@@ -165,10 +156,13 @@ impl FlionApp {
 
         let aot_library_path = env::var("FLION_AOT_LIBRARY_PATH").map(PathBuf::from).ok();
 
+        let view_surfaces = Arc::new(ViewSurfaceRegistry::default());
+        let opengl_compositor = OpenGLCompositor::new(egl.clone(), view_surfaces.clone()).unwrap();
+
         let engine = FlutterEngine::new(FlutterEngineConfig {
             assets_path: &env::var("FLION_ASSETS_PATH").unwrap(),
             aot_library_path: aot_library_path.as_deref().and_then(|p| p.to_str()),
-            compositor: OpenGLCompositor::new(egl.clone(), egl_surface).unwrap(),
+            compositor: opengl_compositor,
             platform_task_handler: Box::new(move |task| {
                 let _ = task_sender.send(task);
             }),
@@ -186,13 +180,52 @@ impl FlionApp {
             MouseCursorHandler::new(mouse_cursor.clone()),
         );
 
+        let (add_view_result_sender, add_view_result_receiver) = calloop::channel::channel();
+
+        engine.add_view(1, 1, 1, 1.0, |success| {
+            let _ = add_view_result_sender.send((1, success));
+        })?;
+
+        event_loop
+            .handle()
+            .insert_source(add_view_result_receiver, |event, _, app| {
+                if let calloop::channel::Event::Msg((view_id, success)) = event {
+                    if success {
+                        debug!("View added successfully");
+
+                        let window = Window::new(
+                            view_id,
+                            &app.qh,
+                            &app.compositor,
+                            &app.xdg_wm_base,
+                            &app.viewporter,
+                            &app.fractional_scale_manager,
+                        );
+
+                        app.view_surfaces.add(
+                            window.id,
+                            app.egl
+                                .create_window_surface(SurfaceHandle(window.surface.clone()), 1, 1)
+                                .unwrap(),
+                        );
+
+                        app.windows.insert(view_id, window);
+                    }
+                }
+            })
+            .unwrap();
+
         let mut app = AppState {
+            qh,
+            compositor,
+            xdg_wm_base,
+            viewporter,
+            fractional_scale_manager,
+            egl,
             task_queue: FlutterTaskQueue::new(),
             engine,
-            close_requested: false,
-            window_size: (0, 0),
-            scale_factor: 1.0,
-            viewport,
+            view_surfaces,
+            windows: BTreeMap::from([]),
             loop_handle: event_loop.handle(),
             pointer: None,
             mouse: mouse_state,
@@ -205,7 +238,7 @@ impl FlionApp {
             clipboard,
         };
 
-        while !app.close_requested {
+        while app.windows.is_empty() || !app.windows.values().any(|window| window.close_requested) {
             let timeout = app
                 .task_queue
                 .next_deadline()
@@ -216,11 +249,10 @@ impl FlionApp {
             app.task_queue.run_tasks(&app.engine);
         }
 
-        fractional_scale.destroy();
-        app.viewport.destroy();
-        top_level.destroy();
-        xdg_surface.destroy();
-        surface.destroy();
+        for window in std::mem::take(&mut app.windows).into_values() {
+            drop(app.view_surfaces.remove(window.id));
+            window.destroy();
+        }
 
         app.mouse_cursor.borrow_mut().set_pointer(None, None);
 
@@ -239,22 +271,28 @@ impl FlionApp {
         app.clipboard.borrow_mut().destroy();
 
         seat.release();
-        fractional_scale.destroy();
-        viewporter.destroy();
-        xdg_wm_base.destroy();
-        compositor.release();
+        app.fractional_scale_manager.destroy();
+        app.viewporter.destroy();
+        app.xdg_wm_base.destroy();
+        app.compositor.release();
 
         Ok(())
     }
 }
 
+type WindowId = i64;
+
 struct AppState {
+    qh: QueueHandle<AppState>,
+    compositor: WlCompositor,
+    xdg_wm_base: XdgWmBase,
+    viewporter: WpViewporter,
+    fractional_scale_manager: WpFractionalScaleManagerV1,
+    egl: EglDisplay,
     task_queue: FlutterTaskQueue,
     engine: FlutterEngine,
-    close_requested: bool,
-    window_size: (u32, u32),
-    scale_factor: f64,
-    viewport: WpViewport,
+    view_surfaces: Arc<ViewSurfaceRegistry>,
+    windows: BTreeMap<WindowId, Window>,
     loop_handle: LoopHandle<'static, AppState>,
     pointer: Option<WlPointer>,
     mouse: MouseState,
@@ -265,6 +303,57 @@ struct AppState {
     mouse_cursor: Rc<RefCell<MouseCursor>>,
     cursor_shape_manager: Option<WpCursorShapeManagerV1>,
     clipboard: Rc<RefCell<Clipboard>>,
+}
+
+struct Window {
+    id: WindowId,
+    surface: WlSurface,
+    xdg_surface: XdgSurface,
+    toplevel: XdgToplevel,
+    viewport: WpViewport,
+    fractional_scale: wp_fractional_scale_v1::WpFractionalScaleV1,
+    size: (u32, u32),
+    scale_factor: f64,
+    close_requested: bool,
+}
+
+impl Window {
+    fn new(
+        id: WindowId,
+        qh: &QueueHandle<AppState>,
+        compositor: &WlCompositor,
+        xdg_wm_base: &XdgWmBase,
+        viewporter: &WpViewporter,
+        fractional_scale_manager: &WpFractionalScaleManagerV1,
+    ) -> Window {
+        let surface = compositor.create_surface(qh, id);
+        let xdg_surface = xdg_wm_base.get_xdg_surface(&surface, qh, id);
+        let toplevel = xdg_surface.get_toplevel(qh, id);
+        let viewport = viewporter.get_viewport(&surface, qh, id);
+        let fractional_scale = fractional_scale_manager.get_fractional_scale(&surface, qh, id);
+
+        surface.commit();
+
+        Window {
+            id,
+            surface,
+            xdg_surface,
+            toplevel,
+            viewport,
+            fractional_scale,
+            size: (0, 0),
+            scale_factor: 1.0,
+            close_requested: false,
+        }
+    }
+
+    fn destroy(self) {
+        self.fractional_scale.destroy();
+        self.viewport.destroy();
+        self.toplevel.destroy();
+        self.xdg_surface.destroy();
+        self.surface.destroy();
+    }
 }
 
 impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListContents> for AppState {
@@ -300,12 +389,12 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for AppState {
     }
 }
 
-impl Dispatch<wl_surface::WlSurface, ()> for AppState {
+impl Dispatch<wl_surface::WlSurface, WindowId> for AppState {
     fn event(
         _state: &mut Self,
         _proxy: &wl_surface::WlSurface,
         _event: <wl_surface::WlSurface as Proxy>::Event,
-        _data: &(),
+        _data: &WindowId,
         _conn: &Connection,
         _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
@@ -328,26 +417,38 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for AppState {
     }
 }
 
-impl Dispatch<xdg_surface::XdgSurface, ()> for AppState {
+impl Dispatch<xdg_surface::XdgSurface, WindowId> for AppState {
     fn event(
         state: &mut Self,
         proxy: &xdg_surface::XdgSurface,
         event: <xdg_surface::XdgSurface as Proxy>::Event,
-        _data: &(),
+        window_id: &WindowId,
         _conn: &Connection,
         _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         if let xdg_surface::Event::Configure { serial } = event {
-            let (width, height) = state.window_size;
+            let Some(window) = state.windows.get(window_id) else {
+                return;
+            };
 
-            state.viewport.set_destination(width as i32, height as i32);
+            let (width, height) = window.size;
+            let scale_factor = window.scale_factor;
 
-            let width = f64::from(width) * state.scale_factor;
-            let height = f64::from(height) * state.scale_factor;
+            window.viewport.set_destination(width as i32, height as i32);
+
+            let width = f64::from(width) * scale_factor;
+            let height = f64::from(height) * scale_factor;
+
+            debug!("Window resized {window_id}");
 
             state
                 .engine
-                .send_window_metrics_event(width as usize, height as usize, state.scale_factor)
+                .send_window_metrics_event(
+                    *window_id,
+                    width as usize,
+                    height as usize,
+                    scale_factor,
+                )
                 .unwrap();
 
             proxy.ack_configure(serial);
@@ -355,23 +456,27 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for AppState {
     }
 }
 
-impl Dispatch<xdg_toplevel::XdgToplevel, ()> for AppState {
+impl Dispatch<xdg_toplevel::XdgToplevel, WindowId> for AppState {
     fn event(
         state: &mut Self,
         _proxy: &xdg_toplevel::XdgToplevel,
         event: <xdg_toplevel::XdgToplevel as Proxy>::Event,
-        _data: &(),
+        window_id: &WindowId,
         _conn: &Connection,
         _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
+        let Some(window) = state.windows.get_mut(window_id) else {
+            return;
+        };
+
         match event {
             xdg_toplevel::Event::Configure { width, height, .. } => {
                 let width = if width == 0 { 1280 } else { width };
                 let height = if height == 0 { 800 } else { height };
-                state.window_size = (width as u32, height as u32);
+                window.size = (width as u32, height as u32);
             }
             xdg_toplevel::Event::Close => {
-                state.close_requested = true;
+                window.close_requested = true;
             }
             xdg_toplevel::Event::ConfigureBounds { .. } => {}
             xdg_toplevel::Event::WmCapabilities { .. } => {}
@@ -392,12 +497,12 @@ impl Dispatch<wp_viewporter::WpViewporter, ()> for AppState {
     }
 }
 
-impl Dispatch<wp_viewport::WpViewport, ()> for AppState {
+impl Dispatch<wp_viewport::WpViewport, WindowId> for AppState {
     fn event(
         _state: &mut Self,
         _proxy: &wp_viewport::WpViewport,
         _event: <wp_viewport::WpViewport as Proxy>::Event,
-        _data: &(),
+        _data: &WindowId,
         _conn: &Connection,
         _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
@@ -416,17 +521,19 @@ impl Dispatch<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1, ()> fo
     }
 }
 
-impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for AppState {
+impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, WindowId> for AppState {
     fn event(
         state: &mut Self,
         _proxy: &wp_fractional_scale_v1::WpFractionalScaleV1,
         event: <wp_fractional_scale_v1::WpFractionalScaleV1 as Proxy>::Event,
-        _data: &(),
+        window_id: &WindowId,
         _conn: &Connection,
         _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
-        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
-            state.scale_factor = f64::from(scale) / 120.0;
+        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event
+            && let Some(window) = state.windows.get_mut(window_id)
+        {
+            window.scale_factor = f64::from(scale) / 120.0;
             // TODO: Probably need to send a window metrics event to flutter
         }
     }
@@ -506,9 +613,14 @@ impl Dispatch<wl_pointer::WlPointer, ()> for AppState {
             state.mouse_cursor.borrow_mut().on_leave();
         }
 
-        state
-            .mouse
-            .handle_event(&state.engine, state.scale_factor, event);
+        let windows = &state.windows;
+
+        state.mouse.handle_event(
+            &state.engine,
+            |surface| surface.data().copied(),
+            |id| windows.get(&id).map(|window| window.scale_factor),
+            event,
+        );
     }
 }
 
@@ -549,9 +661,12 @@ impl Dispatch<wl_touch::WlTouch, ()> for AppState {
             state.clipboard.borrow_mut().set_input_serial(*serial);
         }
 
-        state
-            .touch_state
-            .handle_event(&state.engine, state.scale_factor, event);
+        state.touch_state.handle_event(
+            &state.engine,
+            |surface| surface.data().copied(),
+            |id| state.windows.get(&id).map(|window| window.scale_factor),
+            event,
+        );
     }
 }
 

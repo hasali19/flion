@@ -7,11 +7,12 @@ use std::thread::{self, ThreadId};
 use std::{mem, ptr};
 
 use bitflags::bitflags;
-use eyre::{Context, bail};
+use eyre::{Context, bail, eyre};
 use flutter_embedder::{
-    FlutterBackingStore, FlutterBackingStoreConfig, FlutterCustomTaskRunners, FlutterEngineAOTData,
-    FlutterEngineAOTDataSource, FlutterEngineAOTDataSource__bindgen_ty_1,
-    FlutterEngineAOTDataSourceType_kFlutterEngineAOTDataSourceTypeElfPath,
+    FlutterAddViewInfo, FlutterAddViewResult, FlutterBackingStore, FlutterBackingStoreConfig,
+    FlutterCustomTaskRunners, FlutterEngineAOTData, FlutterEngineAOTDataSource,
+    FlutterEngineAOTDataSource__bindgen_ty_1,
+    FlutterEngineAOTDataSourceType_kFlutterEngineAOTDataSourceTypeElfPath, FlutterEngineAddView,
     FlutterEngineCreateAOTData, FlutterEngineGetCurrentTime, FlutterEngineInitialize,
     FlutterEngineResult_kSuccess, FlutterEngineRunInitialized, FlutterEngineRunTask,
     FlutterEngineRunsAOTCompiledDartCode, FlutterEngineSendKeyEvent,
@@ -125,6 +126,7 @@ pub enum PointerSignal {
 
 #[derive(Default)]
 pub struct PointerEvent {
+    pub view_id: i64,
     pub device_kind: PointerDeviceKind,
     pub device_id: i32,
     pub phase: PointerPhase,
@@ -262,8 +264,53 @@ impl FlutterEngine {
         })
     }
 
+    pub fn add_view<F: FnOnce(bool) + Send>(
+        &self,
+        view_id: i64,
+        width: usize,
+        height: usize,
+        pixel_ratio: f64,
+        callback: F,
+    ) -> eyre::Result<()> {
+        let callback = Box::into_raw(Box::new(callback));
+
+        extern "C" fn trampoline<F: FnOnce(bool) + Send>(result: *const FlutterAddViewResult) {
+            let success = unsafe { (*result).added };
+            let callback = unsafe { Box::from_raw((*result).user_data.cast::<F>()) };
+            callback(success);
+        }
+
+        let result = unsafe {
+            FlutterEngineAddView(
+                self.engine(),
+                &FlutterAddViewInfo {
+                    struct_size: mem::size_of::<FlutterAddViewInfo>(),
+                    view_id,
+                    view_metrics: &FlutterWindowMetricsEvent {
+                        struct_size: mem::size_of::<FlutterWindowMetricsEvent>(),
+                        view_id,
+                        width,
+                        height,
+                        pixel_ratio,
+                        ..Default::default()
+                    },
+                    user_data: callback.cast(),
+                    add_view_callback: Some(trampoline::<F>),
+                },
+            )
+        };
+
+        if result != FlutterEngineResult_kSuccess {
+            unsafe { drop(Box::from_raw(callback)) };
+            return Err(eyre!("Failed to add view"));
+        }
+
+        Ok(())
+    }
+
     pub fn send_window_metrics_event(
         &self,
+        view_id: i64,
         width: usize,
         height: usize,
         pixel_ratio: f64,
@@ -273,6 +320,7 @@ impl FlutterEngine {
                 self.engine(),
                 &FlutterWindowMetricsEvent {
                     struct_size: mem::size_of::<FlutterWindowMetricsEvent>(),
+                    view_id,
                     width,
                     height,
                     pixel_ratio,
@@ -323,6 +371,7 @@ impl FlutterEngine {
 
                 FlutterPointerEvent {
                     struct_size: mem::size_of::<FlutterPointerEvent>(),
+                    view_id: event.view_id,
                     device_kind: event.device_kind as FlutterPointerDeviceKind,
                     device: event.device_id,
                     phase: event.phase as FlutterPointerPhase,
