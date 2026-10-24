@@ -1,3 +1,4 @@
+mod clipboard;
 mod codec;
 mod compositor;
 mod egl;
@@ -24,6 +25,10 @@ use calloop_wayland_source::WaylandSource;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle, WaylandWindowHandle, WindowHandle};
 use tracing::debug;
 use wayland_client::protocol::wl_compositor::{self, WlCompositor};
+use wayland_client::protocol::wl_data_device::{self, WlDataDevice};
+use wayland_client::protocol::wl_data_device_manager::{self, WlDataDeviceManager};
+use wayland_client::protocol::wl_data_offer::{self, WlDataOffer};
+use wayland_client::protocol::wl_data_source;
 use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
 use wayland_client::protocol::wl_pointer::{self, WlPointer};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
@@ -44,9 +49,10 @@ use wayland_protocols::wp::viewporter::client::wp_viewporter::{self, WpViewporte
 use wayland_protocols::xdg::shell::client::xdg_wm_base::{self, XdgWmBase};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel};
 
+use crate::clipboard::{Clipboard, OfferData, PlatformHandler};
 use crate::compositor::OpenGLCompositor;
 use crate::egl::EglDisplay;
-use crate::engine::{BinaryMessageHandler, FlutterEngine, FlutterEngineConfig};
+use crate::engine::{FlutterEngine, FlutterEngineConfig};
 use crate::keyboard::KeyboardState;
 use crate::mouse::MouseState;
 use crate::mouse_cursor::{MouseCursor, MouseCursorHandler};
@@ -97,6 +103,7 @@ impl FlionApp {
         let seat: WlSeat = globals.bind(&qh, 5..=11, ())?;
         let cursor_shape_manager: Option<WpCursorShapeManagerV1> =
             globals.bind(&qh, 1..=1, ()).ok();
+        let data_device_manager: Option<WlDataDeviceManager> = globals.bind(&qh, 1..=3, ()).ok();
 
         let mut event_loop: EventLoop<'_, AppState> = EventLoop::try_new()?;
 
@@ -148,11 +155,12 @@ impl FlionApp {
         let touch_state = TouchState::default();
         let text_input = Rc::new(RefCell::new(TextInputState::default()));
         let keyboard_state = KeyboardState::new(text_input.clone());
-
-        let platform_message_handlers: Vec<(&str, Box<dyn BinaryMessageHandler>)> = vec![(
-            "flutter/mousecursor",
-            Box::new(MouseCursorHandler::new(mouse_cursor.clone())),
-        )];
+        let clipboard = Rc::new(RefCell::new(Clipboard::new(
+            data_device_manager,
+            &seat,
+            qh.clone(),
+            event_loop.handle(),
+        )));
 
         let aot_library_path = env::var("FLION_AOT_LIBRARY_PATH").map(PathBuf::from).ok();
 
@@ -163,11 +171,19 @@ impl FlionApp {
             platform_task_handler: Box::new(move |task| {
                 let _ = task_sender.send(task);
             }),
-            platform_message_handlers,
+            platform_message_handlers: vec![],
         })?;
 
         engine.set_platform_message_handler("flutter/keyboard", keyboard_state.channel_handler());
         engine.set_platform_message_handler("flutter/textinput", TextInputHandler::new(text_input));
+        engine.set_platform_message_handler(
+            "flutter/platform",
+            PlatformHandler::new(clipboard.clone()),
+        );
+        engine.set_platform_message_handler(
+            "flutter/mousecursor",
+            MouseCursorHandler::new(mouse_cursor.clone()),
+        );
 
         let mut app = AppState {
             task_queue: FlutterTaskQueue::new(),
@@ -185,6 +201,7 @@ impl FlionApp {
             keyboard_state,
             mouse_cursor,
             cursor_shape_manager,
+            clipboard,
         };
 
         while !app.close_requested {
@@ -218,6 +235,8 @@ impl FlionApp {
             manager.destroy();
         }
 
+        app.clipboard.borrow_mut().destroy();
+
         seat.release();
         fractional_scale.destroy();
         viewporter.destroy();
@@ -244,6 +263,7 @@ struct AppState {
     keyboard_state: KeyboardState,
     mouse_cursor: Rc<RefCell<MouseCursor>>,
     cursor_shape_manager: Option<WpCursorShapeManagerV1>,
+    clipboard: Rc<RefCell<Clipboard>>,
 }
 
 impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListContents> for AppState {
@@ -479,6 +499,10 @@ impl Dispatch<wl_pointer::WlPointer, ()> for AppState {
         _conn: &Connection,
         _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
+        if let wl_pointer::Event::Button { serial, .. } = &event {
+            state.clipboard.borrow_mut().set_input_serial(*serial);
+        }
+
         if let wl_pointer::Event::Enter { serial, .. } = &event {
             state.mouse_cursor.borrow_mut().on_enter(*serial);
         } else if let wl_pointer::Event::Leave { .. } = &event {
@@ -524,6 +548,10 @@ impl Dispatch<wl_touch::WlTouch, ()> for AppState {
         _conn: &Connection,
         _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
+        if let wl_touch::Event::Down { serial, .. } = &event {
+            state.clipboard.borrow_mut().set_input_serial(*serial);
+        }
+
         state
             .touch_state
             .handle_event(&state.engine, state.scale_factor, event);
@@ -539,8 +567,72 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for AppState {
         _conn: &Connection,
         _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
+        if let wl_keyboard::Event::Enter { serial, .. } | wl_keyboard::Event::Key { serial, .. } =
+            &event
+        {
+            state.clipboard.borrow_mut().set_input_serial(*serial);
+        }
+
         state
             .keyboard_state
             .handle_event(&state.engine, &state.loop_handle, event);
+    }
+}
+
+impl Dispatch<wl_data_device_manager::WlDataDeviceManager, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_data_device_manager::WlDataDeviceManager,
+        _event: <wl_data_device_manager::WlDataDeviceManager as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wl_data_device::WlDataDevice, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_data_device::WlDataDevice,
+        event: <wl_data_device::WlDataDevice as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        state.clipboard.borrow_mut().handle_data_device_event(event);
+    }
+
+    wayland_client::event_created_child!(AppState, WlDataDevice, [
+        wl_data_device::EVT_DATA_OFFER_OPCODE => (WlDataOffer, OfferData::default()),
+    ]);
+}
+
+impl Dispatch<wl_data_offer::WlDataOffer, OfferData> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_data_offer::WlDataOffer,
+        event: <wl_data_offer::WlDataOffer as Proxy>::Event,
+        data: &OfferData,
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        data.handle_event(event);
+    }
+}
+
+impl Dispatch<wl_data_source::WlDataSource, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        proxy: &wl_data_source::WlDataSource,
+        event: <wl_data_source::WlDataSource as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        state
+            .clipboard
+            .borrow_mut()
+            .handle_data_source_event(proxy, event);
     }
 }
