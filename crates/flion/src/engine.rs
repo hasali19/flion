@@ -300,23 +300,29 @@ impl FlutterEngine {
     }
 
     pub fn send_pointer_event(&self, event: &PointerEvent) -> eyre::Result<()> {
-        let (signal_kind, scroll_delta_x, scroll_delta_y) = match event.signal {
-            PointerSignal::None => (
-                FlutterPointerSignalKind_kFlutterPointerSignalKindNone,
-                0.0,
-                0.0,
-            ),
-            PointerSignal::Scroll { delta_x, delta_y } => (
-                FlutterPointerSignalKind_kFlutterPointerSignalKindScroll,
-                delta_x,
-                delta_y,
-            ),
-        };
+        self.send_pointer_events(std::slice::from_ref(event))
+    }
 
-        let result = unsafe {
-            FlutterEngineSendPointerEvent(
-                self.engine(),
-                &FlutterPointerEvent {
+    pub fn send_pointer_events(&self, events: &[PointerEvent]) -> eyre::Result<()> {
+        let timestamp = unsafe { FlutterEngineGetCurrentTime() as usize };
+
+        let events: Vec<FlutterPointerEvent> = events
+            .iter()
+            .map(|event| {
+                let (signal_kind, scroll_delta_x, scroll_delta_y) = match event.signal {
+                    PointerSignal::None => (
+                        FlutterPointerSignalKind_kFlutterPointerSignalKindNone,
+                        0.0,
+                        0.0,
+                    ),
+                    PointerSignal::Scroll { delta_x, delta_y } => (
+                        FlutterPointerSignalKind_kFlutterPointerSignalKindScroll,
+                        delta_x,
+                        delta_y,
+                    ),
+                };
+
+                FlutterPointerEvent {
                     struct_size: mem::size_of::<FlutterPointerEvent>(),
                     device_kind: event.device_kind as FlutterPointerDeviceKind,
                     device: event.device_id,
@@ -327,12 +333,14 @@ impl FlutterEngine {
                     signal_kind,
                     scroll_delta_x,
                     scroll_delta_y,
-                    timestamp: FlutterEngineGetCurrentTime() as usize,
+                    timestamp,
                     ..Default::default()
-                },
-                1,
-            )
-        };
+                }
+            })
+            .collect();
+
+        let result =
+            unsafe { FlutterEngineSendPointerEvent(self.engine(), events.as_ptr(), events.len()) };
 
         if result != FlutterEngineResult_kSuccess {
             bail!("failed to send pointer event: {result}");

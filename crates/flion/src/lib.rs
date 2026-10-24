@@ -9,6 +9,7 @@ mod mouse_cursor;
 mod standard_method_channel;
 mod task_queue;
 mod text_input;
+mod touch;
 
 use std::cell::RefCell;
 use std::env;
@@ -28,6 +29,7 @@ use wayland_client::protocol::wl_pointer::{self, WlPointer};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::protocol::wl_seat::{self, Capability, WlSeat};
 use wayland_client::protocol::wl_surface::{self, WlSurface};
+use wayland_client::protocol::wl_touch::{self, WlTouch};
 use wayland_client::{Connection, Dispatch, Proxy};
 use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1;
 use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_manager_v1::{
@@ -50,6 +52,7 @@ use crate::mouse::MouseState;
 use crate::mouse_cursor::{MouseCursor, MouseCursorHandler};
 use crate::task_queue::FlutterTaskQueue;
 use crate::text_input::{TextInputHandler, TextInputState};
+use crate::touch::TouchState;
 
 pub struct FlionAppBuilder<'a> {
     _p: PhantomData<&'a ()>,
@@ -142,6 +145,7 @@ impl FlionApp {
         let mouse_cursor = Rc::new(RefCell::new(MouseCursor::new()));
 
         let mouse_state = MouseState::default();
+        let touch_state = TouchState::default();
         let text_input = Rc::new(RefCell::new(TextInputState::default()));
         let keyboard_state = KeyboardState::new(text_input.clone());
 
@@ -175,6 +179,8 @@ impl FlionApp {
             loop_handle: event_loop.handle(),
             pointer: None,
             mouse: mouse_state,
+            touch: None,
+            touch_state,
             keyboard: None,
             keyboard_state,
             mouse_cursor,
@@ -204,6 +210,10 @@ impl FlionApp {
             keyboard.release();
         }
 
+        if let Some(touch) = app.touch.take() {
+            touch.release();
+        }
+
         if let Some(manager) = app.cursor_shape_manager.take() {
             manager.destroy();
         }
@@ -228,6 +238,8 @@ struct AppState {
     loop_handle: LoopHandle<'static, AppState>,
     pointer: Option<WlPointer>,
     mouse: MouseState,
+    touch: Option<WlTouch>,
+    touch_state: TouchState,
     keyboard: Option<WlKeyboard>,
     keyboard_state: KeyboardState,
     mouse_cursor: Rc<RefCell<MouseCursor>>,
@@ -435,6 +447,15 @@ impl Dispatch<wl_seat::WlSeat, ()> for AppState {
                         pointer.release();
                     }
 
+                    if capabilities.contains(Capability::Touch) {
+                        if state.touch.is_none() {
+                            state.touch = Some(seat.get_touch(qh, ()));
+                        }
+                    } else if let Some(touch) = state.touch.take() {
+                        state.touch_state.cancel_all(&state.engine);
+                        touch.release();
+                    }
+
                     if capabilities.contains(Capability::Keyboard) {
                         if state.keyboard.is_none() {
                             state.keyboard = Some(seat.get_keyboard(qh, ()));
@@ -491,6 +512,21 @@ impl Dispatch<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1, ()> for AppState
         _conn: &Connection,
         _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
+    }
+}
+
+impl Dispatch<wl_touch::WlTouch, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_touch::WlTouch,
+        event: <wl_touch::WlTouch as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        state
+            .touch_state
+            .handle_event(&state.engine, state.scale_factor, event);
     }
 }
 
