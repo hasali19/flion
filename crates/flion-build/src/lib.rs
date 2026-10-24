@@ -6,6 +6,8 @@ use std::io::{BufRead, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 
 pub fn generate_plugins_registrant(project_dir: &Path) -> Result<(), Box<dyn Error>> {
+    return Ok(());
+
     let build_dir = project_dir.join("build/flion").canonicalize()?;
     let plugins_dir = build_dir.join("plugins");
     let plugins_lib_dir = plugins_dir.join("lib");
