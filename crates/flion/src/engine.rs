@@ -1,24 +1,24 @@
 use std::collections::BTreeMap;
-use std::ffi::{c_char, c_void, CStr, CString};
-use std::marker::PhantomData;
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::thread::{self, ThreadId};
 use std::{mem, ptr};
 
 use bitflags::bitflags;
-use eyre::{bail, Context};
+use eyre::{Context, bail, eyre};
 use flutter_embedder::{
-    FlutterBackingStore, FlutterBackingStoreConfig, FlutterCustomTaskRunners, FlutterEngineAOTData,
-    FlutterEngineAOTDataSource,
-    FlutterEngineAOTDataSourceType_kFlutterEngineAOTDataSourceTypeElfPath,
-    FlutterEngineAOTDataSource__bindgen_ty_1, FlutterEngineCreateAOTData,
-    FlutterEngineGetCurrentTime, FlutterEngineInitialize, FlutterEngineResult_kSuccess,
-    FlutterEngineRunInitialized, FlutterEngineRunTask, FlutterEngineRunsAOTCompiledDartCode,
-    FlutterEngineScheduleFrame, FlutterEngineSendKeyEvent, FlutterEngineSendPlatformMessage,
-    FlutterEngineSendPlatformMessageResponse, FlutterEngineSendPointerEvent,
-    FlutterEngineSendWindowMetricsEvent, FlutterEngineShutdown, FlutterKeyEvent,
-    FlutterKeyEventDeviceType_kFlutterKeyEventDeviceTypeKeyboard,
+    FlutterAddViewInfo, FlutterAddViewResult, FlutterBackingStore, FlutterBackingStoreConfig,
+    FlutterCustomTaskRunners, FlutterEngineAOTData, FlutterEngineAOTDataSource,
+    FlutterEngineAOTDataSource__bindgen_ty_1,
+    FlutterEngineAOTDataSourceType_kFlutterEngineAOTDataSourceTypeElfPath, FlutterEngineAddView,
+    FlutterEngineCreateAOTData, FlutterEngineGetCurrentTime, FlutterEngineInitialize,
+    FlutterEngineResult_kSuccess, FlutterEngineRunInitialized, FlutterEngineRunTask,
+    FlutterEngineRunsAOTCompiledDartCode, FlutterEngineSendKeyEvent,
+    FlutterEngineSendPlatformMessage, FlutterEngineSendPlatformMessageResponse,
+    FlutterEngineSendPointerEvent, FlutterEngineSendWindowMetricsEvent, FlutterEngineShutdown,
+    FlutterKeyEvent, FlutterKeyEventDeviceType_kFlutterKeyEventDeviceTypeKeyboard,
     FlutterKeyEventType_kFlutterKeyEventTypeDown, FlutterKeyEventType_kFlutterKeyEventTypeRepeat,
     FlutterKeyEventType_kFlutterKeyEventTypeUp, FlutterLayer, FlutterOpenGLRendererConfig,
     FlutterPlatformMessage, FlutterPlatformMessageCreateResponseHandle,
@@ -32,47 +32,53 @@ use flutter_embedder::{
     FlutterPointerMouseButtons_kFlutterPointerButtonMouseMiddle,
     FlutterPointerMouseButtons_kFlutterPointerButtonMousePrimary,
     FlutterPointerMouseButtons_kFlutterPointerButtonMouseSecondary, FlutterPointerPhase,
-    FlutterPointerPhase_kAdd, FlutterPointerPhase_kDown, FlutterPointerPhase_kHover,
-    FlutterPointerPhase_kMove, FlutterPointerPhase_kRemove, FlutterPointerPhase_kUp,
+    FlutterPointerPhase_kAdd, FlutterPointerPhase_kCancel, FlutterPointerPhase_kDown,
+    FlutterPointerPhase_kHover, FlutterPointerPhase_kMove, FlutterPointerPhase_kRemove,
+    FlutterPointerPhase_kUp, FlutterPointerSignalKind_kFlutterPointerSignalKindNone,
     FlutterPointerSignalKind_kFlutterPointerSignalKindScroll, FlutterPresentViewInfo,
-    FlutterProjectArgs, FlutterRendererConfig, FlutterRendererType_kOpenGL, FlutterTask,
-    FlutterTaskRunnerDescription, FlutterTransformation, FlutterWindowMetricsEvent,
-    FLUTTER_ENGINE_VERSION,
+    FlutterProjectArgs, FlutterRendererConfig, FlutterRendererConfig__bindgen_ty_1,
+    FlutterRendererType_kOpenGL, FlutterTaskRunnerDescription, FlutterWindowMetricsEvent,
 };
 use parking_lot::Mutex;
 use smol_str::SmolStr;
+use tracing::debug;
 
-use crate::compositor::FlutterCompositor;
-use crate::egl::EglDevice;
-use crate::task_runner::{self, FlutterTaskRunner, Task};
+const FLUTTER_ENGINE_VERSION: usize = flutter_embedder::FLUTTER_ENGINE_VERSION as usize;
 
-pub struct FlutterEngineConfig<'a> {
+pub struct FlutterEngineConfig<'a, C> {
     pub assets_path: &'a str,
     pub aot_library_path: Option<&'a str>,
-    pub egl: Arc<EglDevice>,
-    pub compositor: FlutterCompositor,
-    pub platform_task_handler: Box<dyn Fn(Task)>,
+    pub compositor: C,
+    pub platform_task_handler: Box<dyn Fn(FlutterTask) + Send + Sync>,
     pub platform_message_handlers: Vec<(&'a str, Box<dyn BinaryMessageHandler + 'static>)>,
 }
 
-pub struct FlutterEngine {
-    // The 'static lifetime should be fine since this reference is valid as long as the outer
-    // FlutterEngine is valid. We should not leak the reference out of this module.
-    inner: &'static FlutterEngineInner,
-    // Engine should not be sent across threads.
-    _not_send: PhantomData<*const ()>,
+pub trait FlutterCompositor {
+    const AVOID_BACKING_STORE_CACHE: bool;
 }
 
-struct FlutterEngineInner {
-    handle: flutter_embedder::FlutterEngine,
-    is_running: Arc<Mutex<bool>>,
-    egl: Arc<EglDevice>,
-    compositor: *mut FlutterCompositor,
-    platform_message_handlers: Mutex<BTreeMap<String, Box<dyn BinaryMessageHandler + 'static>>>,
+pub trait FlutterOpenGLCompositor: Send + Sync + 'static {
+    fn make_current(&self) -> eyre::Result<()>;
+
+    fn make_resource_current(&self) -> eyre::Result<()>;
+
+    fn clear_current(&self) -> eyre::Result<()>;
+
+    fn get_proc_address(&self, name: &str) -> Option<extern "system" fn()>;
+
+    fn create_backing_store(
+        &self,
+        config: &FlutterBackingStoreConfig,
+        backing_store: &mut FlutterBackingStore,
+    ) -> eyre::Result<()>;
+
+    fn release_backing_store(&self, backing_store: &FlutterBackingStore) -> eyre::Result<()>;
+
+    fn present_view(&self, view_id: i64, layers: &[&FlutterLayer]) -> eyre::Result<()>;
 }
 
 #[derive(Clone, Copy, Default)]
-#[repr(i32)]
+#[repr(u32)]
 pub enum PointerDeviceKind {
     #[default]
     Unknown = 0,
@@ -85,10 +91,10 @@ pub enum PointerDeviceKind {
 }
 
 #[derive(Clone, Copy, Default, Debug)]
-#[repr(i32)]
+#[repr(u32)]
 pub enum PointerPhase {
     #[default]
-    Unknown = 0,
+    Cancel = FlutterPointerPhase_kCancel,
     Up = FlutterPointerPhase_kUp,
     Down = FlutterPointerPhase_kDown,
     Add = FlutterPointerPhase_kAdd,
@@ -108,18 +114,30 @@ bitflags! {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+pub enum PointerSignal {
+    #[default]
+    None,
+    Scroll {
+        delta_x: f64,
+        delta_y: f64,
+    },
+}
+
 #[derive(Default)]
 pub struct PointerEvent {
+    pub view_id: i64,
     pub device_kind: PointerDeviceKind,
     pub device_id: i32,
     pub phase: PointerPhase,
     pub x: f64,
     pub y: f64,
     pub buttons: PointerButtons,
+    pub signal: PointerSignal,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[repr(i32)]
+#[repr(u32)]
 pub enum KeyEventType {
     Up = FlutterKeyEventType_kFlutterKeyEventTypeUp,
     Down = FlutterKeyEventType_kFlutterKeyEventTypeDown,
@@ -135,16 +153,28 @@ pub struct KeyEvent {
     pub physical: Option<u64>,
 }
 
+struct FlutterEngineState {
+    handle: flutter_embedder::FlutterEngine,
+    is_running: Arc<Mutex<bool>>,
+    compositor: Box<dyn FlutterOpenGLCompositor>,
+    platform_message_handlers: Mutex<BTreeMap<String, Box<dyn BinaryMessageHandler + 'static>>>,
+}
+
+pub struct FlutterEngine {
+    inner: *mut FlutterEngineState,
+}
+
 impl FlutterEngine {
-    pub fn new(config: FlutterEngineConfig) -> eyre::Result<FlutterEngine> {
-        let platform_task_runner = create_task_runner(
-            1,
-            FlutterTaskRunner::new(move |task| (config.platform_task_handler)(task)),
-        );
+    pub fn new<C: FlutterCompositor + FlutterOpenGLCompositor>(
+        config: FlutterEngineConfig<'_, C>,
+    ) -> eyre::Result<FlutterEngine> {
+        let platform_runner = Arc::new(FlutterTaskRunner::new(move |task| {
+            (config.platform_task_handler)(task)
+        }));
 
         let renderer_config = FlutterRendererConfig {
             type_: FlutterRendererType_kOpenGL,
-            __bindgen_anon_1: flutter_embedder::FlutterRendererConfig__bindgen_ty_1 {
+            __bindgen_anon_1: FlutterRendererConfig__bindgen_ty_1 {
                 open_gl: FlutterOpenGLRendererConfig {
                     struct_size: mem::size_of::<FlutterOpenGLRendererConfig>(),
                     make_current: Some(gl_make_current),
@@ -154,44 +184,13 @@ impl FlutterEngine {
                     fbo_callback: Some(gl_fbo_callback),
                     fbo_reset_after_present: true,
                     gl_proc_resolver: Some(gl_get_proc_address),
-                    surface_transformation: Some(gl_get_surface_transformation),
+                    // surface_transformation: Some(gl_get_surface_transformation),
                     ..Default::default()
                 },
             },
         };
 
-        let assets_path = CString::from_str(config.assets_path)?;
-        let aot_data = load_aot_data(config.aot_library_path)?.unwrap_or(ptr::null_mut());
-
-        // This is freed when the FlutterEngine is dropped.
-        let compositor = Box::into_raw(Box::new(config.compositor));
-
-        let project_args = FlutterProjectArgs {
-            struct_size: mem::size_of::<FlutterProjectArgs>(),
-            assets_path: assets_path.as_ptr(),
-            icu_data_path: c"icudtl.dat".as_ptr(),
-            aot_data,
-            custom_task_runners: &FlutterCustomTaskRunners {
-                struct_size: mem::size_of::<FlutterCustomTaskRunners>(),
-                platform_task_runner: &platform_task_runner,
-                render_task_runner: ptr::null(),
-                ui_task_runner: ptr::null(),
-                thread_priority_setter: Some(task_runner::set_thread_priority),
-            },
-            compositor: &flutter_embedder::FlutterCompositor {
-                struct_size: mem::size_of::<FlutterCompositor>(),
-                create_backing_store_callback: Some(compositor_create_backing_store),
-                collect_backing_store_callback: Some(compositor_collect_backing_store),
-                present_layers_callback: None,
-                present_view_callback: Some(compositor_present_view),
-                user_data: compositor.cast(),
-                avoid_backing_store_cache: false,
-            },
-            platform_message_callback: Some(platform_message_callback),
-            log_message_callback: Some(log_message),
-            // vsync_callback: Some(vsync_callback),
-            ..Default::default()
-        };
+        let compositor = Box::new(config.compositor);
 
         let platform_message_handlers = BTreeMap::from_iter(
             config
@@ -200,23 +199,50 @@ impl FlutterEngine {
                 .map(|(channel, handler)| (channel.to_owned(), handler)),
         );
 
-        // This is freed when the FlutterEngine is dropped.
-        let engine = Box::leak(Box::new(FlutterEngineInner {
+        let engine_state = Box::into_raw(Box::new(FlutterEngineState {
             handle: ptr::null_mut(),
             is_running: Arc::new(Mutex::new(false)),
-            egl: config.egl,
-            platform_message_handlers: Mutex::new(platform_message_handlers),
             compositor,
+            platform_message_handlers: Mutex::new(platform_message_handlers),
         }));
 
-        let engine_handle = unsafe {
+        let assets_path = CString::new(config.assets_path)?;
+        let aot_data = load_aot_data(config.aot_library_path)?.unwrap_or(ptr::null_mut());
+
+        let project_args = FlutterProjectArgs {
+            struct_size: mem::size_of::<FlutterProjectArgs>(),
+            assets_path: assets_path.as_ptr(),
+            icu_data_path: c"icudtl.dat".as_ptr(),
+            aot_data,
+            custom_task_runners: &FlutterCustomTaskRunners {
+                struct_size: mem::size_of::<FlutterCustomTaskRunners>(),
+                platform_task_runner: &create_task_runner(1, platform_runner.clone()),
+                render_task_runner: ptr::null(),
+                ui_task_runner: &create_task_runner(1, platform_runner),
+                thread_priority_setter: None,
+            },
+            compositor: &flutter_embedder::FlutterCompositor {
+                struct_size: mem::size_of::<flutter_embedder::FlutterCompositor>(),
+                avoid_backing_store_cache: C::AVOID_BACKING_STORE_CACHE,
+                create_backing_store_callback: Some(compositor_create_backing_store),
+                collect_backing_store_callback: Some(compositor_collect_backing_store),
+                present_layers_callback: None,
+                present_view_callback: Some(compositor_present_view),
+                user_data: engine_state.cast(),
+            },
+            platform_message_callback: Some(platform_message_callback),
+            log_message_callback: Some(log_message),
+            ..Default::default()
+        };
+
+        let engine = unsafe {
             let mut engine_ptr = ptr::null_mut();
 
             let result = FlutterEngineInitialize(
-                FLUTTER_ENGINE_VERSION as usize,
+                FLUTTER_ENGINE_VERSION,
                 &renderer_config,
                 &project_args,
-                engine as *mut FlutterEngineInner as _,
+                engine_state.cast(),
                 &mut engine_ptr,
             );
 
@@ -227,31 +253,74 @@ impl FlutterEngine {
             engine_ptr
         };
 
-        engine.handle = engine_handle;
-
-        *engine.is_running.lock() = true;
-
         unsafe {
-            FlutterEngineRunInitialized(engine_handle);
+            *(*engine_state).is_running.lock() = true;
+            (*engine_state).handle = engine;
+            FlutterEngineRunInitialized(engine);
         }
 
         Ok(FlutterEngine {
-            inner: engine,
-            _not_send: PhantomData,
+            inner: engine_state,
         })
+    }
+
+    pub fn add_view<F: FnOnce(bool) + Send>(
+        &self,
+        view_id: i64,
+        width: usize,
+        height: usize,
+        pixel_ratio: f64,
+        callback: F,
+    ) -> eyre::Result<()> {
+        let callback = Box::into_raw(Box::new(callback));
+
+        extern "C" fn trampoline<F: FnOnce(bool) + Send>(result: *const FlutterAddViewResult) {
+            let success = unsafe { (*result).added };
+            let callback = unsafe { Box::from_raw((*result).user_data.cast::<F>()) };
+            callback(success);
+        }
+
+        let result = unsafe {
+            FlutterEngineAddView(
+                self.engine(),
+                &FlutterAddViewInfo {
+                    struct_size: mem::size_of::<FlutterAddViewInfo>(),
+                    view_id,
+                    view_metrics: &FlutterWindowMetricsEvent {
+                        struct_size: mem::size_of::<FlutterWindowMetricsEvent>(),
+                        view_id,
+                        width,
+                        height,
+                        pixel_ratio,
+                        ..Default::default()
+                    },
+                    user_data: callback.cast(),
+                    add_view_callback: Some(trampoline::<F>),
+                },
+            )
+        };
+
+        if result != FlutterEngineResult_kSuccess {
+            unsafe { drop(Box::from_raw(callback)) };
+            return Err(eyre!("Failed to add view"));
+        }
+
+        Ok(())
     }
 
     pub fn send_window_metrics_event(
         &self,
+        view_id: i64,
         width: usize,
         height: usize,
         pixel_ratio: f64,
     ) -> eyre::Result<()> {
         let result = unsafe {
             FlutterEngineSendWindowMetricsEvent(
-                self.inner.handle,
+                self.engine(),
                 &FlutterWindowMetricsEvent {
                     struct_size: mem::size_of::<FlutterWindowMetricsEvent>(),
+                    view_id,
                     width,
                     height,
                     pixel_ratio,
@@ -268,7 +337,7 @@ impl FlutterEngine {
     }
 
     pub fn run_task(&self, task: &FlutterTask) -> eyre::Result<()> {
-        let result = unsafe { FlutterEngineRunTask(self.inner.handle, task) };
+        let result = unsafe { FlutterEngineRunTask(self.engine(), &raw const task.task) };
 
         if result != FlutterEngineResult_kSuccess {
             bail!("failed to run task: {result}");
@@ -278,54 +347,48 @@ impl FlutterEngine {
     }
 
     pub fn send_pointer_event(&self, event: &PointerEvent) -> eyre::Result<()> {
-        let result = unsafe {
-            FlutterEngineSendPointerEvent(
-                self.inner.handle,
-                &FlutterPointerEvent {
+        self.send_pointer_events(std::slice::from_ref(event))
+    }
+
+    pub fn send_pointer_events(&self, events: &[PointerEvent]) -> eyre::Result<()> {
+        let timestamp = unsafe { FlutterEngineGetCurrentTime() as usize };
+
+        let events: Vec<FlutterPointerEvent> = events
+            .iter()
+            .map(|event| {
+                let (signal_kind, scroll_delta_x, scroll_delta_y) = match event.signal {
+                    PointerSignal::None => (
+                        FlutterPointerSignalKind_kFlutterPointerSignalKindNone,
+                        0.0,
+                        0.0,
+                    ),
+                    PointerSignal::Scroll { delta_x, delta_y } => (
+                        FlutterPointerSignalKind_kFlutterPointerSignalKindScroll,
+                        delta_x,
+                        delta_y,
+                    ),
+                };
+
+                FlutterPointerEvent {
                     struct_size: mem::size_of::<FlutterPointerEvent>(),
+                    view_id: event.view_id,
                     device_kind: event.device_kind as FlutterPointerDeviceKind,
                     device: event.device_id,
                     phase: event.phase as FlutterPointerPhase,
                     x: event.x,
                     y: event.y,
                     buttons: event.buttons.bits() as i64,
-                    timestamp: FlutterEngineGetCurrentTime() as usize,
-                    ..Default::default()
-                },
-                1,
-            )
-        };
-
-        if result != FlutterEngineResult_kSuccess {
-            bail!("failed to send pointer event: {result}");
-        }
-
-        Ok(())
-    }
-
-    pub fn send_scroll_event(
-        &self,
-        x: f64,
-        y: f64,
-        scroll_delta_x: f64,
-        scroll_delta_y: f64,
-    ) -> eyre::Result<()> {
-        let result = unsafe {
-            FlutterEngineSendPointerEvent(
-                self.inner.handle,
-                &FlutterPointerEvent {
-                    struct_size: mem::size_of::<FlutterPointerEvent>(),
-                    signal_kind: FlutterPointerSignalKind_kFlutterPointerSignalKindScroll,
-                    x,
-                    y,
+                    signal_kind,
                     scroll_delta_x,
                     scroll_delta_y,
-                    timestamp: FlutterEngineGetCurrentTime() as usize,
+                    timestamp,
                     ..Default::default()
-                },
-                1,
-            )
-        };
+                }
+            })
+            .collect();
+
+        let result =
+            unsafe { FlutterEngineSendPointerEvent(self.engine(), events.as_ptr(), events.len()) };
 
         if result != FlutterEngineResult_kSuccess {
             bail!("failed to send pointer event: {result}");
@@ -342,20 +405,24 @@ impl FlutterEngine {
             handled: bool,
             user_data: *mut ::std::os::raw::c_void,
         ) {
-            Box::from_raw(user_data.cast::<F>())(handled);
+            unsafe { Box::from_raw(user_data.cast::<F>())(handled) };
         }
 
         // This is freed above when the calback invoked.
         let reply = Box::into_raw(Box::new(callback));
 
+        let character = event
+            .character
+            .as_deref()
+            .and_then(|c| CString::new(c).ok());
+
         let event = FlutterKeyEvent {
             struct_size: mem::size_of::<FlutterKeyEvent>(),
             timestamp: unsafe { FlutterEngineGetCurrentTime() as f64 },
-            type_: event.event_type as i32,
-            character: event
-                .character
+            type_: event.event_type as u32,
+            character: character
                 .as_deref()
-                .map(|c| c.as_ptr().cast())
+                .map(|c| c.as_ptr())
                 .unwrap_or(ptr::null()),
             synthesized: event.synthesized,
             logical: event.logical.unwrap_or(0),
@@ -365,13 +432,14 @@ impl FlutterEngine {
 
         unsafe {
             let result = FlutterEngineSendKeyEvent(
-                self.inner.handle,
+                self.engine(),
                 &event,
                 Some(_callback::<F>),
                 reply.cast(),
             );
 
             if result != FlutterEngineResult_kSuccess {
+                drop(Box::from_raw(reply));
                 bail!("failed to send key event: {result}");
             }
         }
@@ -384,40 +452,43 @@ impl FlutterEngine {
         name: impl Into<String>,
         handler: impl BinaryMessageHandler + 'static,
     ) {
-        self.inner
-            .platform_message_handlers
-            .lock()
-            .insert(name.into(), Box::new(handler));
+        unsafe {
+            (*self.inner)
+                .platform_message_handlers
+                .lock()
+                .insert(name.into(), Box::new(handler));
+        }
     }
 
     pub fn messenger(&self) -> BinaryMessenger {
         BinaryMessenger {
-            engine: self.inner.handle,
-            engine_is_running: self.inner.is_running.clone(),
+            engine: unsafe { (*self.inner).handle },
+            engine_is_running: unsafe { (*self.inner).is_running.clone() },
         }
     }
 
-    pub fn schedule_frame(&self) {
-        unsafe {
-            FlutterEngineScheduleFrame(self.inner.handle);
-        }
+    unsafe fn engine(&self) -> flutter_embedder::FlutterEngine {
+        unsafe { (*self.inner).handle }
     }
 }
 
 impl Drop for FlutterEngine {
     fn drop(&mut self) {
         unsafe {
-            tracing::debug!("shutting down engine");
+            debug!("shutting down engine");
 
-            *self.inner.is_running.lock() = false;
+            *(*self.inner).is_running.lock() = false;
 
-            FlutterEngineShutdown(self.inner.handle);
+            let engine = self.engine();
 
-            drop(Box::from_raw(self.inner.compositor));
+            if !engine.is_null() {
+                let result = FlutterEngineShutdown(engine);
+                if result != FlutterEngineResult_kSuccess {
+                    tracing::error!("failed to shut down flutter engine: {result}");
+                }
+            }
 
-            drop(Box::from_raw(
-                &raw const *self.inner as *mut FlutterEngineInner,
-            ));
+            drop(Box::from_raw(self.inner));
         }
     }
 }
@@ -455,34 +526,29 @@ fn load_aot_data(path: Option<&str>) -> eyre::Result<Option<FlutterEngineAOTData
     Ok(Some(aot_data))
 }
 
-fn create_task_runner<F: Fn(Task) + 'static>(
+fn create_task_runner<F: Fn(FlutterTask) + Send + Sync + 'static>(
     id: usize,
-    runner: FlutterTaskRunner<F>,
+    runner: Arc<FlutterTaskRunner<F>>,
 ) -> FlutterTaskRunnerDescription {
     unsafe extern "C" fn runs_tasks_on_current_thread<F>(task_runner: *mut c_void) -> bool {
-        task_runner
-            .cast::<FlutterTaskRunner<F>>()
-            .as_mut()
-            .unwrap()
+        unsafe { task_runner.cast::<FlutterTaskRunner<F>>().as_ref().unwrap() }
             .runs_tasks_on_current_thread()
     }
 
-    unsafe extern "C" fn post_task_callback<F: Fn(Task)>(
-        task: FlutterTask,
+    unsafe extern "C" fn post_task_callback<F: Fn(FlutterTask)>(
+        task: flutter_embedder::FlutterTask,
         target_time_nanos: u64,
         user_data: *mut c_void,
     ) {
-        let runner = user_data.cast::<FlutterTaskRunner<F>>();
-        (*runner).post_task(task, target_time_nanos);
+        let runner = unsafe { user_data.cast::<FlutterTaskRunner<F>>().as_ref().unwrap() };
+        runner.post_task(task, target_time_nanos);
     }
 
-    unsafe extern "C" fn destruction_callback<F: Fn(Task)>(user_data: *mut c_void) {
-        tracing::debug!("destroying task runner");
-        drop(Box::from_raw(user_data.cast::<FlutterTaskRunner<F>>()));
+    unsafe extern "C" fn destruction_callback<F: Fn(FlutterTask)>(user_data: *mut c_void) {
+        unsafe { drop(Arc::from_raw(user_data.cast::<FlutterTaskRunner<F>>())) };
     }
 
-    // This is freed by the above destruction_callback.
-    let runner = Box::into_raw(Box::new(runner));
+    let runner = Arc::into_raw(runner).cast_mut();
 
     FlutterTaskRunnerDescription {
         struct_size: mem::size_of::<FlutterTaskRunnerDescription>(),
@@ -491,6 +557,52 @@ fn create_task_runner<F: Fn(Task) + 'static>(
         runs_task_on_current_thread_callback: Some(runs_tasks_on_current_thread::<F>),
         post_task_callback: Some(post_task_callback::<F>),
         destruction_callback: Some(destruction_callback::<F>),
+    }
+}
+
+#[derive(Debug)]
+pub struct FlutterTask {
+    target_time: u64,
+    task: flutter_embedder::FlutterTask,
+}
+
+// SAFETY: The `flutter_embedder::FlutterTask` is basically an opaque task handle from our
+// perspective. The engine expects it to be sent between threads.
+unsafe impl Send for FlutterTask {}
+
+impl FlutterTask {
+    pub fn target_time_nanos(&self) -> u64 {
+        self.target_time
+    }
+}
+
+pub struct FlutterTaskRunner<F> {
+    main_thread_id: ThreadId,
+    handler: F,
+}
+
+impl<F> FlutterTaskRunner<F> {
+    pub fn new(handler: F) -> FlutterTaskRunner<F> {
+        FlutterTaskRunner {
+            main_thread_id: thread::current().id(),
+            handler,
+        }
+    }
+
+    pub fn runs_tasks_on_current_thread(&self) -> bool {
+        self.main_thread_id == thread::current().id()
+    }
+}
+
+impl<F> FlutterTaskRunner<F>
+where
+    F: Fn(FlutterTask),
+{
+    pub fn post_task(&self, task: flutter_embedder::FlutterTask, target_time_nanos: u64) {
+        (self.handler)(FlutterTask {
+            target_time: target_time_nanos,
+            task,
+        });
     }
 }
 
@@ -522,7 +634,7 @@ impl BinaryMessenger {
                 Ok(())
             }
         } else {
-            bail!("engine is not running")
+            bail!("engine is not running");
         }
     }
 
@@ -540,11 +652,11 @@ impl BinaryMessenger {
             size: usize,
             user_data: *mut ::std::os::raw::c_void,
         ) {
-            let reply_handler = Box::from_raw(user_data.cast::<F>());
+            let reply_handler = unsafe { Box::from_raw(user_data.cast::<F>()) };
             if data.is_null() {
                 tracing::warn!("null reply from platform message");
             } else {
-                reply_handler(std::slice::from_raw_parts(data, size));
+                reply_handler(unsafe { std::slice::from_raw_parts(data, size) });
             }
         }
 
@@ -563,6 +675,7 @@ impl BinaryMessenger {
             };
 
             if result != FlutterEngineResult_kSuccess {
+                drop(unsafe { Box::from_raw(reply) });
                 bail!("failed to create response handle: {result}");
             }
 
@@ -580,6 +693,10 @@ impl BinaryMessenger {
             };
 
             if result != FlutterEngineResult_kSuccess {
+                unsafe {
+                    FlutterPlatformMessageReleaseResponseHandle(self.engine, response_handle);
+                    drop(Box::from_raw(reply));
+                }
                 bail!("failed to send platform message: {result}");
             }
 
@@ -593,7 +710,7 @@ impl BinaryMessenger {
 
             Ok(())
         } else {
-            bail!("engine is not running")
+            bail!("engine is not running");
         }
     }
 }
@@ -608,6 +725,10 @@ pub struct BinaryMessageReply {
     response_handle: *const FlutterPlatformMessageResponseHandle,
 }
 
+// SAFETY: Docs don't mention whether we can send a response from a different thread, but I'm
+// pretty sure we can...
+unsafe impl Send for BinaryMessageReply {}
+
 impl BinaryMessageReply {
     pub(crate) fn new(
         engine: flutter_embedder::FlutterEngine,
@@ -619,17 +740,6 @@ impl BinaryMessageReply {
             engine_is_running,
             response_handle,
         }
-    }
-
-    pub(crate) fn for_engine(
-        engine: &FlutterEngine,
-        response_handle: *const FlutterPlatformMessageResponseHandle,
-    ) -> BinaryMessageReply {
-        BinaryMessageReply::new(
-            engine.inner.handle,
-            engine.inner.is_running.clone(),
-            response_handle,
-        )
     }
 
     pub fn send(self, message: &[u8]) {
@@ -654,18 +764,14 @@ impl BinaryMessageReply {
             tracing::error!("send called on a stopped engine");
         }
     }
-
-    pub(crate) fn into_raw(self) -> *const FlutterPlatformMessageResponseHandle {
-        self.response_handle
-    }
 }
 
 unsafe extern "C" fn platform_message_callback(
     message: *const FlutterPlatformMessage,
     user_data: *mut c_void,
 ) {
-    let engine = user_data.cast::<FlutterEngineInner>().as_ref().unwrap();
-    let message = message.as_ref().unwrap();
+    let engine = unsafe { user_data.cast::<FlutterEngineState>().as_ref().unwrap() };
+    let message = unsafe { message.as_ref().unwrap() };
 
     let reply = BinaryMessageReply::new(
         engine.handle,
@@ -673,7 +779,7 @@ unsafe extern "C" fn platform_message_callback(
         message.response_handle,
     );
 
-    let channel = CStr::from_ptr(message.channel);
+    let channel = unsafe { CStr::from_ptr(message.channel) };
     let Ok(channel) = channel.to_str() else {
         tracing::error!("invalid channel name: {channel:?}");
         reply.not_implemented();
@@ -693,15 +799,24 @@ unsafe extern "C" fn platform_message_callback(
         return;
     }
 
-    let bytes = std::slice::from_raw_parts(message.message, message.message_size);
+    let bytes = unsafe { std::slice::from_raw_parts(message.message, message.message_size) };
 
     handler.handle(bytes, reply);
 }
 
-unsafe extern "C" fn gl_make_current(user_data: *mut c_void) -> bool {
-    let engine = user_data.cast::<FlutterEngineInner>().as_ref().unwrap();
+extern "C" fn log_message(tag: *const c_char, message: *const c_char, _: *mut c_void) {
+    unsafe {
+        let tag = CStr::from_ptr(tag).to_string_lossy();
+        let message = CStr::from_ptr(message).to_string_lossy();
+        eprintln!("{tag}: {message}");
+    }
+}
 
-    if let Err(e) = engine.egl.make_context_current() {
+extern "C" fn gl_make_current(user_data: *mut c_void) -> bool {
+    let engine = user_data.cast::<FlutterEngineState>();
+    let compositor = unsafe { (*engine).compositor.as_ref() };
+
+    if let Err(e) = compositor.make_current() {
         tracing::error!("failed to make context current: {e}");
         return false;
     }
@@ -709,10 +824,11 @@ unsafe extern "C" fn gl_make_current(user_data: *mut c_void) -> bool {
     true
 }
 
-unsafe extern "C" fn gl_make_resource_current(user_data: *mut c_void) -> bool {
-    let engine = user_data.cast::<FlutterEngineInner>().as_ref().unwrap();
+extern "C" fn gl_make_resource_current(user_data: *mut c_void) -> bool {
+    let engine = user_data.cast::<FlutterEngineState>();
+    let compositor = unsafe { (*engine).compositor.as_ref() };
 
-    if let Err(e) = engine.egl.make_resource_context_current() {
+    if let Err(e) = compositor.make_resource_current() {
         tracing::error!("failed to make resource context current: {e}");
         return false;
     }
@@ -720,10 +836,11 @@ unsafe extern "C" fn gl_make_resource_current(user_data: *mut c_void) -> bool {
     true
 }
 
-unsafe extern "C" fn gl_clear_current(user_data: *mut c_void) -> bool {
-    let engine = user_data.cast::<FlutterEngineInner>().as_ref().unwrap();
+extern "C" fn gl_clear_current(user_data: *mut c_void) -> bool {
+    let engine = user_data.cast::<FlutterEngineState>();
+    let compositor = unsafe { (*engine).compositor.as_ref() };
 
-    if let Err(e) = engine.egl.clear_current() {
+    if let Err(e) = compositor.clear_current() {
         tracing::error!("failed to clear context: {e}");
         return false;
     }
@@ -731,64 +848,50 @@ unsafe extern "C" fn gl_clear_current(user_data: *mut c_void) -> bool {
     true
 }
 
-unsafe extern "C" fn gl_present(_user_data: *mut c_void) -> bool {
+extern "C" fn gl_present(_user_data: *mut c_void) -> bool {
     false
 }
 
-unsafe extern "C" fn gl_fbo_callback(_user_data: *mut c_void) -> u32 {
+extern "C" fn gl_fbo_callback(_user_data: *mut c_void) -> u32 {
     0
 }
 
-unsafe extern "C" fn gl_get_proc_address(
-    user_data: *mut c_void,
-    name: *const c_char,
-) -> *mut c_void {
-    let engine = user_data.cast::<FlutterEngineInner>().as_ref().unwrap();
-    let name = CStr::from_ptr(name);
-    engine
-        .egl
-        .get_proc_address(name.to_str().unwrap())
-        .unwrap_or(ptr::null_mut())
+extern "C" fn gl_get_proc_address(user_data: *mut c_void, name: *const c_char) -> *mut c_void {
+    let engine = user_data.cast::<FlutterEngineState>();
+    let compositor = unsafe { (*engine).compositor.as_ref() };
+
+    let name = unsafe { CStr::from_ptr(name) };
+    let Ok(name) = name.to_str() else {
+        tracing::error!("invalid proc name: {name:?}");
+        return ptr::null_mut();
+    };
+
+    compositor
+        .get_proc_address(name)
+        .map(|f| f as *mut c_void)
+        .unwrap_or_else(ptr::null_mut)
 }
 
-unsafe extern "C" fn gl_get_surface_transformation(
-    user_data: *mut c_void,
-) -> FlutterTransformation {
-    let engine = user_data.cast::<FlutterEngineInner>().as_ref().unwrap();
-    let compositor = engine.compositor.as_mut().unwrap();
-    match compositor.get_surface_transformation() {
-        Ok(transformation) => transformation,
-        Err(e) => {
-            tracing::error!("failed to get surface transformation: {e:?}");
-            FlutterTransformation {
-                scaleX: 1.0,
-                scaleY: 1.0,
-                pers2: 1.0,
-                ..Default::default()
-            }
-        }
-    }
-}
-
-pub unsafe extern "C" fn compositor_create_backing_store(
+extern "C" fn compositor_create_backing_store(
     config: *const FlutterBackingStoreConfig,
     out: *mut FlutterBackingStore,
     user_data: *mut c_void,
 ) -> bool {
-    let Some(compositor) = user_data.cast::<FlutterCompositor>().as_mut() else {
-        tracing::error!("user_data is null");
-        return false;
-    };
+    let engine = user_data.cast::<FlutterEngineState>();
+    let compositor = unsafe { (*engine).compositor.as_ref() };
 
-    let Some(config) = config.as_ref() else {
-        tracing::error!("config is null");
-        return false;
-    };
+    let config = unsafe { &*config };
+    let backing_store = unsafe { &mut *out };
 
-    let Some(backing_store) = out.as_mut() else {
-        tracing::error!("out is null");
-        return false;
-    };
+    assert_eq!(
+        config.struct_size,
+        mem::size_of::<FlutterBackingStoreConfig>()
+    );
+
+    assert_eq!(
+        backing_store.struct_size,
+        mem::size_of::<FlutterBackingStore>()
+    );
 
     if let Err(e) = compositor.create_backing_store(config, backing_store) {
         tracing::error!("{e:?}");
@@ -798,21 +901,20 @@ pub unsafe extern "C" fn compositor_create_backing_store(
     true
 }
 
-pub unsafe extern "C" fn compositor_collect_backing_store(
+extern "C" fn compositor_collect_backing_store(
     backing_store: *const FlutterBackingStore,
     user_data: *mut c_void,
 ) -> bool {
-    let Some(compositor) = user_data.cast::<FlutterCompositor>().as_mut() else {
-        tracing::error!("user_data is null");
-        return false;
-    };
+    let engine = user_data.cast::<FlutterEngineState>();
+    let compositor = unsafe { (*engine).compositor.as_ref() };
+    let backing_store = unsafe { &*backing_store };
 
-    let Some(backing_store) = backing_store.as_ref() else {
-        tracing::error!("config is null");
-        return false;
-    };
+    assert_eq!(
+        backing_store.struct_size,
+        mem::size_of::<FlutterBackingStore>()
+    );
 
-    if let Err(e) = compositor.collect_backing_store(backing_store) {
+    if let Err(e) = compositor.release_backing_store(backing_store) {
         tracing::error!("{e:?}");
         return false;
     }
@@ -820,23 +922,22 @@ pub unsafe extern "C" fn compositor_collect_backing_store(
     true
 }
 
-pub unsafe extern "C" fn compositor_present_view(info: *const FlutterPresentViewInfo) -> bool {
-    let Some(info) = info.as_ref() else {
-        tracing::error!("FlutterPresentViewInfo is invalid");
-        return false;
-    };
+extern "C" fn compositor_present_view(info: *const FlutterPresentViewInfo) -> bool {
+    let info = unsafe { &*info };
 
-    let Some(compositor) = info.user_data.cast::<FlutterCompositor>().as_mut() else {
-        tracing::error!("user_data is null");
-        return false;
-    };
+    assert_eq!(info.struct_size, mem::size_of::<FlutterPresentViewInfo>());
+
+    let engine = info.user_data.cast::<FlutterEngineState>();
+    let compositor = unsafe { (*engine).compositor.as_ref() };
 
     if info.layers.is_null() {
         tracing::error!("layers is null");
         return false;
     }
 
-    let layers = std::slice::from_raw_parts(info.layers.cast::<&FlutterLayer>(), info.layers_count);
+    let layers = unsafe {
+        std::slice::from_raw_parts(info.layers.cast::<&FlutterLayer>(), info.layers_count)
+    };
 
     if let Err(e) = compositor
         .present_view(info.view_id, layers)
@@ -847,10 +948,4 @@ pub unsafe extern "C" fn compositor_present_view(info: *const FlutterPresentView
     };
 
     true
-}
-
-unsafe extern "C" fn log_message(tag: *const c_char, message: *const c_char, _: *mut c_void) {
-    let tag = CStr::from_ptr(tag).to_string_lossy();
-    let message = CStr::from_ptr(message).to_string_lossy();
-    eprintln!("{tag}: {message}");
 }

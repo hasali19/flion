@@ -1,485 +1,786 @@
-#![feature(default_field_values, let_chains)]
-
+mod clipboard;
 mod compositor;
 mod egl;
 mod engine;
-mod error_utils;
 mod keyboard;
 mod keymap;
+mod mouse;
 mod mouse_cursor;
-mod platform_views;
-mod plugins_shim;
-mod settings;
-mod task_runner;
+mod standard_method_channel;
+mod task_queue;
 mod text_input;
-mod views;
-mod window;
+mod touch;
 
 pub mod codec;
-pub mod standard_method_channel;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::ffi::c_void;
-use std::path::{Path, PathBuf};
+use std::collections::BTreeMap;
+use std::env;
+use std::marker::PhantomData;
+use std::path::PathBuf;
+use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
-use std::{env, mem};
+use std::time::Instant;
 
-use engine::{PointerButtons, PointerDeviceKind, PointerEvent};
-use eyre::OptionExt;
-use parking_lot::Mutex;
-use platform_views::{PlatformViewFactory, PlatformViewsMessageHandler};
-use plugins_shim::FlutterPluginsEngine;
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use task_runner::{FlutterTaskExecutor, FlutterTaskQueue};
-use views::ViewManager;
-use window::{MouseAction, Window, WindowHandler};
-use windows::core::Interface;
-use windows::Win32::Foundation::HWND;
-use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
-use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION,
+use calloop::{EventLoop, LoopHandle};
+use calloop_wayland_source::WaylandSource;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle, WaylandWindowHandle, WindowHandle};
+use tracing::debug;
+use wayland_client::protocol::wl_compositor::{self, WlCompositor};
+use wayland_client::protocol::wl_data_device::{self, WlDataDevice};
+use wayland_client::protocol::wl_data_device_manager::{self, WlDataDeviceManager};
+use wayland_client::protocol::wl_data_offer::{self, WlDataOffer};
+use wayland_client::protocol::wl_data_source;
+use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
+use wayland_client::protocol::wl_pointer::{self, WlPointer};
+use wayland_client::protocol::wl_registry::{self, WlRegistry};
+use wayland_client::protocol::wl_seat::{self, Capability, WlSeat};
+use wayland_client::protocol::wl_surface::{self, WlSurface};
+use wayland_client::protocol::wl_touch::{self, WlTouch};
+use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
+use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1;
+use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_manager_v1::{
+    self, WpCursorShapeManagerV1,
 };
-use windows::Win32::Graphics::DirectComposition::{DCompositionCreateDevice2, IDCompositionDevice};
-use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWM_SYSTEMBACKDROP_TYPE,
+use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::{
+    self, WpFractionalScaleManagerV1,
 };
-use windows::Win32::Graphics::Dxgi::IDXGIDevice;
-use winit::dpi::{LogicalSize, PhysicalSize};
-use winit::event_loop::EventLoopBuilder;
-use winit::platform::windows::WindowBuilderExtWindows;
-use winit::window::WindowBuilder;
+use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1;
+use wayland_protocols::wp::viewporter::client::wp_viewport::{self, WpViewport};
+use wayland_protocols::wp::viewporter::client::wp_viewporter::{self, WpViewporter};
+use wayland_protocols::xdg::shell::client::xdg_surface::{self, XdgSurface};
+use wayland_protocols::xdg::shell::client::xdg_toplevel::{self, XdgToplevel};
+use wayland_protocols::xdg::shell::client::xdg_wm_base::{self, XdgWmBase};
 
-use crate::compositor::FlutterCompositor;
-use crate::egl::EglDevice;
-use crate::engine::{FlutterEngine, FlutterEngineConfig, PointerPhase};
-use crate::error_utils::ResultExt;
-use crate::keyboard::Keyboard;
-use crate::mouse_cursor::MouseCursorHandler;
+use crate::clipboard::{Clipboard, OfferData, PlatformHandler};
+use crate::compositor::{OpenGLCompositor, ViewSurfaceRegistry};
+use crate::egl::EglDisplay;
+use crate::engine::{FlutterEngine, FlutterEngineConfig};
+use crate::keyboard::KeyboardState;
+use crate::mouse::MouseState;
+use crate::mouse_cursor::{MouseCursor, MouseCursorHandler};
+use crate::standard_method_channel::StandardMethodHandler;
+use crate::task_queue::FlutterTaskQueue;
 use crate::text_input::{TextInputHandler, TextInputState};
-
-pub use crate::engine::{BinaryMessageHandler, BinaryMessageReply, BinaryMessenger};
-pub use crate::platform_views::{CompositorContext, PlatformView, PlatformViewUpdateArgs};
-
-#[doc(hidden)]
-pub use ::linkme;
-
-#[doc(hidden)]
-#[linkme::distributed_slice]
-pub static PLUGINS: [unsafe extern "C" fn(*mut c_void)];
-
-#[macro_export]
-macro_rules! include_plugins {
-    () => {
-        include!(concat!(env!("OUT_DIR"), "/plugin_registrant.rs"));
-    };
-}
+use crate::touch::TouchState;
 
 pub struct FlionAppBuilder<'a> {
-    bundle_path: PathBuf,
-    platform_message_handlers: Vec<(&'a str, Box<dyn BinaryMessageHandler>)>,
-    platform_view_factories: HashMap<String, Box<dyn PlatformViewFactory>>,
+    _p: PhantomData<&'a ()>,
 }
 
 impl<'a> FlionAppBuilder<'a> {
-    fn new() -> FlionAppBuilder<'a> {
-        let bundle_path = if let Ok(exe) = env::current_exe()
-            && let Some(dir) = exe.parent()
-        {
-            dir.join("data")
-        } else {
-            PathBuf::from("data")
-        };
-
-        FlionAppBuilder {
-            bundle_path,
-            platform_message_handlers: vec![],
-            platform_view_factories: HashMap::new(),
-        }
-    }
-
-    pub fn with_bundle_path(mut self, path: &'a Path) -> Self {
-        self.bundle_path = path.to_owned();
-        self
-    }
-
-    pub fn with_platform_message_handler(
-        mut self,
-        name: &'a str,
-        handler: Box<dyn BinaryMessageHandler>,
-    ) -> Self {
-        self.platform_message_handlers.push((name, handler));
-        self
-    }
-
-    pub fn with_platform_view_factory(
-        mut self,
-        name: &'a str,
-        factory: impl PlatformViewFactory + 'static,
-    ) -> Self {
-        self.platform_view_factories
-            .insert(name.to_owned(), Box::new(factory));
-        self
-    }
-
     pub fn build(self) -> eyre::Result<FlionApp> {
-        let device = unsafe {
-            let mut device = Default::default();
-
-            D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                Default::default(),
-                D3D11_CREATE_DEVICE_FLAG::default(),
-                None,
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                None,
-            )?;
-
-            device.ok_or_eyre("failed to create D3D11 device")?
-        };
-
-        let composition_device: IDCompositionDevice =
-            unsafe { DCompositionCreateDevice2(&device.cast::<IDXGIDevice>()?)? };
-
-        let egl = EglDevice::create(&device)?;
-
-        let task_executor = Rc::new(FlutterTaskExecutor::new()?);
-        let task_queue = task_executor.queue().clone();
-
-        let view_manager = Arc::new(Mutex::new(ViewManager::new()));
-        let compositor = FlutterCompositor::new(
-            device.clone(),
-            composition_device.clone(),
-            view_manager.clone(),
-            egl.clone(),
-            Box::new(CompositionHandler {
-                composition_device: composition_device.clone(),
-                view_manager: view_manager.clone(),
-                platform_task_queue: task_queue.clone(),
-            }),
-        )?;
-
-        let platform_views = compositor.platform_views();
-
-        let mut platform_message_handlers: Vec<(&str, Box<dyn BinaryMessageHandler>)> = vec![(
-            "flion/platform_views",
-            Box::new(PlatformViewsMessageHandler::new(
-                platform_views,
-                device,
-                composition_device.clone(),
-                self.platform_view_factories,
-            )),
-        )];
-
-        platform_message_handlers.extend(self.platform_message_handlers);
-
-        // TODO: Disable environment variable lookup in release builds.
-        // These variables are provided by the flion cli during development, and are not intended
-        // to be used in release builds.
-        let assets_path = env::var("FLION_ASSETS_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| self.bundle_path.join("flutter_assets"));
-
-        let aot_library_path = env::var("FLION_AOT_LIBRARY_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| self.bundle_path.join("app.so"));
-
-        let engine = Rc::new(FlutterEngine::new(FlutterEngineConfig {
-            assets_path: assets_path.to_str().ok_or_eyre("invalid assets path")?,
-            aot_library_path: Some(
-                aot_library_path
-                    .to_str()
-                    .ok_or_eyre("invalid aot library path")?,
-            ),
-            egl: egl.clone(),
-            compositor,
-            platform_task_handler: Box::new(move |task| task_queue.enqueue(task)),
-            platform_message_handlers,
-        })?);
-
-        task_executor.init(engine.clone());
-
-        settings::send_to_engine(&engine)?;
-
-        Ok(FlionApp {
-            engine,
-            composition_device,
-            view_manager,
-            task_executor,
-        })
+        Ok(FlionApp)
     }
 }
 
-pub struct FlionApp {
-    engine: Rc<FlutterEngine>,
-    composition_device: IDCompositionDevice,
-    view_manager: Arc<Mutex<ViewManager>>,
-    task_executor: Rc<FlutterTaskExecutor>,
-}
+pub struct FlionApp;
 
 impl FlionApp {
     pub fn builder<'a>() -> FlionAppBuilder<'a> {
-        FlionAppBuilder::new()
-    }
-
-    pub fn messenger(&self) -> BinaryMessenger {
-        self.engine.messenger()
-    }
-
-    pub fn set_platform_message_handler(
-        &self,
-        name: impl Into<String>,
-        handler: impl BinaryMessageHandler + 'static,
-    ) {
-        self.engine.set_platform_message_handler(name, handler)
+        FlionAppBuilder { _p: PhantomData }
     }
 
     pub fn run_event_loop(self) -> eyre::Result<()> {
-        let event_loop = EventLoopBuilder::new().build()?;
+        let conn = Connection::connect_to_env()?;
 
-        let parent_window = WindowBuilder::new()
-            .with_inner_size(LogicalSize::new(1280, 720))
-            .with_no_redirection_bitmap(true)
-            .build(&event_loop)?;
+        let (globals, event_queue) = wayland_client::globals::registry_queue_init(&conn)?;
 
-        let parent_window = Rc::new(parent_window);
+        globals.contents().with_list(|globals| {
+            for global in globals {
+                let wayland_client::globals::Global {
+                    interface,
+                    name,
+                    version,
+                } = global;
 
-        let parent_hwnd = match parent_window.window_handle()?.as_raw() {
-            RawWindowHandle::Win32(handle) => HWND(handle.hwnd.get() as _),
-            _ => unreachable!(),
-        };
-
-        unsafe {
-            let backdrop_type = DWMSBT_MAINWINDOW;
-            DwmSetWindowAttribute(
-                parent_hwnd,
-                DWMWA_SYSTEMBACKDROP_TYPE,
-                &raw const backdrop_type as *const c_void,
-                mem::size_of::<DWM_SYSTEMBACKDROP_TYPE>() as u32,
-            )?;
-        }
-
-        let root_visual = unsafe { self.composition_device.CreateVisual()? };
-        self.view_manager.lock().insert(0, root_visual.clone());
-
-        let text_input = Rc::new(RefCell::new(TextInputState::new()));
-
-        let size = parent_window.inner_size();
-        let window = Rc::new(Window::new(
-            size.width,
-            size.height,
-            Box::new(FlutterWindowHandler {
-                engine: self.engine.clone(),
-                task_executor: self.task_executor.clone(),
-                view_manager: self.view_manager.clone(),
-                keyboard: Keyboard::new(self.engine.clone(), text_input.clone()),
-            }),
-        )?);
-
-        window.set_parent(parent_hwnd);
-        window.request_focus();
-
-        window.show();
-
-        // The initial frame is scheduled by the send_window_metrics call when the window is resized
-        // during its creation. However, this frame doesn't seem to show up on the window for some
-        // reason. This workaround forces another frame which then is visible.
-        // TODO: Figure out why this is needed.
-        self.engine.schedule_frame();
-
-        self.engine.set_platform_message_handler(
-            "flutter/textinput",
-            TextInputHandler::new(text_input.clone()),
-        );
-
-        self.engine.set_platform_message_handler(
-            "flutter/mousecursor",
-            MouseCursorHandler::new(Rc::downgrade(&window)),
-        );
-
-        let mut plugins_engine = Box::new(FlutterPluginsEngine::new(
-            self.engine.clone(),
-            window.window_handle(),
-        )?);
-
-        for init in PLUGINS {
-            unsafe {
-                (init)(&raw mut *plugins_engine as *mut c_void);
+                debug!("[{name}] {interface} (v{version})");
             }
-        }
+        });
 
-        // TODO: Composition target should be attached to parent window instead. Use the child window
-        // just for input.
-        let composition_target = unsafe {
-            self.composition_device
-                .CreateTargetForHwnd(window.window_handle(), true)?
-        };
+        let qh = event_queue.handle();
 
-        unsafe { composition_target.SetRoot(&root_visual)? };
+        let compositor: WlCompositor = globals.bind(&qh, 1..=4, ())?;
+        let xdg_wm_base: XdgWmBase = globals.bind(&qh, 7..=7, ())?;
+        let viewporter: WpViewporter = globals.bind(&qh, 1..=1, ())?;
+        let fractional_scale_manager: WpFractionalScaleManagerV1 = globals.bind(&qh, 1..=1, ())?;
+        let seat: WlSeat = globals.bind(&qh, 5..=11, ())?;
+        let cursor_shape_manager: Option<WpCursorShapeManagerV1> =
+            globals.bind(&qh, 1..=1, ()).ok();
+        let data_device_manager: Option<WlDataDeviceManager> = globals.bind(&qh, 1..=3, ()).ok();
 
-        event_loop.run(move |event, target| match event {
-            winit::event::Event::WindowEvent { window_id, event }
-                if window_id == parent_window.id() =>
+        let mut event_loop: EventLoop<'_, AppState> = EventLoop::try_new()?;
+
+        let egl = EglDisplay::for_wayland_connection(&conn)?;
+
+        WaylandSource::new(conn, event_queue).insert(event_loop.handle())?;
+
+        struct SurfaceHandle(WlSurface);
+
+        impl HasWindowHandle for SurfaceHandle {
+            fn window_handle(
+                &self,
+            ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError>
             {
-                match event {
-                    winit::event::WindowEvent::CloseRequested => target.exit(),
-
-                    winit::event::WindowEvent::Focused(true) => window.request_focus(),
-
-                    winit::event::WindowEvent::Resized(PhysicalSize { width, height }) => {
-                        window.set_position_and_size(0, 0, width, height)
-                    }
-
-                    _ => {}
-                }
+                Ok(unsafe {
+                    WindowHandle::borrow_raw(RawWindowHandle::Wayland(WaylandWindowHandle::new(
+                        NonNull::new_unchecked(self.0.id().as_ptr()).cast(),
+                    )))
+                })
             }
+        }
 
-            _ => {}
+        let (task_sender, task_receiver) = calloop::channel::channel();
+
+        event_loop
+            .handle()
+            .insert_source(task_receiver, |event, _, app| {
+                if let calloop::channel::Event::Msg(task) = event {
+                    app.task_queue.push(task);
+                }
+            })
+            .unwrap();
+
+        let mouse_cursor = Rc::new(RefCell::new(MouseCursor::new()));
+
+        let mouse_state = MouseState::default();
+        let touch_state = TouchState::default();
+        let text_input = Rc::new(RefCell::new(TextInputState::default()));
+        let keyboard_state = KeyboardState::new(text_input.clone());
+        let clipboard = Rc::new(RefCell::new(Clipboard::new(
+            data_device_manager,
+            &seat,
+            qh.clone(),
+            event_loop.handle(),
+        )));
+
+        let aot_library_path = env::var("FLION_AOT_LIBRARY_PATH").map(PathBuf::from).ok();
+
+        let view_surfaces = Arc::new(ViewSurfaceRegistry::default());
+        let opengl_compositor = OpenGLCompositor::new(egl.clone(), view_surfaces.clone()).unwrap();
+
+        let engine = FlutterEngine::new(FlutterEngineConfig {
+            assets_path: &env::var("FLION_ASSETS_PATH").unwrap(),
+            aot_library_path: aot_library_path.as_deref().and_then(|p| p.to_str()),
+            compositor: opengl_compositor,
+            platform_task_handler: Box::new(move |task| {
+                let _ = task_sender.send(task);
+            }),
+            platform_message_handlers: vec![],
         })?;
 
-        Ok(())
-    }
-}
+        engine.set_platform_message_handler("flutter/keyboard", keyboard_state.channel_handler());
+        engine.set_platform_message_handler("flutter/textinput", TextInputHandler::new(text_input));
+        engine.set_platform_message_handler(
+            "flutter/platform",
+            PlatformHandler::new(clipboard.clone()),
+        );
+        engine.set_platform_message_handler(
+            "flutter/mousecursor",
+            MouseCursorHandler::new(mouse_cursor.clone()),
+        );
 
-struct FlutterWindowHandler {
-    engine: Rc<engine::FlutterEngine>,
-    task_executor: Rc<FlutterTaskExecutor>,
-    view_manager: Arc<Mutex<ViewManager>>,
-    keyboard: Keyboard,
-}
+        let (create_view_sender, create_view_receiver) = calloop::channel::channel();
+        let (add_view_result_sender, add_view_result_receiver) = calloop::channel::channel();
 
-impl WindowHandler for FlutterWindowHandler {
-    fn on_resize(&self, width: u32, height: u32, scale_factor: f64) {
-        // TODO: Consider moving this to WM_NCCALCSIZE on the parent window for smoother resizing.
-
-        {
-            let mut views = self.view_manager.lock();
-            let Some(view) = views.get_mut(0) else {
-                tracing::error!("Failed to resize non-existent view");
-                return;
-            };
-            view.begin_resize(width, height);
+        struct ViewsHandler {
+            sender: calloop::channel::Sender<standard_method_channel::StandardMethodReply>,
         }
 
-        let _ = self
-            .engine
-            .send_window_metrics_event(width as usize, height as usize, scale_factor)
-            .trace_err();
+        event_loop
+            .handle()
+            .insert_source(create_view_receiver, move |event, _, app| {
+                if let calloop::channel::Event::Msg(reply) = event {
+                    let next_view_id = app.windows.keys().max().copied().unwrap_or_default() + 1;
+                    app.engine
+                        .add_view(next_view_id, 0, 0, 1.0, |success| {
+                            let _ = add_view_result_sender.send((next_view_id, success, reply));
+                        })
+                        .unwrap();
+                }
+            })
+            .unwrap();
 
-        // The Flutter famework may need to run tasks on the platform executor during the resize,
-        // so poll the executor instead of blocking to avoid a deadlock.
-        while is_view_resizing(&self.view_manager.lock(), 0) {
-            self.task_executor
-                .poll_with_timeout(Duration::from_millis(100));
-        }
-
-        fn is_view_resizing(views: &ViewManager, view_id: i64) -> bool {
-            match views.get(view_id) {
-                None => false,
-                Some(view) => view.is_resizing(),
+        impl StandardMethodHandler for ViewsHandler {
+            fn handle(
+                &self,
+                method: &str,
+                _args: codec::EncodableValue,
+                reply: standard_method_channel::StandardMethodReply,
+            ) {
+                if method == "addView" {
+                    self.sender.send(reply).unwrap();
+                }
             }
         }
-    }
 
-    fn on_mouse_event(&self, event: window::MouseEvent) {
-        if event.action == MouseAction::Scroll {
-            let _ = self
-                .engine
-                .send_scroll_event(event.x, event.y, event.scroll_delta_x, event.scroll_delta_y)
-                .trace_err();
-        } else {
-            let pointer_event = PointerEvent {
-                device_kind: PointerDeviceKind::Mouse,
-                device_id: 1,
-                phase: match event.action {
-                    window::MouseAction::Enter => PointerPhase::Add,
-                    window::MouseAction::Exit => PointerPhase::Remove,
-                    window::MouseAction::Move => {
-                        if event.buttons.is_empty() {
-                            PointerPhase::Hover
-                        } else {
-                            PointerPhase::Move
-                        }
+        engine.set_platform_message_handler(
+            "flion/views",
+            ViewsHandler {
+                sender: create_view_sender,
+            },
+        );
+
+        event_loop
+            .handle()
+            .insert_source(add_view_result_receiver, |event, _, app| {
+                if let calloop::channel::Event::Msg((view_id, success, reply)) = event {
+                    if success {
+                        let window = Window::new(
+                            view_id,
+                            &app.qh,
+                            &app.compositor,
+                            &app.xdg_wm_base,
+                            &app.viewporter,
+                            &app.fractional_scale_manager,
+                        );
+
+                        app.view_surfaces.add(
+                            window.id,
+                            app.egl
+                                .create_window_surface(SurfaceHandle(window.surface.clone()), 1, 1)
+                                .unwrap(),
+                        );
+
+                        app.windows.insert(view_id, window);
+
+                        reply.success(&codec::EncodableValue::I64(view_id));
+                    } else {
+                        reply.success(&codec::EncodableValue::Null);
                     }
-                    window::MouseAction::Down => PointerPhase::Down,
-                    window::MouseAction::Up => PointerPhase::Up,
-                    window::MouseAction::Scroll => unreachable!(),
-                },
-                x: event.x,
-                y: event.y,
-                buttons: PointerButtons::from_bits_truncate(event.buttons.bits().into()),
-            };
+                }
+            })
+            .unwrap();
 
-            let _ = self.engine.send_pointer_event(&pointer_event).trace_err();
-        }
-    }
-
-    fn on_touch_event(&self, event: window::TouchEvent) {
-        let phases: &[PointerPhase] = match event.action {
-            window::TouchAction::Down => &[PointerPhase::Add, PointerPhase::Down],
-            window::TouchAction::Up => &[PointerPhase::Up, PointerPhase::Remove],
-            window::TouchAction::Move => &[PointerPhase::Move],
+        let mut app = AppState {
+            qh,
+            compositor,
+            xdg_wm_base,
+            viewporter,
+            fractional_scale_manager,
+            egl,
+            task_queue: FlutterTaskQueue::new(),
+            engine,
+            view_surfaces,
+            windows: BTreeMap::from([]),
+            loop_handle: event_loop.handle(),
+            pointer: None,
+            mouse: mouse_state,
+            touch: None,
+            touch_state,
+            keyboard: None,
+            keyboard_state,
+            mouse_cursor,
+            cursor_shape_manager,
+            clipboard,
         };
 
-        for &phase in phases {
-            let _ = self
-                .engine
-                .send_pointer_event(&PointerEvent {
-                    device_kind: PointerDeviceKind::Touch,
-                    device_id: event.touch_id as i32,
-                    phase,
-                    x: event.x,
-                    y: event.y,
-                    ..Default::default()
-                })
-                .trace_err();
+        while app.windows.is_empty() || !app.windows.values().any(|window| window.close_requested) {
+            let timeout = app
+                .task_queue
+                .next_deadline()
+                .map(|deadline| deadline - Instant::now());
+
+            event_loop.dispatch(timeout, &mut app)?;
+
+            app.task_queue.run_tasks(&app.engine);
         }
-    }
 
-    fn on_key_event(&self, event: window::KeyEvent) {
-        let _ = self.keyboard.handle_event(event).trace_err();
-    }
-}
-
-struct CompositionHandler {
-    composition_device: IDCompositionDevice,
-    view_manager: Arc<Mutex<ViewManager>>,
-    platform_task_queue: Arc<FlutterTaskQueue>,
-}
-
-unsafe impl Send for CompositionHandler {}
-
-impl compositor::CompositionHandler for CompositionHandler {
-    fn get_surface_size(&mut self) -> eyre::Result<(u32, u32)> {
-        let views = self.view_manager.lock();
-        let surface = views.get(0).ok_or_eyre("View not found")?;
-        Ok(surface.size())
-    }
-
-    fn present(&mut self) -> eyre::Result<()> {
-        let mut views = self.view_manager.lock();
-        let surface = views.get_mut(0).ok_or_eyre("View not found")?;
-
-        if surface.is_resizing() {
-            unsafe {
-                // Make sure the previous commit has completed. This reduces glitches while resizing.
-                self.composition_device.WaitForCommitCompletion()?;
-                self.composition_device.Commit()?;
-            }
-
-            surface.end_resize();
-
-            // Platform thread is waiting for the resize so send it a signal to wake up.
-            self.platform_task_queue.wake();
-        } else {
-            unsafe { self.composition_device.Commit()? };
+        for window in std::mem::take(&mut app.windows).into_values() {
+            drop(app.view_surfaces.remove(window.id));
+            window.destroy();
         }
+
+        app.mouse_cursor.borrow_mut().set_pointer(None, None);
+
+        if let Some(keyboard) = app.keyboard.take() {
+            keyboard.release();
+        }
+
+        if let Some(touch) = app.touch.take() {
+            touch.release();
+        }
+
+        if let Some(manager) = app.cursor_shape_manager.take() {
+            manager.destroy();
+        }
+
+        app.clipboard.borrow_mut().destroy();
+
+        seat.release();
+        app.fractional_scale_manager.destroy();
+        app.viewporter.destroy();
+        app.xdg_wm_base.destroy();
+        app.compositor.release();
 
         Ok(())
+    }
+}
+
+type WindowId = i64;
+
+struct AppState {
+    qh: QueueHandle<AppState>,
+    compositor: WlCompositor,
+    xdg_wm_base: XdgWmBase,
+    viewporter: WpViewporter,
+    fractional_scale_manager: WpFractionalScaleManagerV1,
+    egl: EglDisplay,
+    task_queue: FlutterTaskQueue,
+    engine: FlutterEngine,
+    view_surfaces: Arc<ViewSurfaceRegistry>,
+    windows: BTreeMap<WindowId, Window>,
+    loop_handle: LoopHandle<'static, AppState>,
+    pointer: Option<WlPointer>,
+    mouse: MouseState,
+    touch: Option<WlTouch>,
+    touch_state: TouchState,
+    keyboard: Option<WlKeyboard>,
+    keyboard_state: KeyboardState,
+    mouse_cursor: Rc<RefCell<MouseCursor>>,
+    cursor_shape_manager: Option<WpCursorShapeManagerV1>,
+    clipboard: Rc<RefCell<Clipboard>>,
+}
+
+struct Window {
+    id: WindowId,
+    surface: WlSurface,
+    xdg_surface: XdgSurface,
+    toplevel: XdgToplevel,
+    viewport: WpViewport,
+    fractional_scale: wp_fractional_scale_v1::WpFractionalScaleV1,
+    size: (u32, u32),
+    scale_factor: f64,
+    close_requested: bool,
+}
+
+impl Window {
+    fn new(
+        id: WindowId,
+        qh: &QueueHandle<AppState>,
+        compositor: &WlCompositor,
+        xdg_wm_base: &XdgWmBase,
+        viewporter: &WpViewporter,
+        fractional_scale_manager: &WpFractionalScaleManagerV1,
+    ) -> Window {
+        let surface = compositor.create_surface(qh, id);
+        let xdg_surface = xdg_wm_base.get_xdg_surface(&surface, qh, id);
+        let toplevel = xdg_surface.get_toplevel(qh, id);
+        let viewport = viewporter.get_viewport(&surface, qh, id);
+        let fractional_scale = fractional_scale_manager.get_fractional_scale(&surface, qh, id);
+
+        surface.commit();
+
+        Window {
+            id,
+            surface,
+            xdg_surface,
+            toplevel,
+            viewport,
+            fractional_scale,
+            size: (0, 0),
+            scale_factor: 1.0,
+            close_requested: false,
+        }
+    }
+
+    fn destroy(self) {
+        self.fractional_scale.destroy();
+        self.viewport.destroy();
+        self.toplevel.destroy();
+        self.xdg_surface.destroy();
+        self.surface.destroy();
+    }
+}
+
+impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListContents> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlRegistry,
+        event: <WlRegistry as wayland_client::Proxy>::Event,
+        _data: &wayland_client::globals::GlobalListContents,
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
+            debug!(name, interface, version);
+        }
+    }
+}
+
+impl Dispatch<wl_compositor::WlCompositor, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_compositor::WlCompositor,
+        _event: <wl_compositor::WlCompositor as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        todo!()
+    }
+}
+
+impl Dispatch<wl_surface::WlSurface, WindowId> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_surface::WlSurface,
+        _event: <wl_surface::WlSurface as Proxy>::Event,
+        _data: &WindowId,
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        todo!()
+    }
+}
+
+impl Dispatch<xdg_wm_base::XdgWmBase, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        proxy: &xdg_wm_base::XdgWmBase,
+        event: <xdg_wm_base::XdgWmBase as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        if let xdg_wm_base::Event::Ping { serial } = event {
+            proxy.pong(serial)
+        }
+    }
+}
+
+impl Dispatch<xdg_surface::XdgSurface, WindowId> for AppState {
+    fn event(
+        state: &mut Self,
+        proxy: &xdg_surface::XdgSurface,
+        event: <xdg_surface::XdgSurface as Proxy>::Event,
+        window_id: &WindowId,
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        if let xdg_surface::Event::Configure { serial } = event {
+            let Some(window) = state.windows.get(window_id) else {
+                return;
+            };
+
+            let (width, height) = window.size;
+            let scale_factor = window.scale_factor;
+
+            window.viewport.set_destination(width as i32, height as i32);
+
+            let width = f64::from(width) * scale_factor;
+            let height = f64::from(height) * scale_factor;
+
+            state
+                .engine
+                .send_window_metrics_event(
+                    *window_id,
+                    width as usize,
+                    height as usize,
+                    scale_factor,
+                )
+                .unwrap();
+
+            proxy.ack_configure(serial);
+        }
+    }
+}
+
+impl Dispatch<xdg_toplevel::XdgToplevel, WindowId> for AppState {
+    fn event(
+        state: &mut Self,
+        _proxy: &xdg_toplevel::XdgToplevel,
+        event: <xdg_toplevel::XdgToplevel as Proxy>::Event,
+        window_id: &WindowId,
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        let Some(window) = state.windows.get_mut(window_id) else {
+            return;
+        };
+
+        match event {
+            xdg_toplevel::Event::Configure { width, height, .. } => {
+                let width = if width == 0 { 1280 } else { width };
+                let height = if height == 0 { 800 } else { height };
+                window.size = (width as u32, height as u32);
+            }
+            xdg_toplevel::Event::Close => {
+                window.close_requested = true;
+            }
+            xdg_toplevel::Event::ConfigureBounds { .. } => {}
+            xdg_toplevel::Event::WmCapabilities { .. } => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wp_viewporter::WpViewporter, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wp_viewporter::WpViewporter,
+        _event: <wp_viewporter::WpViewporter as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wp_viewport::WpViewport, WindowId> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wp_viewport::WpViewport,
+        _event: <wp_viewport::WpViewport as Proxy>::Event,
+        _data: &WindowId,
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+        _event: <wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, WindowId> for AppState {
+    fn event(
+        state: &mut Self,
+        _proxy: &wp_fractional_scale_v1::WpFractionalScaleV1,
+        event: <wp_fractional_scale_v1::WpFractionalScaleV1 as Proxy>::Event,
+        window_id: &WindowId,
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event
+            && let Some(window) = state.windows.get_mut(window_id)
+        {
+            window.scale_factor = f64::from(scale) / 120.0;
+            // TODO: Probably need to send a window metrics event to flutter
+        }
+    }
+}
+
+impl Dispatch<wl_seat::WlSeat, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        seat: &wl_seat::WlSeat,
+        event: <wl_seat::WlSeat as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        qh: &wayland_client::QueueHandle<Self>,
+    ) {
+        if let wl_seat::Event::Capabilities { capabilities } = event {
+            match capabilities {
+                wayland_client::WEnum::Value(capabilities) => {
+                    if capabilities.contains(Capability::Pointer) {
+                        if state.pointer.is_none() {
+                            let pointer = seat.get_pointer(qh, ());
+                            let shape_device = state
+                                .cursor_shape_manager
+                                .as_ref()
+                                .map(|manager| manager.get_pointer(&pointer, qh, ()));
+
+                            state
+                                .mouse_cursor
+                                .borrow_mut()
+                                .set_pointer(Some(pointer.clone()), shape_device);
+
+                            state.pointer = Some(pointer);
+                        }
+                    } else if let Some(pointer) = state.pointer.take() {
+                        state.mouse_cursor.borrow_mut().set_pointer(None, None);
+                        pointer.release();
+                    }
+
+                    if capabilities.contains(Capability::Touch) {
+                        if state.touch.is_none() {
+                            state.touch = Some(seat.get_touch(qh, ()));
+                        }
+                    } else if let Some(touch) = state.touch.take() {
+                        state.touch_state.cancel_all(&state.engine);
+                        touch.release();
+                    }
+
+                    if capabilities.contains(Capability::Keyboard) {
+                        if state.keyboard.is_none() {
+                            state.keyboard = Some(seat.get_keyboard(qh, ()));
+                        }
+                    } else if let Some(keyboard) = state.keyboard.take() {
+                        keyboard.release();
+                    }
+                }
+                wayland_client::WEnum::Unknown(_) => {}
+            }
+        }
+    }
+}
+
+impl Dispatch<wl_pointer::WlPointer, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_pointer::WlPointer,
+        event: <wl_pointer::WlPointer as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        if let wl_pointer::Event::Button { serial, .. } = &event {
+            state.clipboard.borrow_mut().set_input_serial(*serial);
+        }
+
+        if let wl_pointer::Event::Enter { serial, .. } = &event {
+            state.mouse_cursor.borrow_mut().on_enter(*serial);
+        } else if let wl_pointer::Event::Leave { .. } = &event {
+            state.mouse_cursor.borrow_mut().on_leave();
+        }
+
+        let windows = &state.windows;
+
+        state.mouse.handle_event(
+            &state.engine,
+            |surface| surface.data().copied(),
+            |id| windows.get(&id).map(|window| window.scale_factor),
+            event,
+        );
+    }
+}
+
+impl Dispatch<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
+        _event: <wp_cursor_shape_manager_v1::WpCursorShapeManagerV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wp_cursor_shape_device_v1::WpCursorShapeDeviceV1,
+        _event: <wp_cursor_shape_device_v1::WpCursorShapeDeviceV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wl_touch::WlTouch, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_touch::WlTouch,
+        event: <wl_touch::WlTouch as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        if let wl_touch::Event::Down { serial, .. } = &event {
+            state.clipboard.borrow_mut().set_input_serial(*serial);
+        }
+
+        state.touch_state.handle_event(
+            &state.engine,
+            |surface| surface.data().copied(),
+            |id| state.windows.get(&id).map(|window| window.scale_factor),
+            event,
+        );
+    }
+}
+
+impl Dispatch<wl_keyboard::WlKeyboard, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_keyboard::WlKeyboard,
+        event: <wl_keyboard::WlKeyboard as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        if let wl_keyboard::Event::Enter { serial, .. } | wl_keyboard::Event::Key { serial, .. } =
+            &event
+        {
+            state.clipboard.borrow_mut().set_input_serial(*serial);
+        }
+
+        state
+            .keyboard_state
+            .handle_event(&state.engine, &state.loop_handle, event);
+    }
+}
+
+impl Dispatch<wl_data_device_manager::WlDataDeviceManager, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_data_device_manager::WlDataDeviceManager,
+        _event: <wl_data_device_manager::WlDataDeviceManager as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wl_data_device::WlDataDevice, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_data_device::WlDataDevice,
+        event: <wl_data_device::WlDataDevice as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        state.clipboard.borrow_mut().handle_data_device_event(event);
+    }
+
+    wayland_client::event_created_child!(AppState, WlDataDevice, [
+        wl_data_device::EVT_DATA_OFFER_OPCODE => (WlDataOffer, OfferData::default()),
+    ]);
+}
+
+impl Dispatch<wl_data_offer::WlDataOffer, OfferData> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_data_offer::WlDataOffer,
+        event: <wl_data_offer::WlDataOffer as Proxy>::Event,
+        data: &OfferData,
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        data.handle_event(event);
+    }
+}
+
+impl Dispatch<wl_data_source::WlDataSource, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        proxy: &wl_data_source::WlDataSource,
+        event: <wl_data_source::WlDataSource as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        state
+            .clipboard
+            .borrow_mut()
+            .handle_data_source_event(proxy, event);
     }
 }

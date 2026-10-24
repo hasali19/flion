@@ -1,54 +1,50 @@
 use std::ffi::c_void;
-use std::sync::Arc;
 
-use egl::ClientBuffer;
-use eyre::bail;
 use khronos_egl as egl;
-use windows::core::Interface;
-use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use wayland_client::Connection;
+use wayland_egl::WlEglSurface;
 
-const EGL_PLATFORM_DEVICE_EXT: egl::Enum = 0x313F;
-
-const EGL_D3D11_DEVICE_ANGLE: egl::Int = 0x33A1;
-const EGL_D3D_TEXTURE_ANGLE: egl::Enum = 0x33A3;
-
-const EGL_TEXTURE_OFFSET_X_ANGLE: i32 = 0x3490;
-const EGL_TEXTURE_OFFSET_Y_ANGLE: i32 = 0x3491;
-
-pub struct EglDevice {
-    egl: egl::Instance<egl::Static>,
-    angle_device: *mut c_void,
+#[derive(Clone)]
+pub struct EglDisplay {
     display: egl::Display,
-    config: egl::Config,
-    context: egl::Context,
-    resource_context: egl::Context,
 }
 
-unsafe impl Send for EglDevice {}
-unsafe impl Sync for EglDevice {}
+unsafe impl Send for EglDisplay {}
 
-impl EglDevice {
-    pub fn create(device: &ID3D11Device) -> eyre::Result<Arc<EglDevice>> {
-        let egl = egl::Instance::new(egl::Static);
+unsafe impl Sync for EglDisplay {}
 
-        let angle_device = unsafe {
-            eglCreateDeviceANGLE(EGL_D3D11_DEVICE_ANGLE, device.as_raw(), &egl::ATTRIB_NONE)
-        };
+impl EglDisplay {
+    pub fn for_wayland_connection(conn: &Connection) -> eyre::Result<Self> {
+        // FIXME: Probably unsound?
+        let display = unsafe { EGL.get_display(conn.backend().display_ptr() as *mut c_void) }
+            .ok_or_else(|| eyre::eyre!("failed to get EGL display"))?;
 
-        if angle_device.is_null() {
-            bail!("failed to create angle device");
-        }
+        // TODO: Call eglTerminate somwhere?
 
-        // let attribs = [egl::NONE as egl::Attrib];
-        // unsafe { eglDebugMessageControlKHR(debug_callback, attribs.as_ptr()) };
+        EGL.initialize(display)?;
 
-        let display = unsafe {
-            egl.get_platform_display(EGL_PLATFORM_DEVICE_EXT, angle_device, &[egl::ATTRIB_NONE])?
-        };
+        gl::load_with(|name| {
+            EGL.get_proc_address(name)
+                .map_or(std::ptr::null(), |f| f as *const c_void)
+        });
 
-        egl.initialize(display)?;
+        Ok(EglDisplay { display })
+    }
 
-        let mut configs = Vec::with_capacity(1);
+    pub fn get_proc_address(&self, name: &str) -> Option<extern "system" fn()> {
+        EGL.get_proc_address(name)
+    }
+
+    pub fn create_context(&self) -> eyre::Result<EglContext> {
+        self.create_context_impl(None)
+    }
+
+    pub fn create_shared_context(&self, share_context: &EglContext) -> eyre::Result<EglContext> {
+        self.create_context_impl(Some(share_context))
+    }
+
+    fn create_context_impl(&self, share_context: Option<&EglContext>) -> eyre::Result<EglContext> {
         let config_attribs = [
             egl::RED_SIZE,
             8,
@@ -58,142 +54,142 @@ impl EglDevice {
             8,
             egl::ALPHA_SIZE,
             8,
-            egl::DEPTH_SIZE,
+            egl::NONE,
+        ];
+
+        let config = EGL
+            .choose_first_config(self.display, &config_attribs)?
+            .ok_or_else(|| eyre::eyre!("failed to find a suitable EGL configuration"))?;
+
+        let context_attribs = [egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE];
+
+        let context = EGL.create_context(
+            self.display,
+            config,
+            share_context.map(|c| c.context),
+            &context_attribs,
+        )?;
+
+        Ok(EglContext {
+            display: self.clone(),
+            context,
+        })
+    }
+
+    pub fn create_window_surface(
+        &self,
+        window: impl HasWindowHandle + Send + Sync + 'static,
+        width: u32,
+        height: u32,
+    ) -> eyre::Result<EglSurface> {
+        let config_attribs = [
+            egl::RED_SIZE,
             8,
-            egl::STENCIL_SIZE,
+            egl::GREEN_SIZE,
+            8,
+            egl::BLUE_SIZE,
+            8,
+            egl::ALPHA_SIZE,
             8,
             egl::NONE,
         ];
 
-        egl.choose_config(display, &config_attribs, &mut configs)?;
+        let config = EGL
+            .choose_first_config(self.display, &config_attribs)?
+            .ok_or_else(|| eyre::eyre!("failed to find a suitable EGL configuration"))?;
 
-        let config = configs[0];
+        let RawWindowHandle::Wayland(handle) = window.window_handle()?.as_raw() else {
+            eyre::bail!("unsupported window handle");
+        };
 
-        let context_attribs = [egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE];
-        let context = egl.create_context(display, config, None, &context_attribs)?;
-        let resource_context =
-            egl.create_context(display, config, Some(context), &context_attribs)?;
+        let wl_egl_surface = unsafe {
+            WlEglSurface::new_from_raw(handle.surface.as_ptr().cast(), width as i32, height as i32)
+        }?;
 
-        Ok(Arc::new(EglDevice {
-            egl,
-            angle_device,
-            display,
-            config,
-            context,
-            resource_context,
-        }))
+        let egl_surface = unsafe {
+            EGL.create_window_surface(
+                self.display,
+                config,
+                wl_egl_surface.ptr() as egl::NativeWindowType,
+                None,
+            )
+        }?;
+
+        Ok(EglSurface {
+            display: self.clone(),
+            surface: egl_surface,
+            wl_egl_surface,
+            _window: Box::new(window),
+        })
     }
 
-    pub fn make_surface_current(&self, surface: egl::Surface) -> eyre::Result<()> {
-        self.egl.make_current(
-            self.display,
-            Some(surface),
-            Some(surface),
+    pub fn make_current(
+        &self,
+        context: Option<&EglContext>,
+        surface: Option<&EglSurface>,
+    ) -> eyre::Result<()> {
+        let surface = surface.map(|s| s.surface);
+
+        EGL.make_current(self.display, surface, surface, context.map(|c| c.context))?;
+
+        Ok(())
+    }
+
+    pub fn swap_buffers(&self, surface: &EglSurface) -> eyre::Result<()> {
+        EGL.swap_buffers(self.display, surface.surface)?;
+        Ok(())
+    }
+}
+
+pub struct EglContext {
+    display: EglDisplay,
+    context: egl::Context,
+}
+
+pub struct EglSurface {
+    display: EglDisplay,
+    surface: egl::Surface,
+    wl_egl_surface: WlEglSurface,
+    _window: Box<dyn HasWindowHandle + Send + Sync>,
+}
+
+// SAFETY: All fields implement Send except egl::Surface, which is safe to send between threads.
+unsafe impl Send for EglSurface {}
+
+impl EglSurface {
+    pub fn resize(&self, width: u32, height: u32) {
+        self.wl_egl_surface
+            .resize(width as i32, height as i32, 0, 0);
+    }
+}
+
+impl Drop for EglSurface {
+    fn drop(&mut self) {
+        if let Err(e) = EGL.destroy_surface(self.display.display, self.surface) {
+            tracing::error!("failed to destroy EGL surface: {e}");
+        }
+    }
+}
+
+static EGL: egl::Instance<egl::Static> = egl::Instance::new(egl::Static);
+
+impl EglContext {
+    pub fn make_current(&self) -> eyre::Result<()> {
+        EGL.make_current(
+            self.display.display,
+            EGL.get_current_surface(egl::DRAW),
+            EGL.get_current_surface(egl::READ),
             Some(self.context),
         )?;
-        Ok(())
-    }
 
-    pub fn make_context_current(&self) -> eyre::Result<()> {
-        self.egl
-            .make_current(self.display, None, None, Some(self.context))?;
-        Ok(())
-    }
-
-    pub fn make_resource_context_current(&self) -> eyre::Result<()> {
-        self.egl
-            .make_current(self.display, None, None, Some(self.resource_context))?;
-        Ok(())
-    }
-
-    pub fn clear_current(&self) -> eyre::Result<()> {
-        self.egl.make_current(self.display, None, None, None)?;
-        Ok(())
-    }
-
-    pub fn get_proc_address(&self, name: &str) -> Option<*mut c_void> {
-        self.egl.get_proc_address(name).map(|f| f as *mut c_void)
-    }
-
-    pub fn create_surface_from_d3d11_texture(
-        &self,
-        texture: &ID3D11Texture2D,
-        offset: (i32, i32),
-    ) -> eyre::Result<egl::Surface> {
-        let buffer = unsafe { ClientBuffer::from_ptr(texture.as_raw()) };
-
-        let surface = self.egl.create_pbuffer_from_client_buffer(
-            self.display,
-            EGL_D3D_TEXTURE_ANGLE,
-            buffer,
-            self.config,
-            &[
-                egl::TEXTURE_FORMAT,
-                egl::TEXTURE_RGBA,
-                egl::TEXTURE_TARGET,
-                egl::TEXTURE_2D,
-                EGL_TEXTURE_OFFSET_X_ANGLE,
-                offset.0,
-                EGL_TEXTURE_OFFSET_Y_ANGLE,
-                offset.1,
-                egl::NONE,
-            ],
-        )?;
-        Ok(surface)
-    }
-
-    pub fn destroy_surface(&self, surface: egl::Surface) -> eyre::Result<()> {
-        self.egl.destroy_surface(self.display, surface)?;
         Ok(())
     }
 }
 
-impl Drop for EglDevice {
+impl Drop for EglContext {
     fn drop(&mut self) {
-        unsafe { eglReleaseDeviceANGLE(self.angle_device) }
-
-        self.egl
-            .destroy_context(self.display, self.resource_context)
-            .unwrap();
-
-        self.egl
-            .destroy_context(self.display, self.context)
-            .unwrap();
+        if let Err(e) = EGL.destroy_context(self.display.display, self.context) {
+            tracing::error!("failed to destroy EGL context: {e}");
+        }
     }
 }
-
-extern "C" {
-    // fn eglDebugMessageControlKHR(
-    //     callback: extern "C" fn(
-    //         error: egl::Enum,
-    //         command: *const std::ffi::c_char,
-    //         message_type: egl::Int,
-    //         thread_label: *const c_void,
-    //         object_label: *const c_void,
-    //         message: *const std::ffi::c_char,
-    //     ),
-    //     attribs: *const egl::Attrib,
-    // ) -> egl::Int;
-
-    fn eglCreateDeviceANGLE(
-        device_type: egl::Int,
-        native_device: *mut c_void,
-        attrib_list: *const egl::Attrib,
-    ) -> *mut c_void;
-
-    fn eglReleaseDeviceANGLE(device: *mut c_void);
-}
-
-// extern "C" fn debug_callback(
-//     error: egl::Enum,
-//     command: *const std::ffi::c_char,
-//     message_type: egl::Int,
-//     thread_label: *const c_void,
-//     object_label: *const c_void,
-//     message: *const std::ffi::c_char,
-// ) {
-//     use std::ffi::CStr;
-//     let message = unsafe { CStr::from_ptr(message) };
-//     let message = message.to_str().unwrap_or("invalid");
-//     tracing::debug!("{message}");
-// }

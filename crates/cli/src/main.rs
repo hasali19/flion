@@ -1,5 +1,4 @@
-#![feature(let_chains)]
-
+use std::ffi::OsString;
 use std::fmt::Write;
 use std::fs::File;
 use std::io::{self, BufWriter, Cursor};
@@ -51,6 +50,33 @@ impl BuildMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BuildTarget {
+    Linux,
+    Windows,
+}
+
+impl BuildTarget {
+    pub fn platform_default() -> BuildTarget {
+        cfg_select! {
+            target_os = "windows" => BuildTarget::Windows,
+            target_os = "linux" => BuildTarget::Linux,
+        }
+    }
+
+    pub fn embedder_name(&self, build_mode: BuildMode) -> String {
+        let suffix = match build_mode {
+            BuildMode::Debug => "",
+            BuildMode::Release => "-release",
+        };
+
+        match self {
+            BuildTarget::Linux => format!("linux-x64-embedder{suffix}"),
+            BuildTarget::Windows => format!("windows-x64-embedder{suffix}"),
+        }
+    }
+}
+
 fn main() -> eyre::Result<()> {
     color_eyre::install()?;
     tracing_subscriber::fmt()
@@ -71,6 +97,8 @@ fn main() -> eyre::Result<()> {
     #[cfg(not(target_os = "windows"))]
     let flutter_program = "flutter";
 
+    let build_target = BuildTarget::platform_default();
+
     let flutter_program = which(flutter_program)?;
     let cargo_manifest = find_manifest_path()?;
     let pubspec = find_pubspec_path()?;
@@ -81,6 +109,7 @@ fn main() -> eyre::Result<()> {
     download_engine_artifacts(
         &flutter_program,
         &flutter_project_dir.join("build").join("flion"),
+        build_target,
     )?;
 
     let build_mode = if release {
@@ -108,23 +137,26 @@ fn main() -> eyre::Result<()> {
         &engine_artifacts_dir,
         &flion_build_dir,
         build_mode,
+        build_target,
     )?;
 
     copy_native_libraries(
         &flutter_program,
         flutter_project_dir,
         build_mode,
+        build_target,
         &target_dir,
     )?;
 
-    compile_plugins_shim(&flion_build_dir.join("plugins"), &target_dir)?;
+    // TODO: Linux plugins
+    if build_target == BuildTarget::Windows {
+        compile_plugins_shim(&flion_build_dir.join("plugins"), &target_dir)?;
+        process_plugins(&flutter_program, flutter_project_dir, &target_dir)?;
+    }
 
-    process_plugins(&flutter_program, flutter_project_dir, &target_dir)?;
+    let embedder_path = engine_artifacts_dir.join(build_target.embedder_name(build_mode));
 
-    let embedder_path = engine_artifacts_dir.join(match build_mode {
-        BuildMode::Debug => "windows-x64-embedder",
-        BuildMode::Release => "windows-x64-embedder-release",
-    });
+    tracing::info!("embedder_path: {embedder_path:?}");
 
     let angle_path = flion_build_dir.join("angle-win64");
 
@@ -197,28 +229,51 @@ fn get_engine_artifacts_dir(flutter_path: &Path, build_dir: &Path) -> eyre::Resu
     Ok(engine_artifacts_dir)
 }
 
-const FLUTTER_ENGINE_ARTIFACTS: &[(&str, &str)] = &[
-    ("artifacts", "windows-x64/artifacts.zip"),
-    (
-        "flutter_patched_sdk_product",
-        "flutter_patched_sdk_product.zip",
-    ),
-    (
-        "windows-x64-embedder",
-        "windows-x64/windows-x64-embedder.zip",
-    ),
-    (
-        "windows-x64-flutter",
-        // TODO: Should this use windows-x64-release instead? Does it matter?
-        "windows-x64-debug/windows-x64-flutter.zip",
-    ),
-    (
-        "flutter-cpp-client-wrapper",
-        "windows-x64/flutter-cpp-client-wrapper.zip",
-    ),
-];
+fn get_flutter_artifacts_for_target(
+    target: BuildTarget,
+) -> &'static [(&'static str, &'static str)] {
+    match target {
+        BuildTarget::Linux => &[
+            ("artifacts", "linux-x64/artifacts.zip"),
+            (
+                "flutter_patched_sdk_product",
+                "flutter_patched_sdk_product.zip",
+            ),
+            ("linux-x64-embedder", "linux-x64/linux-x64-embedder.zip"),
+            // ("linux-x64-flutter", "linux-x64-debug/linux-x64-flutter.zip"),
+            // (
+            //     "flutter-cpp-client-wrapper",
+            //     "linux-x64/flutter-cpp-client-wrapper.zip",
+            // ),
+        ],
+        BuildTarget::Windows => &[
+            ("artifacts", "windows-x64/artifacts.zip"),
+            (
+                "flutter_patched_sdk_product",
+                "flutter_patched_sdk_product.zip",
+            ),
+            (
+                "windows-x64-embedder",
+                "windows-x64/windows-x64-embedder.zip",
+            ),
+            (
+                "windows-x64-flutter",
+                // TODO: Should this use windows-x64-release instead? Does it matter?
+                "windows-x64-debug/windows-x64-flutter.zip",
+            ),
+            (
+                "flutter-cpp-client-wrapper",
+                "windows-x64/flutter-cpp-client-wrapper.zip",
+            ),
+        ],
+    }
+}
 
-fn download_engine_artifacts(flutter_path: &Path, build_dir: &Path) -> eyre::Result<()> {
+fn download_engine_artifacts(
+    flutter_path: &Path,
+    build_dir: &Path,
+    build_target: BuildTarget,
+) -> eyre::Result<()> {
     let flutter_bin_dir = flutter_path.parent().unwrap();
     let engine_version_path = flutter_bin_dir.join("internal").join("engine.version");
 
@@ -229,23 +284,25 @@ fn download_engine_artifacts(flutter_path: &Path, build_dir: &Path) -> eyre::Res
     let engine_commit = engine_commit.trim();
     let out_dir = build_dir.join(engine_commit);
 
-    for (name, archive_name) in FLUTTER_ENGINE_ARTIFACTS {
+    for (name, archive_name) in get_flutter_artifacts_for_target(build_target) {
         let path = out_dir.join(name);
         if !path.exists() {
             download_google_engine_artifact(engine_commit, name, archive_name, &out_dir)?;
         }
     }
 
-    let release_engine_url = format!(
-        "https://github.com/hasali19/flutter-engine-build/releases/download/build-{engine_commit}/windows-x64-embedder-release.zip"
-    );
+    let release_engine_url = match build_target {
+        BuildTarget::Linux => format!(
+            "https://github.com/hasali19/flutter-engine-build/releases/download/build-{engine_commit}/linux-x64-embedder-release.zip"
+        ),
+        BuildTarget::Windows => format!(
+            "https://github.com/hasali19/flutter-engine-build/releases/download/build-{engine_commit}/windows-x64-embedder-release.zip"
+        ),
+    };
 
-    if !out_dir.join("windows-x64-embedder-release").exists() {
-        download_engine_artifact(
-            "windows-x64-embedder-release",
-            &release_engine_url,
-            &out_dir,
-        )?;
+    let embedder_name = build_target.embedder_name(BuildMode::Release);
+    if !out_dir.join(&embedder_name).exists() {
+        download_engine_artifact(&embedder_name, &release_engine_url, &out_dir)?;
     }
 
     Ok(())
@@ -297,16 +354,24 @@ fn flutter_build(
     engine_artifacts_dir: &Path,
     build_dir: &Path,
     build_mode: BuildMode,
+    build_target: BuildTarget,
 ) -> eyre::Result<()> {
     tracing::info!("building flutter bundle");
 
     cmd!(flutter_path, "build", "bundle").run()?;
 
     if build_mode == BuildMode::Release {
+        let exe_suffix = env::consts::EXE_SUFFIX;
+
         let dartaotruntime = flutter_path
             .parent()
             .unwrap()
-            .join("cache/dart-sdk/bin/dartaotruntime.exe");
+            .join(format!("cache/dart-sdk/bin/dartaotruntime{exe_suffix}"));
+
+        let target_os = match build_target {
+            BuildTarget::Linux => "linux",
+            BuildTarget::Windows => "windows",
+        };
 
         let frontend_server_snapshot = engine_artifacts_dir
             .join("artifacts")
@@ -339,45 +404,52 @@ fn flutter_build(
             .join("flutter_build")
             .join("dart_plugin_registrant.dart");
 
-        let d_dart_plugin_registrant = format!(
-            "-Dflutter.dart_plugin_registrant=file:///{}",
-            dart_plugin_registrant_path
-                .to_str()
-                .unwrap()
-                .replace("\\", "/"),
-        );
+        let mut args: Vec<OsString> = vec![
+            frontend_server_snapshot.into(),
+            "--sdk-root".into(),
+            sdk_root.into(),
+            "--target=flutter".into(),
+            "--no-print-incremental-dependencies".into(),
+            "-Ddart.vm.profile=false".into(),
+            "-Ddart.vm.product=true".into(),
+            "--delete-tostring-package-uri=dart:ui".into(),
+            "--delete-tostring-package-uri=package:flutter".into(),
+            "--aot".into(),
+            "--tfa".into(),
+            "--target-os".into(),
+            target_os.into(),
+            "--packages".into(),
+            package_config_path.into(),
+            "--output-dill".into(),
+            build_dir.join("kernel_snapshot.dill").into(),
+        ];
 
-        cmd!(
-            dartaotruntime,
-            frontend_server_snapshot,
-            "--sdk-root",
-            sdk_root,
-            "--target=flutter",
-            "--no-print-incremental-dependencies",
-            "-Ddart.vm.profile=false",
-            "-Ddart.vm.product=true",
-            "--delete-tostring-package-uri=dart:ui",
-            "--delete-tostring-package-uri=package:flutter",
-            "--aot",
-            "--tfa",
-            "--target-os",
-            "windows",
-            "--packages",
-            package_config_path,
-            "--output-dill",
-            build_dir.join("kernel_snapshot.dill"),
-            "--source",
-            dart_plugin_registrant_path,
-            "--source",
-            "package:flutter/src/dart_plugin_registrant.dart",
-            d_dart_plugin_registrant,
-            flutter_project_dir.join("lib").join("main.dart"),
-        )
-        .run()?;
+        if dart_plugin_registrant_path.exists() {
+            let d_dart_plugin_registrant = format!(
+                "-Dflutter.dart_plugin_registrant=file:///{}",
+                dart_plugin_registrant_path
+                    .to_str()
+                    .unwrap()
+                    .replace("\\", "/")
+                    .trim_start_matches('/'),
+            );
+
+            args.extend([
+                "--source".into(),
+                dart_plugin_registrant_path.into(),
+                "--source".into(),
+                "package:flutter/src/dart_plugin_registrant.dart".into(),
+                d_dart_plugin_registrant.into(),
+            ]);
+        }
+
+        args.push(flutter_project_dir.join("lib").join("main.dart").into());
+
+        duct::cmd(dartaotruntime, args).run()?;
 
         let gen_snapshot = engine_artifacts_dir
-            .join("windows-x64-embedder-release")
-            .join("gen_snapshot.exe");
+            .join(build_target.embedder_name(BuildMode::Release))
+            .join(format!("gen_snapshot{exe_suffix}"));
 
         tracing::info!("building aot library");
 
@@ -399,6 +471,7 @@ fn copy_native_libraries(
     flutter_path: &Path,
     flutter_project_dir: &Path,
     build_mode: BuildMode,
+    build_target: BuildTarget,
     out_dir: &Path,
 ) -> eyre::Result<()> {
     let build_dir = flutter_project_dir.join("build").join("flion");
@@ -408,16 +481,16 @@ fn copy_native_libraries(
 
     let engine_artifacts_dir = get_engine_artifacts_dir(flutter_path, &build_dir)?;
 
-    let mode_suffix = match build_mode {
-        BuildMode::Debug => "",
-        BuildMode::Release => "-release",
+    let engine_lib = match build_target {
+        BuildTarget::Linux => "libflutter_engine.so",
+        BuildTarget::Windows => "flutter_engine.dll",
     };
 
     copy_if_newer(
         &engine_artifacts_dir
-            .join(format!("windows-x64-embedder{mode_suffix}"))
-            .join("flutter_engine.dll"),
-        &out_dir.join("flutter_engine.dll"),
+            .join(build_target.embedder_name(build_mode))
+            .join(engine_lib),
+        &out_dir.join(engine_lib),
     )?;
 
     copy_if_newer(
@@ -425,43 +498,45 @@ fn copy_native_libraries(
         &out_dir.join("icudtl.dat"),
     )?;
 
-    let angle_version = "2024-10-05-23-15";
-    let angle_archive_name = format!("angle-win64-{angle_version}.tar.gz");
-    let angle_archive_path = build_dir.join(angle_archive_name);
-    let angle_extract_path = build_dir.join("angle-win64");
+    if build_target == BuildTarget::Windows {
+        let angle_version = "2024-10-05-23-15";
+        let angle_archive_name = format!("angle-win64-{angle_version}.tar.gz");
+        let angle_archive_path = build_dir.join(angle_archive_name);
+        let angle_extract_path = build_dir.join("angle-win64");
 
-    if !angle_extract_path.exists() {
-        let url = format!(
-            "https://github.com/hasali19/angle-build/releases/download/build-{angle_version}/angle-win64.tar.gz"
-        );
+        if !angle_extract_path.exists() {
+            let url = format!(
+                "https://github.com/hasali19/angle-build/releases/download/build-{angle_version}/angle-win64.tar.gz"
+            );
 
-        tracing::info!("downloading angle from {url}");
+            tracing::info!("downloading angle from {url}");
 
-        let res = ureq::get(&url).call()?;
-        if !res.status().is_success() {
-            bail!("downloading angle failed with status {}", res.status());
+            let res = ureq::get(&url).call()?;
+            if !res.status().is_success() {
+                bail!("downloading angle failed with status {}", res.status());
+            }
+
+            let body = res.into_body();
+            let out_file = File::create(&angle_archive_path)?;
+
+            io::copy(&mut body.into_reader(), &mut BufWriter::new(out_file))?;
+
+            if angle_extract_path.exists() {
+                fs::remove_dir_all(&angle_extract_path)?
+            }
+
+            tracing::info!("unpacking angle to {angle_extract_path:?}");
+
+            cmd!("tar", "xf", &angle_archive_path, "-C", &build_dir).run()?;
+
+            fs::remove_file(angle_archive_path)?;
         }
 
-        let body = res.into_body();
-        let out_file = File::create(&angle_archive_path)?;
-
-        io::copy(&mut body.into_reader(), &mut BufWriter::new(out_file))?;
-
-        if angle_extract_path.exists() {
-            fs::remove_dir_all(&angle_extract_path)?
+        for lib in ["libEGL.dll", "libGLESv2.dll"] {
+            let src_path = angle_extract_path.join("bin").join(lib);
+            let dst_path = out_dir.join(lib);
+            copy_if_newer(&src_path, &dst_path)?;
         }
-
-        tracing::info!("unpacking angle to {angle_extract_path:?}");
-
-        cmd!("tar", "xf", &angle_archive_path, "-C", &build_dir).run()?;
-
-        fs::remove_file(angle_archive_path)?;
-    }
-
-    for lib in ["libEGL.dll", "libGLESv2.dll"] {
-        let src_path = angle_extract_path.join("bin").join(lib);
-        let dst_path = out_dir.join(lib);
-        copy_if_newer(&src_path, &dst_path)?;
     }
 
     Ok(())
@@ -537,7 +612,7 @@ fn process_plugins(
 
     let flutter_engine_artifacts_link = plugins_build_dir.join("flutter");
     if !flutter_engine_artifacts_link.exists() {
-        std::os::windows::fs::symlink_dir(&engine_artifacts_dir, &flutter_engine_artifacts_link)?;
+        symlink_dir(&engine_artifacts_dir, &flutter_engine_artifacts_link)?;
     }
 
     let mut plugin_names = vec![];
@@ -569,7 +644,7 @@ fn process_plugins(
 
                 let link_path = plugins_build_dir.join(name);
                 if !link_path.exists() {
-                    std::os::windows::fs::symlink_dir(path, &link_path)?;
+                    symlink_dir(path, &link_path)?;
                 }
 
                 plugin_names.push(name);
@@ -657,4 +732,11 @@ fn copy_if_newer(src: &Path, dst: &Path) -> eyre::Result<()> {
         .wrap_err_with(|| eyre!("failed to copy {} to {}", src.display(), dst.display()))?;
 
     Ok(())
+}
+
+fn symlink_dir(original: impl AsRef<Path>, link: impl AsRef<Path>) -> std::io::Result<()> {
+    cfg_select! {
+        target_os = "linux" => std::os::unix::fs::symlink(original, link),
+        target_os = "windows" => std::os::windows::fs::symlink_dir(original, link),
+    }
 }
