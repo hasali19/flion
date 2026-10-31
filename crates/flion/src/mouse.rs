@@ -177,6 +177,21 @@ impl MouseState {
         );
     }
 
+    /// Ends any interaction in progress, for when the pointer device goes away.
+    pub fn release(&mut self, engine: &FlutterEngine) {
+        if !self.added {
+            return;
+        }
+
+        if !self.buttons.is_empty() {
+            self.buttons = PointerButtons::empty();
+            send_pointer_event(engine, &self.pointer_event(PointerPhase::Up));
+        }
+
+        self.entered = false;
+        self.remove_pointer(engine);
+    }
+
     fn add_pointer(&mut self, engine: &FlutterEngine) {
         if !self.added {
             send_pointer_event(engine, &self.pointer_event(PointerPhase::Add));

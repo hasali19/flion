@@ -328,6 +328,14 @@ impl KeyboardState {
         }
     }
 
+    /// Clears per-device state when the keyboard goes away: stops key repeat, tells Flutter the
+    /// held keys were released, and drops the keymap (a new keyboard sends its own).
+    pub fn reset(&mut self, engine: &FlutterEngine, loop_handle: &LoopHandle<'static, AppState>) {
+        self.stop_repeat(loop_handle);
+        self.release_all(engine);
+        self.state = None;
+    }
+
     fn start_repeat(&mut self, loop_handle: &LoopHandle<'static, AppState>, keycode: xkb::Keycode) {
         self.stop_repeat(loop_handle);
 
@@ -344,7 +352,7 @@ impl KeyboardState {
 
         let token = loop_handle
             .insert_source(Timer::from_duration(self.repeat_delay), move |_, _, app| {
-                app.keyboard_state.on_key(&app.engine, keycode, true);
+                app.seat.keyboard_state.on_key(&app.engine, keycode, true);
                 TimeoutAction::ToDuration(interval)
             })
             .ok();

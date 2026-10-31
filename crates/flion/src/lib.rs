@@ -6,6 +6,7 @@ mod keyboard;
 mod keymap;
 mod mouse;
 mod mouse_cursor;
+mod seat;
 mod standard_method_channel;
 mod task_queue;
 mod text_input;
@@ -32,17 +33,11 @@ use wayland_client::protocol::wl_data_device::{self, WlDataDevice};
 use wayland_client::protocol::wl_data_device_manager::{self, WlDataDeviceManager};
 use wayland_client::protocol::wl_data_offer::{self, WlDataOffer};
 use wayland_client::protocol::wl_data_source;
-use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
-use wayland_client::protocol::wl_pointer::{self, WlPointer};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
-use wayland_client::protocol::wl_seat::{self, Capability, WlSeat};
+use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::protocol::wl_surface::{self, WlSurface};
-use wayland_client::protocol::wl_touch::{self, WlTouch};
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
-use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1;
-use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_manager_v1::{
-    self, WpCursorShapeManagerV1,
-};
+use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_manager_v1::WpCursorShapeManagerV1;
 use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::{
     self, WpFractionalScaleManagerV1,
 };
@@ -58,12 +53,11 @@ use crate::compositor::{OpenGLCompositor, ViewSurfaceRegistry};
 use crate::egl::EglDisplay;
 use crate::engine::{FlutterEngine, FlutterEngineConfig};
 use crate::keyboard::KeyboardState;
-use crate::mouse::MouseState;
-use crate::mouse_cursor::{MouseCursor, MouseCursorHandler};
+use crate::mouse_cursor::MouseCursorHandler;
+use crate::seat::Seat;
 use crate::standard_method_channel::StandardMethodHandler;
 use crate::task_queue::FlutterTaskQueue;
 use crate::text_input::{TextInputHandler, TextInputState};
-use crate::touch::TouchState;
 
 pub struct FlionAppBuilder<'a> {
     _p: PhantomData<&'a ()>,
@@ -142,15 +136,26 @@ impl FlionApp {
             })
             .unwrap();
 
-        let mouse_cursor = Rc::new(RefCell::new(MouseCursor::new()));
+        let (cursor_shape_sender, cursor_shape_receiver) = calloop::channel::channel();
 
-        let mouse_state = MouseState::default();
-        let touch_state = TouchState::default();
+        event_loop
+            .handle()
+            .insert_source(cursor_shape_receiver, |event, _, app| {
+                if let calloop::channel::Event::Msg(shape) = event {
+                    app.seat.set_cursor_shape(shape);
+                }
+            })
+            .unwrap();
+
         let text_input = Rc::new(RefCell::new(TextInputState::default()));
-        let keyboard_state = KeyboardState::new(text_input.clone());
+        let seat = Seat::new(
+            seat,
+            cursor_shape_manager,
+            KeyboardState::new(text_input.clone()),
+        );
         let clipboard = Rc::new(RefCell::new(Clipboard::new(
             data_device_manager,
-            &seat,
+            seat.wl_seat(),
             qh.clone(),
             event_loop.handle(),
         )));
@@ -170,7 +175,10 @@ impl FlionApp {
             platform_message_handlers: vec![],
         })?;
 
-        engine.set_platform_message_handler("flutter/keyboard", keyboard_state.channel_handler());
+        engine.set_platform_message_handler(
+            "flutter/keyboard",
+            seat.keyboard_state.channel_handler(),
+        );
         engine.set_platform_message_handler("flutter/textinput", TextInputHandler::new(text_input));
         engine.set_platform_message_handler(
             "flutter/platform",
@@ -178,7 +186,7 @@ impl FlionApp {
         );
         engine.set_platform_message_handler(
             "flutter/mousecursor",
-            MouseCursorHandler::new(mouse_cursor.clone()),
+            MouseCursorHandler::new(cursor_shape_sender),
         );
 
         let (create_view_sender, create_view_receiver) = calloop::channel::channel();
@@ -265,14 +273,7 @@ impl FlionApp {
             view_surfaces,
             windows: BTreeMap::from([]),
             loop_handle: event_loop.handle(),
-            pointer: None,
-            mouse: mouse_state,
-            touch: None,
-            touch_state,
-            keyboard: None,
-            keyboard_state,
-            mouse_cursor,
-            cursor_shape_manager,
+            seat,
             clipboard,
         };
 
@@ -287,28 +288,17 @@ impl FlionApp {
             app.task_queue.run_tasks(&app.engine);
         }
 
+        // Release input devices while the views still exist, so Flutter can be told about any
+        // held keys, buttons or touches. The clipboard's data device belongs to the seat, so it
+        // goes first.
+        app.clipboard.borrow_mut().destroy();
+        app.seat.destroy(&app.engine, &app.loop_handle);
+
         for window in std::mem::take(&mut app.windows).into_values() {
             drop(app.view_surfaces.remove(window.id));
             window.destroy();
         }
 
-        app.mouse_cursor.borrow_mut().set_pointer(None, None);
-
-        if let Some(keyboard) = app.keyboard.take() {
-            keyboard.release();
-        }
-
-        if let Some(touch) = app.touch.take() {
-            touch.release();
-        }
-
-        if let Some(manager) = app.cursor_shape_manager.take() {
-            manager.destroy();
-        }
-
-        app.clipboard.borrow_mut().destroy();
-
-        seat.release();
         app.fractional_scale_manager.destroy();
         app.viewporter.destroy();
         app.xdg_wm_base.destroy();
@@ -332,14 +322,7 @@ struct AppState {
     view_surfaces: Arc<ViewSurfaceRegistry>,
     windows: BTreeMap<WindowId, Window>,
     loop_handle: LoopHandle<'static, AppState>,
-    pointer: Option<WlPointer>,
-    mouse: MouseState,
-    touch: Option<WlTouch>,
-    touch_state: TouchState,
-    keyboard: Option<WlKeyboard>,
-    keyboard_state: KeyboardState,
-    mouse_cursor: Rc<RefCell<MouseCursor>>,
-    cursor_shape_manager: Option<WpCursorShapeManagerV1>,
+    seat: Seat,
     clipboard: Rc<RefCell<Clipboard>>,
 }
 
@@ -572,158 +555,6 @@ impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, WindowId> for AppStat
             window.scale_factor = f64::from(scale) / 120.0;
             // TODO: Probably need to send a window metrics event to flutter
         }
-    }
-}
-
-impl Dispatch<wl_seat::WlSeat, ()> for AppState {
-    fn event(
-        state: &mut Self,
-        seat: &wl_seat::WlSeat,
-        event: <wl_seat::WlSeat as Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        qh: &wayland_client::QueueHandle<Self>,
-    ) {
-        if let wl_seat::Event::Capabilities { capabilities } = event {
-            match capabilities {
-                wayland_client::WEnum::Value(capabilities) => {
-                    if capabilities.contains(Capability::Pointer) {
-                        if state.pointer.is_none() {
-                            let pointer = seat.get_pointer(qh, ());
-                            let shape_device = state
-                                .cursor_shape_manager
-                                .as_ref()
-                                .map(|manager| manager.get_pointer(&pointer, qh, ()));
-
-                            state
-                                .mouse_cursor
-                                .borrow_mut()
-                                .set_pointer(Some(pointer.clone()), shape_device);
-
-                            state.pointer = Some(pointer);
-                        }
-                    } else if let Some(pointer) = state.pointer.take() {
-                        state.mouse_cursor.borrow_mut().set_pointer(None, None);
-                        pointer.release();
-                    }
-
-                    if capabilities.contains(Capability::Touch) {
-                        if state.touch.is_none() {
-                            state.touch = Some(seat.get_touch(qh, ()));
-                        }
-                    } else if let Some(touch) = state.touch.take() {
-                        state.touch_state.cancel_all(&state.engine);
-                        touch.release();
-                    }
-
-                    if capabilities.contains(Capability::Keyboard) {
-                        if state.keyboard.is_none() {
-                            state.keyboard = Some(seat.get_keyboard(qh, ()));
-                        }
-                    } else if let Some(keyboard) = state.keyboard.take() {
-                        keyboard.release();
-                    }
-                }
-                wayland_client::WEnum::Unknown(_) => {}
-            }
-        }
-    }
-}
-
-impl Dispatch<wl_pointer::WlPointer, ()> for AppState {
-    fn event(
-        state: &mut Self,
-        _proxy: &wl_pointer::WlPointer,
-        event: <wl_pointer::WlPointer as Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qhandle: &wayland_client::QueueHandle<Self>,
-    ) {
-        if let wl_pointer::Event::Button { serial, .. } = &event {
-            state.clipboard.borrow_mut().set_input_serial(*serial);
-        }
-
-        if let wl_pointer::Event::Enter { serial, .. } = &event {
-            state.mouse_cursor.borrow_mut().on_enter(*serial);
-        } else if let wl_pointer::Event::Leave { .. } = &event {
-            state.mouse_cursor.borrow_mut().on_leave();
-        }
-
-        let windows = &state.windows;
-
-        state.mouse.handle_event(
-            &state.engine,
-            |surface| surface.data().copied(),
-            |id| windows.get(&id).map(|window| window.scale_factor),
-            event,
-        );
-    }
-}
-
-impl Dispatch<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1, ()> for AppState {
-    fn event(
-        _state: &mut Self,
-        _proxy: &wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
-        _event: <wp_cursor_shape_manager_v1::WpCursorShapeManagerV1 as Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qhandle: &wayland_client::QueueHandle<Self>,
-    ) {
-    }
-}
-
-impl Dispatch<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1, ()> for AppState {
-    fn event(
-        _state: &mut Self,
-        _proxy: &wp_cursor_shape_device_v1::WpCursorShapeDeviceV1,
-        _event: <wp_cursor_shape_device_v1::WpCursorShapeDeviceV1 as Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qhandle: &wayland_client::QueueHandle<Self>,
-    ) {
-    }
-}
-
-impl Dispatch<wl_touch::WlTouch, ()> for AppState {
-    fn event(
-        state: &mut Self,
-        _proxy: &wl_touch::WlTouch,
-        event: <wl_touch::WlTouch as Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qhandle: &wayland_client::QueueHandle<Self>,
-    ) {
-        if let wl_touch::Event::Down { serial, .. } = &event {
-            state.clipboard.borrow_mut().set_input_serial(*serial);
-        }
-
-        state.touch_state.handle_event(
-            &state.engine,
-            |surface| surface.data().copied(),
-            |id| state.windows.get(&id).map(|window| window.scale_factor),
-            event,
-        );
-    }
-}
-
-impl Dispatch<wl_keyboard::WlKeyboard, ()> for AppState {
-    fn event(
-        state: &mut Self,
-        _proxy: &wl_keyboard::WlKeyboard,
-        event: <wl_keyboard::WlKeyboard as Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qhandle: &wayland_client::QueueHandle<Self>,
-    ) {
-        if let wl_keyboard::Event::Enter { serial, .. } | wl_keyboard::Event::Key { serial, .. } =
-            &event
-        {
-            state.clipboard.borrow_mut().set_input_serial(*serial);
-        }
-
-        state
-            .keyboard_state
-            .handle_event(&state.engine, &state.loop_handle, event);
     }
 }
 
