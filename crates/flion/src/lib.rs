@@ -310,7 +310,7 @@ impl Globals {
         qh: &QueueHandle<AppState>,
     ) -> eyre::Result<Globals> {
         Ok(Globals {
-            compositor: globals.bind(qh, 1..=4, ())?,
+            compositor: globals.bind(qh, 1..=7, ())?,
             xdg_wm_base: globals.bind(qh, 7..=7, ())?,
             viewporter: globals.bind(qh, 1..=1, ())?,
             fractional_scale_manager: globals.bind(qh, 1..=1, ())?,
@@ -329,7 +329,10 @@ impl Globals {
         self.fractional_scale_manager.destroy();
         self.viewporter.destroy();
         self.xdg_wm_base.destroy();
-        self.compositor.release();
+
+        if self.compositor.version() >= 6 {
+            self.compositor.release();
+        }
     }
 }
 
@@ -440,7 +443,6 @@ impl Dispatch<wl_surface::WlSurface, WindowId> for AppState {
         _conn: &Connection,
         _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
-        todo!()
     }
 }
 
