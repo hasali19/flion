@@ -723,6 +723,7 @@ pub struct BinaryMessageReply {
     engine: flutter_embedder::FlutterEngine,
     engine_is_running: Arc<Mutex<bool>>,
     response_handle: *const FlutterPlatformMessageResponseHandle,
+    is_sent: bool,
 }
 
 // SAFETY: Docs don't mention whether we can send a response from a different thread, but I'm
@@ -739,18 +740,20 @@ impl BinaryMessageReply {
             engine,
             engine_is_running,
             response_handle,
+            is_sent: false,
         }
     }
 
-    pub fn send(self, message: &[u8]) {
+    pub fn send(mut self, message: &[u8]) {
         self.send_raw(message.as_ptr(), message.len());
     }
 
-    pub fn not_implemented(self) {
+    pub fn not_implemented(mut self) {
         self.send_raw(ptr::null(), 0);
     }
 
-    fn send_raw(self, data: *const u8, length: usize) {
+    fn send_raw(&mut self, data: *const u8, length: usize) {
+        self.is_sent = true;
         if *self.engine_is_running.lock() {
             unsafe {
                 FlutterEngineSendPlatformMessageResponse(
@@ -762,6 +765,14 @@ impl BinaryMessageReply {
             }
         } else {
             tracing::error!("send called on a stopped engine");
+        }
+    }
+}
+
+impl Drop for BinaryMessageReply {
+    fn drop(&mut self) {
+        if !self.is_sent && *self.engine_is_running.lock() {
+            self.send_raw(ptr::null(), 0);
         }
     }
 }
