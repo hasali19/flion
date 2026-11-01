@@ -101,14 +101,7 @@ impl FlionApp {
 
         let qh = event_queue.handle();
 
-        let compositor: WlCompositor = globals.bind(&qh, 1..=4, ())?;
-        let xdg_wm_base: XdgWmBase = globals.bind(&qh, 7..=7, ())?;
-        let viewporter: WpViewporter = globals.bind(&qh, 1..=1, ())?;
-        let fractional_scale_manager: WpFractionalScaleManagerV1 = globals.bind(&qh, 1..=1, ())?;
-        let seat: WlSeat = globals.bind(&qh, 5..=11, ())?;
-        let cursor_shape_manager: Option<WpCursorShapeManagerV1> =
-            globals.bind(&qh, 1..=1, ()).ok();
-        let data_device_manager: Option<WlDataDeviceManager> = globals.bind(&qh, 1..=3, ()).ok();
+        let globals = Globals::bind(&globals, &qh)?;
 
         let mut event_loop: EventLoop<'_, AppState> = EventLoop::try_new()?;
 
@@ -149,8 +142,8 @@ impl FlionApp {
         let text_input = Rc::new(RefCell::new(TextInputState::default()));
         let keyboard_state = KeyboardState::new(text_input.clone());
         let clipboard = Rc::new(RefCell::new(Clipboard::new(
-            data_device_manager,
-            &seat,
+            globals.data_device_manager.clone(),
+            &globals.seat,
             qh.clone(),
             event_loop.handle(),
         )));
@@ -227,14 +220,7 @@ impl FlionApp {
             .insert_source(add_view_result_receiver, |event, _, app| {
                 if let calloop::channel::Event::Msg((view_id, success, reply)) = event {
                     if success {
-                        let window = Window::new(
-                            view_id,
-                            &app.qh,
-                            &app.compositor,
-                            &app.xdg_wm_base,
-                            &app.viewporter,
-                            &app.fractional_scale_manager,
-                        );
+                        let window = Window::new(view_id, &app.qh, &app.globals);
 
                         app.view_surfaces.add(
                             window.id,
@@ -255,10 +241,7 @@ impl FlionApp {
 
         let mut app = AppState {
             qh,
-            compositor,
-            xdg_wm_base,
-            viewporter,
-            fractional_scale_manager,
+            globals,
             egl,
             task_queue: FlutterTaskQueue::new(),
             engine,
@@ -272,7 +255,6 @@ impl FlionApp {
             keyboard: None,
             keyboard_state,
             mouse_cursor,
-            cursor_shape_manager,
             clipboard,
         };
 
@@ -302,17 +284,9 @@ impl FlionApp {
             touch.release();
         }
 
-        if let Some(manager) = app.cursor_shape_manager.take() {
-            manager.destroy();
-        }
-
         app.clipboard.borrow_mut().destroy();
 
-        seat.release();
-        app.fractional_scale_manager.destroy();
-        app.viewporter.destroy();
-        app.xdg_wm_base.destroy();
-        app.compositor.release();
+        app.globals.destroy();
 
         Ok(())
     }
@@ -320,12 +294,48 @@ impl FlionApp {
 
 type WindowId = i64;
 
-struct AppState {
-    qh: QueueHandle<AppState>,
+struct Globals {
     compositor: WlCompositor,
     xdg_wm_base: XdgWmBase,
     viewporter: WpViewporter,
     fractional_scale_manager: WpFractionalScaleManagerV1,
+    seat: WlSeat,
+    cursor_shape_manager: Option<WpCursorShapeManagerV1>,
+    data_device_manager: Option<WlDataDeviceManager>,
+}
+
+impl Globals {
+    fn bind(
+        globals: &wayland_client::globals::GlobalList,
+        qh: &QueueHandle<AppState>,
+    ) -> eyre::Result<Globals> {
+        Ok(Globals {
+            compositor: globals.bind(qh, 1..=4, ())?,
+            xdg_wm_base: globals.bind(qh, 7..=7, ())?,
+            viewporter: globals.bind(qh, 1..=1, ())?,
+            fractional_scale_manager: globals.bind(qh, 1..=1, ())?,
+            seat: globals.bind(qh, 5..=11, ())?,
+            cursor_shape_manager: globals.bind(qh, 1..=1, ()).ok(),
+            data_device_manager: globals.bind(qh, 1..=3, ()).ok(),
+        })
+    }
+
+    fn destroy(self) {
+        if let Some(manager) = self.cursor_shape_manager {
+            manager.destroy();
+        }
+
+        self.seat.release();
+        self.fractional_scale_manager.destroy();
+        self.viewporter.destroy();
+        self.xdg_wm_base.destroy();
+        self.compositor.release();
+    }
+}
+
+struct AppState {
+    qh: QueueHandle<AppState>,
+    globals: Globals,
     egl: EglDisplay,
     task_queue: FlutterTaskQueue,
     engine: FlutterEngine,
@@ -339,7 +349,6 @@ struct AppState {
     keyboard: Option<WlKeyboard>,
     keyboard_state: KeyboardState,
     mouse_cursor: Rc<RefCell<MouseCursor>>,
-    cursor_shape_manager: Option<WpCursorShapeManagerV1>,
     clipboard: Rc<RefCell<Clipboard>>,
 }
 
@@ -356,19 +365,14 @@ struct Window {
 }
 
 impl Window {
-    fn new(
-        id: WindowId,
-        qh: &QueueHandle<AppState>,
-        compositor: &WlCompositor,
-        xdg_wm_base: &XdgWmBase,
-        viewporter: &WpViewporter,
-        fractional_scale_manager: &WpFractionalScaleManagerV1,
-    ) -> Window {
-        let surface = compositor.create_surface(qh, id);
-        let xdg_surface = xdg_wm_base.get_xdg_surface(&surface, qh, id);
+    fn new(id: WindowId, qh: &QueueHandle<AppState>, globals: &Globals) -> Window {
+        let surface = globals.compositor.create_surface(qh, id);
+        let xdg_surface = globals.xdg_wm_base.get_xdg_surface(&surface, qh, id);
         let toplevel = xdg_surface.get_toplevel(qh, id);
-        let viewport = viewporter.get_viewport(&surface, qh, id);
-        let fractional_scale = fractional_scale_manager.get_fractional_scale(&surface, qh, id);
+        let viewport = globals.viewporter.get_viewport(&surface, qh, id);
+        let fractional_scale = globals
+            .fractional_scale_manager
+            .get_fractional_scale(&surface, qh, id);
 
         surface.commit();
 
@@ -591,6 +595,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for AppState {
                         if state.pointer.is_none() {
                             let pointer = seat.get_pointer(qh, ());
                             let shape_device = state
+                                .globals
                                 .cursor_shape_manager
                                 .as_ref()
                                 .map(|manager| manager.get_pointer(&pointer, qh, ()));
