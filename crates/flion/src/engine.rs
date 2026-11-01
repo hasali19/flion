@@ -13,9 +13,9 @@ use flutter_embedder::{
     FlutterCustomTaskRunners, FlutterEngineAOTData, FlutterEngineAOTDataSource,
     FlutterEngineAOTDataSource__bindgen_ty_1,
     FlutterEngineAOTDataSourceType_kFlutterEngineAOTDataSourceTypeElfPath, FlutterEngineAddView,
-    FlutterEngineCreateAOTData, FlutterEngineGetCurrentTime, FlutterEngineInitialize,
-    FlutterEngineResult_kSuccess, FlutterEngineRunInitialized, FlutterEngineRunTask,
-    FlutterEngineRunsAOTCompiledDartCode, FlutterEngineSendKeyEvent,
+    FlutterEngineCollectAOTData, FlutterEngineCreateAOTData, FlutterEngineGetCurrentTime,
+    FlutterEngineInitialize, FlutterEngineResult_kSuccess, FlutterEngineRunInitialized,
+    FlutterEngineRunTask, FlutterEngineRunsAOTCompiledDartCode, FlutterEngineSendKeyEvent,
     FlutterEngineSendPlatformMessage, FlutterEngineSendPlatformMessageResponse,
     FlutterEngineSendPointerEvent, FlutterEngineSendWindowMetricsEvent, FlutterEngineShutdown,
     FlutterKeyEvent, FlutterKeyEventDeviceType_kFlutterKeyEventDeviceTypeKeyboard,
@@ -158,6 +158,7 @@ struct FlutterEngineState {
     is_running: Arc<Mutex<bool>>,
     compositor: Box<dyn FlutterOpenGLCompositor>,
     platform_message_handlers: Mutex<BTreeMap<String, Box<dyn BinaryMessageHandler + 'static>>>,
+    aot_data: FlutterEngineAOTData,
 }
 
 pub struct FlutterEngine {
@@ -199,15 +200,16 @@ impl FlutterEngine {
                 .map(|(channel, handler)| (channel.to_owned(), handler)),
         );
 
+        let assets_path = CString::new(config.assets_path)?;
+        let aot_data = load_aot_data(config.aot_library_path)?;
+
         let engine_state = Box::into_raw(Box::new(FlutterEngineState {
             handle: ptr::null_mut(),
             is_running: Arc::new(Mutex::new(false)),
             compositor,
             platform_message_handlers: Mutex::new(platform_message_handlers),
+            aot_data,
         }));
-
-        let assets_path = CString::new(config.assets_path)?;
-        let aot_data = load_aot_data(config.aot_library_path)?.unwrap_or(ptr::null_mut());
 
         let project_args = FlutterProjectArgs {
             struct_size: mem::size_of::<FlutterProjectArgs>(),
@@ -232,6 +234,7 @@ impl FlutterEngine {
             },
             platform_message_callback: Some(platform_message_callback),
             log_message_callback: Some(log_message),
+            shutdown_dart_vm_when_done: true,
             ..Default::default()
         };
 
@@ -488,15 +491,19 @@ impl Drop for FlutterEngine {
                 }
             }
 
+            if FlutterEngineCollectAOTData((*self.inner).aot_data) != FlutterEngineResult_kSuccess {
+                tracing::error!("failed to collect AOT data");
+            }
+
             drop(Box::from_raw(self.inner));
         }
     }
 }
 
-fn load_aot_data(path: Option<&str>) -> eyre::Result<Option<FlutterEngineAOTData>> {
+fn load_aot_data(path: Option<&str>) -> eyre::Result<FlutterEngineAOTData> {
     if !unsafe { FlutterEngineRunsAOTCompiledDartCode() } {
         tracing::debug!("Engine does not support AOT dart code");
-        return Ok(None);
+        return Ok(ptr::null_mut());
     }
 
     let Some(path) = path else {
@@ -523,7 +530,7 @@ fn load_aot_data(path: Option<&str>) -> eyre::Result<Option<FlutterEngineAOTData
 
     tracing::info!("Loaded AOT data from {path}");
 
-    Ok(Some(aot_data))
+    Ok(aot_data)
 }
 
 fn create_task_runner<F: Fn(FlutterTask) + Send + Sync + 'static>(
