@@ -14,7 +14,7 @@ flutter-embedder = { path = "../flutter-embedder" }
 gl = "0.14"
 linkme = "0.3.32"
 parking_lot = "0.12.3"
-raw-window-handle = "0.6.2"
+raw-window-handle = { version = "0.6.2", features = ["std"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 smol_str = "0.3.6"
