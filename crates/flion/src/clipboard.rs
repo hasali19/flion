@@ -9,6 +9,7 @@ use calloop::{Interest, LoopHandle, Mode, PostAction};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
+use wayland_client::globals::GlobalList;
 use wayland_client::protocol::wl_data_device::{self, WlDataDevice};
 use wayland_client::protocol::wl_data_device_manager::WlDataDeviceManager;
 use wayland_client::protocol::wl_data_offer::{self, WlDataOffer};
@@ -52,26 +53,27 @@ impl OfferData {
 }
 
 impl Clipboard {
-    pub fn new(
-        manager: Option<WlDataDeviceManager>,
+    pub fn bind(
+        globals: &GlobalList,
+        qh: &QueueHandle<AppState>,
         seat: &WlSeat,
-        qh: QueueHandle<AppState>,
         loop_handle: LoopHandle<'static, AppState>,
-    ) -> Clipboard {
-        let data_device = manager
+    ) -> eyre::Result<Clipboard> {
+        let data_device_manager: Option<WlDataDeviceManager> = globals.bind(qh, 1..=3, ()).ok();
+        let data_device = data_device_manager
             .as_ref()
-            .map(|manager| manager.get_data_device(seat, &qh, ()));
+            .map(|manager| manager.get_data_device(seat, qh, ()));
 
-        Clipboard {
-            manager,
+        Ok(Clipboard {
+            manager: data_device_manager,
             data_device,
-            qh,
+            qh: qh.clone(),
             loop_handle,
             selection_offer: None,
             dnd_offer: None,
             app_selection: None,
             last_input_serial: None,
-        }
+        })
     }
 
     pub fn set_input_serial(&mut self, serial: u32) {
@@ -128,28 +130,6 @@ impl Clipboard {
             }
             _ => {}
         }
-    }
-
-    pub fn destroy(&mut self) {
-        for offer in [self.selection_offer.take(), self.dnd_offer.take()]
-            .into_iter()
-            .flatten()
-        {
-            offer.destroy();
-        }
-
-        if let Some((source, _)) = self.app_selection.take() {
-            source.destroy();
-        }
-
-        // `release` was only added in version 2.
-        if let Some(device) = self.data_device.take()
-            && device.version() >= 2
-        {
-            device.release();
-        }
-
-        self.manager = None;
     }
 
     fn set_text(&mut self, text: String) -> Result<(), &'static str> {
@@ -253,6 +233,27 @@ impl Clipboard {
 
         if let Err(e) = result {
             tracing::error!("failed to register clipboard read: {e:?}");
+        }
+    }
+}
+
+impl Drop for Clipboard {
+    fn drop(&mut self) {
+        for offer in [self.selection_offer.take(), self.dnd_offer.take()]
+            .into_iter()
+            .flatten()
+        {
+            offer.destroy();
+        }
+
+        if let Some((source, _)) = self.app_selection.take() {
+            source.destroy();
+        }
+
+        if let Some(device) = self.data_device.take()
+            && device.version() >= 2
+        {
+            device.release();
         }
     }
 }

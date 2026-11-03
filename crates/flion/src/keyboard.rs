@@ -344,7 +344,7 @@ impl KeyboardState {
 
         let token = loop_handle
             .insert_source(Timer::from_duration(self.repeat_delay), move |_, _, app| {
-                app.keyboard_state.on_key(&app.engine, keycode, true);
+                app.seat.keyboard_state.on_key(&app.engine, keycode, true);
                 TimeoutAction::ToDuration(interval)
             })
             .ok();

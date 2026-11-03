@@ -27,9 +27,10 @@ use calloop::{EventLoop, LoopHandle};
 use calloop_wayland_source::WaylandSource;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle, WaylandWindowHandle, WindowHandle};
 use tracing::debug;
+use wayland_client::globals::GlobalList;
 use wayland_client::protocol::wl_compositor::{self, WlCompositor};
 use wayland_client::protocol::wl_data_device::{self, WlDataDevice};
-use wayland_client::protocol::wl_data_device_manager::{self, WlDataDeviceManager};
+use wayland_client::protocol::wl_data_device_manager;
 use wayland_client::protocol::wl_data_offer::{self, WlDataOffer};
 use wayland_client::protocol::wl_data_source;
 use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
@@ -101,8 +102,6 @@ impl FlionApp {
 
         let qh = event_queue.handle();
 
-        let globals = Globals::bind(&globals, &qh)?;
-
         let mut event_loop: EventLoop<'_, AppState> = EventLoop::try_new()?;
 
         let egl = EglDisplay::for_wayland_connection(&conn)?;
@@ -141,12 +140,14 @@ impl FlionApp {
         let touch_state = TouchState::default();
         let text_input = Rc::new(RefCell::new(TextInputState::default()));
         let keyboard_state = KeyboardState::new(text_input.clone());
-        let clipboard = Rc::new(RefCell::new(Clipboard::new(
-            globals.data_device_manager.clone(),
-            &globals.seat,
-            qh.clone(),
+
+        let seat = globals.bind(&qh, 5..=11, ())?;
+        let clipboard = Rc::new(RefCell::new(Clipboard::bind(
+            &globals,
+            &qh,
+            &seat,
             event_loop.handle(),
-        )));
+        )?));
 
         let aot_library_path = env::var("FLION_AOT_LIBRARY_PATH").map(PathBuf::from).ok();
 
@@ -215,45 +216,56 @@ impl FlionApp {
             },
         );
 
+        let window_creator = Rc::new(WindowCreator::bind(&globals, &qh)?);
+
         event_loop
             .handle()
-            .insert_source(add_view_result_receiver, |event, _, app| {
-                if let calloop::channel::Event::Msg((view_id, success, reply)) = event {
-                    if success {
-                        let window = Window::new(view_id, &app.qh, &app.globals);
+            .insert_source(add_view_result_receiver, {
+                let qh = qh.clone();
+                move |event, _, app| {
+                    if let calloop::channel::Event::Msg((view_id, success, reply)) = event {
+                        if success {
+                            let window = window_creator.clone().create_window(view_id, &qh);
 
-                        app.view_surfaces.add(
-                            window.id,
-                            app.egl
-                                .create_window_surface(SurfaceHandle(window.surface.clone()), 1, 1)
-                                .unwrap(),
-                        );
+                            app.view_surfaces.add(
+                                window.id,
+                                app.egl
+                                    .create_window_surface(
+                                        SurfaceHandle(window.surface.clone()),
+                                        1,
+                                        1,
+                                    )
+                                    .unwrap(),
+                            );
 
-                        app.windows.insert(view_id, window);
+                            app.windows.insert(view_id, window);
 
-                        reply.success(&codec::EncodableValue::I64(view_id));
-                    } else {
-                        reply.success(&codec::EncodableValue::Null);
+                            reply.success(&codec::EncodableValue::I64(view_id));
+                        } else {
+                            reply.success(&codec::EncodableValue::Null);
+                        }
                     }
                 }
             })
             .unwrap();
 
         let mut app = AppState {
-            qh,
-            globals,
             egl,
             task_queue: FlutterTaskQueue::new(),
             engine,
             view_surfaces,
             windows: BTreeMap::from([]),
             loop_handle: event_loop.handle(),
-            pointer: None,
-            mouse: mouse_state,
-            touch: None,
-            touch_state,
-            keyboard: None,
-            keyboard_state,
+            seat: Seat {
+                seat,
+                pointer: None,
+                mouse: mouse_state,
+                touch: None,
+                touch_state,
+                keyboard: None,
+                keyboard_state,
+            },
+            cursor_shape_manager: globals.bind(&qh, 1..=1, ()).ok(),
             mouse_cursor,
             clipboard,
         };
@@ -270,23 +282,10 @@ impl FlionApp {
         }
 
         for window in std::mem::take(&mut app.windows).into_values() {
-            drop(app.view_surfaces.remove(window.id));
-            window.destroy();
+            app.view_surfaces.remove(window.id);
         }
 
         app.mouse_cursor.borrow_mut().set_pointer(None, None);
-
-        if let Some(keyboard) = app.keyboard.take() {
-            keyboard.release();
-        }
-
-        if let Some(touch) = app.touch.take() {
-            touch.release();
-        }
-
-        app.clipboard.borrow_mut().destroy();
-
-        app.globals.destroy();
 
         Ok(())
     }
@@ -294,86 +293,78 @@ impl FlionApp {
 
 type WindowId = i64;
 
-struct Globals {
-    compositor: WlCompositor,
-    xdg_wm_base: XdgWmBase,
-    viewporter: WpViewporter,
-    fractional_scale_manager: WpFractionalScaleManagerV1,
+struct Seat {
     seat: WlSeat,
-    cursor_shape_manager: Option<WpCursorShapeManagerV1>,
-    data_device_manager: Option<WlDataDeviceManager>,
-}
-
-impl Globals {
-    fn bind(
-        globals: &wayland_client::globals::GlobalList,
-        qh: &QueueHandle<AppState>,
-    ) -> eyre::Result<Globals> {
-        Ok(Globals {
-            compositor: globals.bind(qh, 1..=7, ())?,
-            xdg_wm_base: globals.bind(qh, 7..=7, ())?,
-            viewporter: globals.bind(qh, 1..=1, ())?,
-            fractional_scale_manager: globals.bind(qh, 1..=1, ())?,
-            seat: globals.bind(qh, 5..=11, ())?,
-            cursor_shape_manager: globals.bind(qh, 1..=1, ()).ok(),
-            data_device_manager: globals.bind(qh, 1..=3, ()).ok(),
-        })
-    }
-
-    fn destroy(self) {
-        if let Some(manager) = self.cursor_shape_manager {
-            manager.destroy();
-        }
-
-        self.seat.release();
-        self.fractional_scale_manager.destroy();
-        self.viewporter.destroy();
-        self.xdg_wm_base.destroy();
-
-        if self.compositor.version() >= 6 {
-            self.compositor.release();
-        }
-    }
-}
-
-struct AppState {
-    qh: QueueHandle<AppState>,
-    globals: Globals,
-    egl: EglDisplay,
-    task_queue: FlutterTaskQueue,
-    engine: FlutterEngine,
-    view_surfaces: Arc<ViewSurfaceRegistry>,
-    windows: BTreeMap<WindowId, Window>,
-    loop_handle: LoopHandle<'static, AppState>,
     pointer: Option<WlPointer>,
     mouse: MouseState,
     touch: Option<WlTouch>,
     touch_state: TouchState,
     keyboard: Option<WlKeyboard>,
     keyboard_state: KeyboardState,
+}
+
+impl Drop for Seat {
+    fn drop(&mut self) {
+        if let Some(keyboard) = self.keyboard.take() {
+            keyboard.release();
+        }
+
+        if let Some(touch) = self.touch.take() {
+            touch.release();
+        }
+
+        if let Some(pointer) = self.pointer.take() {
+            pointer.release();
+        }
+
+        self.seat.release();
+    }
+}
+
+struct AppState {
+    egl: EglDisplay,
+    task_queue: FlutterTaskQueue,
+    engine: FlutterEngine,
+    view_surfaces: Arc<ViewSurfaceRegistry>,
+    windows: BTreeMap<WindowId, Window>,
+    loop_handle: LoopHandle<'static, AppState>,
+    cursor_shape_manager: Option<WpCursorShapeManagerV1>,
     mouse_cursor: Rc<RefCell<MouseCursor>>,
     clipboard: Rc<RefCell<Clipboard>>,
+    seat: Seat,
 }
 
-struct Window {
-    id: WindowId,
-    surface: WlSurface,
-    xdg_surface: XdgSurface,
-    toplevel: XdgToplevel,
-    viewport: WpViewport,
-    fractional_scale: wp_fractional_scale_v1::WpFractionalScaleV1,
-    size: (u32, u32),
-    scale_factor: f64,
-    close_requested: bool,
+impl Drop for AppState {
+    fn drop(&mut self) {
+        if let Some(cursor_shape_manager) = &self.cursor_shape_manager {
+            cursor_shape_manager.destroy();
+        }
+    }
 }
 
-impl Window {
-    fn new(id: WindowId, qh: &QueueHandle<AppState>, globals: &Globals) -> Window {
-        let surface = globals.compositor.create_surface(qh, id);
-        let xdg_surface = globals.xdg_wm_base.get_xdg_surface(&surface, qh, id);
+struct WindowCreator {
+    compositor: WlCompositor,
+    xdg_wm_base: XdgWmBase,
+    viewporter: WpViewporter,
+    fractional_scale_manager: WpFractionalScaleManagerV1,
+}
+
+impl WindowCreator {
+    pub fn bind(globals: &GlobalList, qh: &QueueHandle<AppState>) -> eyre::Result<Self> {
+        Ok(WindowCreator {
+            compositor: globals.bind(qh, 1..=7, ())?,
+            xdg_wm_base: globals.bind(qh, 7..=7, ())?,
+            viewporter: globals.bind(qh, 1..=1, ())?,
+            fractional_scale_manager: globals.bind(qh, 1..=1, ())?,
+        })
+    }
+
+    pub fn create_window(self: Rc<Self>, id: WindowId, qh: &QueueHandle<AppState>) -> Window {
+        let surface = self.compositor.create_surface(qh, id);
+        let xdg_surface = self.xdg_wm_base.get_xdg_surface(&surface, qh, id);
         let toplevel = xdg_surface.get_toplevel(qh, id);
-        let viewport = globals.viewporter.get_viewport(&surface, qh, id);
-        let fractional_scale = globals
+        let viewport = self.viewporter.get_viewport(&surface, qh, id);
+        let fractional_scale = self
             .fractional_scale_manager
             .get_fractional_scale(&surface, qh, id);
 
@@ -381,6 +372,7 @@ impl Window {
 
         Window {
             id,
+            _creator: self,
             surface,
             xdg_surface,
             toplevel,
@@ -391,8 +383,36 @@ impl Window {
             close_requested: false,
         }
     }
+}
 
-    fn destroy(self) {
+impl Drop for WindowCreator {
+    fn drop(&mut self) {
+        self.fractional_scale_manager.destroy();
+        self.viewporter.destroy();
+        self.xdg_wm_base.destroy();
+
+        if self.compositor.version() >= 6 {
+            self.compositor.release();
+        }
+    }
+}
+
+struct Window {
+    id: WindowId,
+    // WindowCreator must outlive its windows.
+    _creator: Rc<WindowCreator>,
+    surface: WlSurface,
+    xdg_surface: XdgSurface,
+    toplevel: XdgToplevel,
+    viewport: WpViewport,
+    fractional_scale: wp_fractional_scale_v1::WpFractionalScaleV1,
+    size: (u32, u32),
+    scale_factor: f64,
+    close_requested: bool,
+}
+
+impl Drop for Window {
+    fn drop(&mut self) {
         self.fractional_scale.destroy();
         self.viewport.destroy();
         self.toplevel.destroy();
@@ -594,10 +614,9 @@ impl Dispatch<wl_seat::WlSeat, ()> for AppState {
             match capabilities {
                 wayland_client::WEnum::Value(capabilities) => {
                     if capabilities.contains(Capability::Pointer) {
-                        if state.pointer.is_none() {
+                        if state.seat.pointer.is_none() {
                             let pointer = seat.get_pointer(qh, ());
                             let shape_device = state
-                                .globals
                                 .cursor_shape_manager
                                 .as_ref()
                                 .map(|manager| manager.get_pointer(&pointer, qh, ()));
@@ -607,27 +626,27 @@ impl Dispatch<wl_seat::WlSeat, ()> for AppState {
                                 .borrow_mut()
                                 .set_pointer(Some(pointer.clone()), shape_device);
 
-                            state.pointer = Some(pointer);
+                            state.seat.pointer = Some(pointer);
                         }
-                    } else if let Some(pointer) = state.pointer.take() {
+                    } else if let Some(pointer) = state.seat.pointer.take() {
                         state.mouse_cursor.borrow_mut().set_pointer(None, None);
                         pointer.release();
                     }
 
                     if capabilities.contains(Capability::Touch) {
-                        if state.touch.is_none() {
-                            state.touch = Some(seat.get_touch(qh, ()));
+                        if state.seat.touch.is_none() {
+                            state.seat.touch = Some(seat.get_touch(qh, ()));
                         }
-                    } else if let Some(touch) = state.touch.take() {
-                        state.touch_state.cancel_all(&state.engine);
+                    } else if let Some(touch) = state.seat.touch.take() {
+                        state.seat.touch_state.cancel_all(&state.engine);
                         touch.release();
                     }
 
                     if capabilities.contains(Capability::Keyboard) {
-                        if state.keyboard.is_none() {
-                            state.keyboard = Some(seat.get_keyboard(qh, ()));
+                        if state.seat.keyboard.is_none() {
+                            state.seat.keyboard = Some(seat.get_keyboard(qh, ()));
                         }
-                    } else if let Some(keyboard) = state.keyboard.take() {
+                    } else if let Some(keyboard) = state.seat.keyboard.take() {
                         keyboard.release();
                     }
                 }
@@ -658,7 +677,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for AppState {
 
         let windows = &state.windows;
 
-        state.mouse.handle_event(
+        state.seat.mouse.handle_event(
             &state.engine,
             |surface| surface.data().copied(),
             |id| windows.get(&id).map(|window| window.scale_factor),
@@ -704,7 +723,7 @@ impl Dispatch<wl_touch::WlTouch, ()> for AppState {
             state.clipboard.borrow_mut().set_input_serial(*serial);
         }
 
-        state.touch_state.handle_event(
+        state.seat.touch_state.handle_event(
             &state.engine,
             |surface| surface.data().copied(),
             |id| state.windows.get(&id).map(|window| window.scale_factor),
@@ -729,6 +748,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for AppState {
         }
 
         state
+            .seat
             .keyboard_state
             .handle_event(&state.engine, &state.loop_handle, event);
     }
