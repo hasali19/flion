@@ -72,7 +72,7 @@ void main(List<String> args) {
     ..writeln('}');
 
   final repoRoot = File.fromUri(Platform.script).parent.parent;
-  final output = File('${repoRoot.path}/crates/flion/src/keymap.rs');
+  final output = File('${repoRoot.path}/crates/flion/src/wayland/keymap.rs');
   output.writeAsStringSync(out.toString());
 
   print(

@@ -17,12 +17,12 @@ use wayland_client::WEnum;
 use wayland_client::protocol::wl_keyboard;
 use xkbcommon::xkb;
 
-use crate::AppState;
 use crate::codec::EncodableValue;
 use crate::engine::{FlutterEngine, KeyEvent, KeyEventType};
-use crate::keymap;
 use crate::standard_method_channel::{StandardMethodHandler, StandardMethodReply};
 use crate::text_input::{TextInputKeyEvent, TextInputState};
+use crate::wayland::keymap;
+use crate::wayland::state::AppState;
 
 /// Plane used by the GTK embedder for keys that have no Flutter mapping.
 const GTK_PLANE: u64 = 0x01500000000;

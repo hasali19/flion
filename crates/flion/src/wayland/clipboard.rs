@@ -17,8 +17,8 @@ use wayland_client::protocol::wl_data_source::{self, WlDataSource};
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::{Proxy, QueueHandle};
 
-use crate::AppState;
 use crate::engine::{BinaryMessageHandler, BinaryMessageReply};
+use crate::wayland::state::AppState;
 
 const TEXT_MIME_TYPES: [&str; 5] = [
     "text/plain;charset=utf-8",
