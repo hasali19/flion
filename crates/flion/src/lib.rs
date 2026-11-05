@@ -1,485 +1,236 @@
-#![feature(default_field_values, let_chains)]
-
 mod compositor;
 mod egl;
 mod engine;
-mod error_utils;
-mod keyboard;
-mod keymap;
-mod mouse_cursor;
-mod platform_views;
-mod plugins_shim;
-mod settings;
-mod task_runner;
+mod standard_method_channel;
+mod task_queue;
 mod text_input;
-mod views;
-mod window;
+mod wayland;
 
 pub mod codec;
-pub mod standard_method_channel;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::ffi::c_void;
-use std::path::{Path, PathBuf};
+use std::collections::BTreeMap;
+use std::env;
+use std::marker::PhantomData;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
-use std::{env, mem};
+use std::time::Instant;
 
-use engine::{PointerButtons, PointerDeviceKind, PointerEvent};
-use eyre::OptionExt;
-use parking_lot::Mutex;
-use platform_views::{PlatformViewFactory, PlatformViewsMessageHandler};
-use plugins_shim::FlutterPluginsEngine;
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use task_runner::{FlutterTaskExecutor, FlutterTaskQueue};
-use views::ViewManager;
-use window::{MouseAction, Window, WindowHandler};
-use windows::core::Interface;
-use windows::Win32::Foundation::HWND;
-use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
-use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION,
-};
-use windows::Win32::Graphics::DirectComposition::{DCompositionCreateDevice2, IDCompositionDevice};
-use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWM_SYSTEMBACKDROP_TYPE,
-};
-use windows::Win32::Graphics::Dxgi::IDXGIDevice;
-use winit::dpi::{LogicalSize, PhysicalSize};
-use winit::event_loop::EventLoopBuilder;
-use winit::platform::windows::WindowBuilderExtWindows;
-use winit::window::WindowBuilder;
+use calloop::EventLoop;
+use calloop_wayland_source::WaylandSource;
+use tracing::debug;
+use wayland_client::Connection;
 
-use crate::compositor::FlutterCompositor;
-use crate::egl::EglDevice;
-use crate::engine::{FlutterEngine, FlutterEngineConfig, PointerPhase};
-use crate::error_utils::ResultExt;
-use crate::keyboard::Keyboard;
-use crate::mouse_cursor::MouseCursorHandler;
+use crate::compositor::{OpenGLCompositor, ViewSurfaceRegistry};
+use crate::egl::EglDisplay;
+use crate::engine::{FlutterEngine, FlutterEngineConfig};
+use crate::standard_method_channel::StandardMethodHandler;
+use crate::task_queue::FlutterTaskQueue;
 use crate::text_input::{TextInputHandler, TextInputState};
-
-pub use crate::engine::{BinaryMessageHandler, BinaryMessageReply, BinaryMessenger};
-pub use crate::platform_views::{CompositorContext, PlatformView, PlatformViewUpdateArgs};
-
-#[doc(hidden)]
-pub use ::linkme;
-
-#[doc(hidden)]
-#[linkme::distributed_slice]
-pub static PLUGINS: [unsafe extern "C" fn(*mut c_void)];
-
-#[macro_export]
-macro_rules! include_plugins {
-    () => {
-        include!(concat!(env!("OUT_DIR"), "/plugin_registrant.rs"));
-    };
-}
+use crate::wayland::clipboard::{Clipboard, PlatformHandler};
+use crate::wayland::keyboard::KeyboardState;
+use crate::wayland::mouse::MouseState;
+use crate::wayland::mouse_cursor::{MouseCursor, MouseCursorHandler};
+use crate::wayland::seat::Seat;
+use crate::wayland::state::{AppState, WindowCreator};
+use crate::wayland::touch::TouchState;
 
 pub struct FlionAppBuilder<'a> {
-    bundle_path: PathBuf,
-    platform_message_handlers: Vec<(&'a str, Box<dyn BinaryMessageHandler>)>,
-    platform_view_factories: HashMap<String, Box<dyn PlatformViewFactory>>,
+    _p: PhantomData<&'a ()>,
 }
 
 impl<'a> FlionAppBuilder<'a> {
-    fn new() -> FlionAppBuilder<'a> {
-        let bundle_path = if let Ok(exe) = env::current_exe()
-            && let Some(dir) = exe.parent()
-        {
-            dir.join("data")
-        } else {
-            PathBuf::from("data")
-        };
-
-        FlionAppBuilder {
-            bundle_path,
-            platform_message_handlers: vec![],
-            platform_view_factories: HashMap::new(),
-        }
-    }
-
-    pub fn with_bundle_path(mut self, path: &'a Path) -> Self {
-        self.bundle_path = path.to_owned();
-        self
-    }
-
-    pub fn with_platform_message_handler(
-        mut self,
-        name: &'a str,
-        handler: Box<dyn BinaryMessageHandler>,
-    ) -> Self {
-        self.platform_message_handlers.push((name, handler));
-        self
-    }
-
-    pub fn with_platform_view_factory(
-        mut self,
-        name: &'a str,
-        factory: impl PlatformViewFactory + 'static,
-    ) -> Self {
-        self.platform_view_factories
-            .insert(name.to_owned(), Box::new(factory));
-        self
-    }
-
     pub fn build(self) -> eyre::Result<FlionApp> {
-        let device = unsafe {
-            let mut device = Default::default();
-
-            D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                Default::default(),
-                D3D11_CREATE_DEVICE_FLAG::default(),
-                None,
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                None,
-            )?;
-
-            device.ok_or_eyre("failed to create D3D11 device")?
-        };
-
-        let composition_device: IDCompositionDevice =
-            unsafe { DCompositionCreateDevice2(&device.cast::<IDXGIDevice>()?)? };
-
-        let egl = EglDevice::create(&device)?;
-
-        let task_executor = Rc::new(FlutterTaskExecutor::new()?);
-        let task_queue = task_executor.queue().clone();
-
-        let view_manager = Arc::new(Mutex::new(ViewManager::new()));
-        let compositor = FlutterCompositor::new(
-            device.clone(),
-            composition_device.clone(),
-            view_manager.clone(),
-            egl.clone(),
-            Box::new(CompositionHandler {
-                composition_device: composition_device.clone(),
-                view_manager: view_manager.clone(),
-                platform_task_queue: task_queue.clone(),
-            }),
-        )?;
-
-        let platform_views = compositor.platform_views();
-
-        let mut platform_message_handlers: Vec<(&str, Box<dyn BinaryMessageHandler>)> = vec![(
-            "flion/platform_views",
-            Box::new(PlatformViewsMessageHandler::new(
-                platform_views,
-                device,
-                composition_device.clone(),
-                self.platform_view_factories,
-            )),
-        )];
-
-        platform_message_handlers.extend(self.platform_message_handlers);
-
-        // TODO: Disable environment variable lookup in release builds.
-        // These variables are provided by the flion cli during development, and are not intended
-        // to be used in release builds.
-        let assets_path = env::var("FLION_ASSETS_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| self.bundle_path.join("flutter_assets"));
-
-        let aot_library_path = env::var("FLION_AOT_LIBRARY_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| self.bundle_path.join("app.so"));
-
-        let engine = Rc::new(FlutterEngine::new(FlutterEngineConfig {
-            assets_path: assets_path.to_str().ok_or_eyre("invalid assets path")?,
-            aot_library_path: Some(
-                aot_library_path
-                    .to_str()
-                    .ok_or_eyre("invalid aot library path")?,
-            ),
-            egl: egl.clone(),
-            compositor,
-            platform_task_handler: Box::new(move |task| task_queue.enqueue(task)),
-            platform_message_handlers,
-        })?);
-
-        task_executor.init(engine.clone());
-
-        settings::send_to_engine(&engine)?;
-
-        Ok(FlionApp {
-            engine,
-            composition_device,
-            view_manager,
-            task_executor,
-        })
+        Ok(FlionApp)
     }
 }
 
-pub struct FlionApp {
-    engine: Rc<FlutterEngine>,
-    composition_device: IDCompositionDevice,
-    view_manager: Arc<Mutex<ViewManager>>,
-    task_executor: Rc<FlutterTaskExecutor>,
-}
+pub struct FlionApp;
 
 impl FlionApp {
     pub fn builder<'a>() -> FlionAppBuilder<'a> {
-        FlionAppBuilder::new()
-    }
-
-    pub fn messenger(&self) -> BinaryMessenger {
-        self.engine.messenger()
-    }
-
-    pub fn set_platform_message_handler(
-        &self,
-        name: impl Into<String>,
-        handler: impl BinaryMessageHandler + 'static,
-    ) {
-        self.engine.set_platform_message_handler(name, handler)
+        FlionAppBuilder { _p: PhantomData }
     }
 
     pub fn run_event_loop(self) -> eyre::Result<()> {
-        let event_loop = EventLoopBuilder::new().build()?;
+        let conn = Connection::connect_to_env()?;
 
-        let parent_window = WindowBuilder::new()
-            .with_inner_size(LogicalSize::new(1280, 720))
-            .with_no_redirection_bitmap(true)
-            .build(&event_loop)?;
+        let (globals, event_queue) = wayland_client::globals::registry_queue_init(&conn)?;
 
-        let parent_window = Rc::new(parent_window);
+        globals.contents().with_list(|globals| {
+            for global in globals {
+                let wayland_client::globals::Global {
+                    interface,
+                    name,
+                    version,
+                } = global;
 
-        let parent_hwnd = match parent_window.window_handle()?.as_raw() {
-            RawWindowHandle::Win32(handle) => HWND(handle.hwnd.get() as _),
-            _ => unreachable!(),
-        };
-
-        unsafe {
-            let backdrop_type = DWMSBT_MAINWINDOW;
-            DwmSetWindowAttribute(
-                parent_hwnd,
-                DWMWA_SYSTEMBACKDROP_TYPE,
-                &raw const backdrop_type as *const c_void,
-                mem::size_of::<DWM_SYSTEMBACKDROP_TYPE>() as u32,
-            )?;
-        }
-
-        let root_visual = unsafe { self.composition_device.CreateVisual()? };
-        self.view_manager.lock().insert(0, root_visual.clone());
-
-        let text_input = Rc::new(RefCell::new(TextInputState::new()));
-
-        let size = parent_window.inner_size();
-        let window = Rc::new(Window::new(
-            size.width,
-            size.height,
-            Box::new(FlutterWindowHandler {
-                engine: self.engine.clone(),
-                task_executor: self.task_executor.clone(),
-                view_manager: self.view_manager.clone(),
-                keyboard: Keyboard::new(self.engine.clone(), text_input.clone()),
-            }),
-        )?);
-
-        window.set_parent(parent_hwnd);
-        window.request_focus();
-
-        window.show();
-
-        // The initial frame is scheduled by the send_window_metrics call when the window is resized
-        // during its creation. However, this frame doesn't seem to show up on the window for some
-        // reason. This workaround forces another frame which then is visible.
-        // TODO: Figure out why this is needed.
-        self.engine.schedule_frame();
-
-        self.engine.set_platform_message_handler(
-            "flutter/textinput",
-            TextInputHandler::new(text_input.clone()),
-        );
-
-        self.engine.set_platform_message_handler(
-            "flutter/mousecursor",
-            MouseCursorHandler::new(Rc::downgrade(&window)),
-        );
-
-        let mut plugins_engine = Box::new(FlutterPluginsEngine::new(
-            self.engine.clone(),
-            window.window_handle(),
-        )?);
-
-        for init in PLUGINS {
-            unsafe {
-                (init)(&raw mut *plugins_engine as *mut c_void);
+                debug!("[{name}] {interface} (v{version})");
             }
-        }
+        });
 
-        // TODO: Composition target should be attached to parent window instead. Use the child window
-        // just for input.
-        let composition_target = unsafe {
-            self.composition_device
-                .CreateTargetForHwnd(window.window_handle(), true)?
-        };
+        let qh = event_queue.handle();
 
-        unsafe { composition_target.SetRoot(&root_visual)? };
+        let mut event_loop: EventLoop<'_, AppState> = EventLoop::try_new()?;
 
-        event_loop.run(move |event, target| match event {
-            winit::event::Event::WindowEvent { window_id, event }
-                if window_id == parent_window.id() =>
-            {
-                match event {
-                    winit::event::WindowEvent::CloseRequested => target.exit(),
+        WaylandSource::new(conn.clone(), event_queue).insert(event_loop.handle())?;
 
-                    winit::event::WindowEvent::Focused(true) => window.request_focus(),
+        let (task_sender, task_receiver) = calloop::channel::channel();
 
-                    winit::event::WindowEvent::Resized(PhysicalSize { width, height }) => {
-                        window.set_position_and_size(0, 0, width, height)
-                    }
-
-                    _ => {}
+        event_loop
+            .handle()
+            .insert_source(task_receiver, |event, _, app| {
+                if let calloop::channel::Event::Msg(task) = event {
+                    app.task_queue.push(task);
                 }
-            }
+            })
+            .unwrap();
 
-            _ => {}
+        let mouse_cursor = Rc::new(RefCell::new(MouseCursor::new()));
+
+        let mouse_state = MouseState::default();
+        let touch_state = TouchState::default();
+        let text_input = Rc::new(RefCell::new(TextInputState::default()));
+        let keyboard_state = KeyboardState::new(text_input.clone());
+
+        let seat = globals.bind(&qh, 5..=11, ())?;
+        let clipboard = Rc::new(RefCell::new(Clipboard::bind(
+            &globals,
+            &qh,
+            &seat,
+            event_loop.handle(),
+        )?));
+
+        let aot_library_path = env::var("FLION_AOT_LIBRARY_PATH").map(PathBuf::from).ok();
+
+        let view_surfaces = Arc::new(ViewSurfaceRegistry::default());
+        let egl = EglDisplay::for_wayland_connection(&conn)?;
+        let opengl_compositor = OpenGLCompositor::new(egl.clone(), view_surfaces.clone())?;
+
+        let engine = FlutterEngine::new(FlutterEngineConfig {
+            assets_path: &env::var("FLION_ASSETS_PATH").unwrap(),
+            aot_library_path: aot_library_path.as_deref().and_then(|p| p.to_str()),
+            compositor: opengl_compositor,
+            platform_task_handler: Box::new(move |task| {
+                let _ = task_sender.send(task);
+            }),
+            platform_message_handlers: vec![],
         })?;
 
-        Ok(())
-    }
-}
+        engine.set_platform_message_handler("flutter/keyboard", keyboard_state.channel_handler());
+        engine.set_platform_message_handler("flutter/textinput", TextInputHandler::new(text_input));
+        engine.set_platform_message_handler(
+            "flutter/platform",
+            PlatformHandler::new(clipboard.clone()),
+        );
+        engine.set_platform_message_handler(
+            "flutter/mousecursor",
+            MouseCursorHandler::new(mouse_cursor.clone()),
+        );
 
-struct FlutterWindowHandler {
-    engine: Rc<engine::FlutterEngine>,
-    task_executor: Rc<FlutterTaskExecutor>,
-    view_manager: Arc<Mutex<ViewManager>>,
-    keyboard: Keyboard,
-}
+        let (create_view_sender, create_view_receiver) = calloop::channel::channel();
+        let (add_view_result_sender, add_view_result_receiver) = calloop::channel::channel();
 
-impl WindowHandler for FlutterWindowHandler {
-    fn on_resize(&self, width: u32, height: u32, scale_factor: f64) {
-        // TODO: Consider moving this to WM_NCCALCSIZE on the parent window for smoother resizing.
+        event_loop
+            .handle()
+            .insert_source(create_view_receiver, move |event, _, app| {
+                if let calloop::channel::Event::Msg(reply) = event {
+                    let next_view_id = app.windows.keys().max().copied().unwrap_or_default() + 1;
+                    app.engine
+                        .add_view(next_view_id, 0, 0, 1.0, |success| {
+                            let _ = add_view_result_sender.send((next_view_id, success, reply));
+                        })
+                        .unwrap();
+                }
+            })
+            .unwrap();
 
-        {
-            let mut views = self.view_manager.lock();
-            let Some(view) = views.get_mut(0) else {
-                tracing::error!("Failed to resize non-existent view");
-                return;
-            };
-            view.begin_resize(width, height);
-        }
+        engine.set_platform_message_handler(
+            "flion/views",
+            ViewsHandler {
+                sender: create_view_sender,
+            },
+        );
 
-        let _ = self
-            .engine
-            .send_window_metrics_event(width as usize, height as usize, scale_factor)
-            .trace_err();
+        let window_creator = WindowCreator::bind(&globals, &qh)?;
 
-        // The Flutter famework may need to run tasks on the platform executor during the resize,
-        // so poll the executor instead of blocking to avoid a deadlock.
-        while is_view_resizing(&self.view_manager.lock(), 0) {
-            self.task_executor
-                .poll_with_timeout(Duration::from_millis(100));
-        }
+        event_loop
+            .handle()
+            .insert_source(add_view_result_receiver, {
+                let qh = qh.clone();
+                move |event, _, app| {
+                    if let calloop::channel::Event::Msg((view_id, success, reply)) = event {
+                        if success {
+                            let window = window_creator.create_window(view_id, &qh).unwrap();
 
-        fn is_view_resizing(views: &ViewManager, view_id: i64) -> bool {
-            match views.get(view_id) {
-                None => false,
-                Some(view) => view.is_resizing(),
-            }
-        }
-    }
+                            app.view_surfaces.add(
+                                window.id(),
+                                app.egl
+                                    .create_window_surface(window.surface(), 1, 1)
+                                    .unwrap(),
+                            );
 
-    fn on_mouse_event(&self, event: window::MouseEvent) {
-        if event.action == MouseAction::Scroll {
-            let _ = self
-                .engine
-                .send_scroll_event(event.x, event.y, event.scroll_delta_x, event.scroll_delta_y)
-                .trace_err();
-        } else {
-            let pointer_event = PointerEvent {
-                device_kind: PointerDeviceKind::Mouse,
-                device_id: 1,
-                phase: match event.action {
-                    window::MouseAction::Enter => PointerPhase::Add,
-                    window::MouseAction::Exit => PointerPhase::Remove,
-                    window::MouseAction::Move => {
-                        if event.buttons.is_empty() {
-                            PointerPhase::Hover
+                            app.windows.insert(view_id, window);
+
+                            reply.success(&codec::EncodableValue::I64(view_id));
                         } else {
-                            PointerPhase::Move
+                            reply.success(&codec::EncodableValue::Null);
                         }
                     }
-                    window::MouseAction::Down => PointerPhase::Down,
-                    window::MouseAction::Up => PointerPhase::Up,
-                    window::MouseAction::Scroll => unreachable!(),
-                },
-                x: event.x,
-                y: event.y,
-                buttons: PointerButtons::from_bits_truncate(event.buttons.bits().into()),
-            };
+                }
+            })
+            .unwrap();
 
-            let _ = self.engine.send_pointer_event(&pointer_event).trace_err();
-        }
-    }
-
-    fn on_touch_event(&self, event: window::TouchEvent) {
-        let phases: &[PointerPhase] = match event.action {
-            window::TouchAction::Down => &[PointerPhase::Add, PointerPhase::Down],
-            window::TouchAction::Up => &[PointerPhase::Up, PointerPhase::Remove],
-            window::TouchAction::Move => &[PointerPhase::Move],
+        let mut app = AppState {
+            egl,
+            task_queue: FlutterTaskQueue::new(),
+            engine,
+            view_surfaces,
+            windows: BTreeMap::from([]),
+            loop_handle: event_loop.handle(),
+            seat: Seat {
+                seat,
+                pointer: None,
+                mouse: mouse_state,
+                touch: None,
+                touch_state,
+                keyboard: None,
+                keyboard_state,
+            },
+            cursor_shape_manager: globals.bind(&qh, 1..=1, ()).ok(),
+            mouse_cursor,
+            clipboard,
         };
 
-        for &phase in phases {
-            let _ = self
-                .engine
-                .send_pointer_event(&PointerEvent {
-                    device_kind: PointerDeviceKind::Touch,
-                    device_id: event.touch_id as i32,
-                    phase,
-                    x: event.x,
-                    y: event.y,
-                    ..Default::default()
-                })
-                .trace_err();
-        }
-    }
+        while app.windows.is_empty() || !app.windows.values().any(|window| window.close_requested) {
+            let timeout = app
+                .task_queue
+                .next_deadline()
+                .map(|deadline| deadline - Instant::now());
 
-    fn on_key_event(&self, event: window::KeyEvent) {
-        let _ = self.keyboard.handle_event(event).trace_err();
-    }
-}
+            event_loop.dispatch(timeout, &mut app)?;
 
-struct CompositionHandler {
-    composition_device: IDCompositionDevice,
-    view_manager: Arc<Mutex<ViewManager>>,
-    platform_task_queue: Arc<FlutterTaskQueue>,
-}
-
-unsafe impl Send for CompositionHandler {}
-
-impl compositor::CompositionHandler for CompositionHandler {
-    fn get_surface_size(&mut self) -> eyre::Result<(u32, u32)> {
-        let views = self.view_manager.lock();
-        let surface = views.get(0).ok_or_eyre("View not found")?;
-        Ok(surface.size())
-    }
-
-    fn present(&mut self) -> eyre::Result<()> {
-        let mut views = self.view_manager.lock();
-        let surface = views.get_mut(0).ok_or_eyre("View not found")?;
-
-        if surface.is_resizing() {
-            unsafe {
-                // Make sure the previous commit has completed. This reduces glitches while resizing.
-                self.composition_device.WaitForCommitCompletion()?;
-                self.composition_device.Commit()?;
-            }
-
-            surface.end_resize();
-
-            // Platform thread is waiting for the resize so send it a signal to wake up.
-            self.platform_task_queue.wake();
-        } else {
-            unsafe { self.composition_device.Commit()? };
+            app.task_queue.run_tasks(&app.engine);
         }
 
         Ok(())
+    }
+}
+
+struct ViewsHandler {
+    sender: calloop::channel::Sender<standard_method_channel::StandardMethodReply>,
+}
+
+impl StandardMethodHandler for ViewsHandler {
+    fn handle(
+        &self,
+        method: &str,
+        _args: codec::EncodableValue,
+        reply: standard_method_channel::StandardMethodReply,
+    ) {
+        if method == "addView" {
+            self.sender.send(reply).unwrap();
+        }
     }
 }

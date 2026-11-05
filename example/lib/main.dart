@@ -1,9 +1,21 @@
+import 'dart:ui';
+
 import 'package:dynamic_system_colors/dynamic_system_colors.dart';
 import 'package:flion/flion.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
-void main() {
-  runApp(const MyApp());
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  const viewsChannel = MethodChannel('flion/views');
+  final viewId = await viewsChannel.invokeMethod('addView');
+
+  final view = PlatformDispatcher.instance.view(id: viewId)!;
+
+  runWidget(ViewCollection(views: [
+    View(view: view, child: const MyApp()),
+  ]));
 }
 
 class MyApp extends StatelessWidget {
@@ -88,7 +100,7 @@ class _MyHomePageState extends State<MyHomePage> {
     // fast, so that you can just rebuild anything that needs updating rather
     // than having to individually change instances of widgets.
     return Scaffold(
-      backgroundColor: Colors.transparent,
+      // backgroundColor: Colors.transparent,
       appBar: AppBar(
         // Here we take the value from the MyHomePage object that was created by
         // the App.build method, and use it to set our appbar title.
@@ -120,7 +132,10 @@ class _MyHomePageState extends State<MyHomePage> {
               // horizontal).
               mainAxisAlignment: MainAxisAlignment.center,
               children: <Widget>[
-                TextField(controller: _textController),
+                Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: TextField(controller: _textController),
+                ),
                 const Text('You have pushed the button this many times:'),
                 Text(
                   '$_counter',
