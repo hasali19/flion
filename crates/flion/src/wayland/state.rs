@@ -1,6 +1,8 @@
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
+use std::{cell::RefCell, collections::BTreeMap, ptr::NonNull, rc::Rc, sync::Arc};
 
 use calloop::LoopHandle;
+use eyre::eyre;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle, WaylandWindowHandle, WindowHandle};
 use tracing::debug;
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, WEnum,
@@ -91,7 +93,7 @@ impl WindowCreator {
         })
     }
 
-    pub fn create_window(self: Rc<Self>, id: WindowId, qh: &QueueHandle<AppState>) -> Window {
+    pub fn create_window(&self, id: WindowId, qh: &QueueHandle<AppState>) -> eyre::Result<Window> {
         let surface = self.compositor.create_surface(qh, id);
         let xdg_surface = self.xdg_wm_base.get_xdg_surface(&surface, qh, id);
         let toplevel = xdg_surface.get_toplevel(qh, id);
@@ -100,12 +102,20 @@ impl WindowCreator {
             .fractional_scale_manager
             .get_fractional_scale(&surface, qh, id);
 
+        let surface_connection = surface
+            .backend()
+            .upgrade()
+            .map(Connection::from_backend)
+            .ok_or_else(|| eyre!("wayland connection is gone"))?;
+
         surface.commit();
 
-        Window {
+        Ok(Window {
             id,
-            _creator: self,
-            surface,
+            surface: Arc::new(WindowSurface {
+                surface,
+                _conn: surface_connection,
+            }),
             xdg_surface,
             toplevel,
             viewport,
@@ -113,7 +123,7 @@ impl WindowCreator {
             size: (0, 0),
             scale_factor: 1.0,
             close_requested: false,
-        }
+        })
     }
 }
 
@@ -129,11 +139,34 @@ impl Drop for WindowCreator {
     }
 }
 
+pub struct WindowSurface {
+    surface: WlSurface,
+    // Ensure the connection stays open as long as the surface is alive
+    _conn: Connection,
+}
+
+impl HasWindowHandle for WindowSurface {
+    fn window_handle(
+        &self,
+    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        Ok(unsafe {
+            WindowHandle::borrow_raw(RawWindowHandle::Wayland(WaylandWindowHandle::new(
+                NonNull::new_unchecked(self.surface.id().as_ptr()).cast(),
+            )))
+        })
+    }
+}
+
+impl Drop for WindowSurface {
+    fn drop(&mut self) {
+        self.surface.destroy();
+    }
+}
+
 pub struct Window {
-    pub id: WindowId,
+    id: WindowId,
     // WindowCreator must outlive its windows.
-    _creator: Rc<WindowCreator>,
-    pub surface: WlSurface,
+    surface: Arc<WindowSurface>,
     xdg_surface: XdgSurface,
     toplevel: XdgToplevel,
     viewport: WpViewport,
@@ -143,13 +176,22 @@ pub struct Window {
     pub close_requested: bool,
 }
 
+impl Window {
+    pub fn id(&self) -> WindowId {
+        self.id
+    }
+
+    pub fn surface(&self) -> Arc<WindowSurface> {
+        self.surface.clone()
+    }
+}
+
 impl Drop for Window {
     fn drop(&mut self) {
         self.fractional_scale.destroy();
         self.viewport.destroy();
         self.toplevel.destroy();
         self.xdg_surface.destroy();
-        self.surface.destroy();
     }
 }
 

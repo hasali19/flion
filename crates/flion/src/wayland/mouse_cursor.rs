@@ -76,6 +76,14 @@ impl MouseCursor {
     }
 }
 
+impl Drop for MouseCursor {
+    fn drop(&mut self) {
+        if let Some(device) = self.shape_device.take() {
+            device.destroy();
+        }
+    }
+}
+
 pub struct MouseCursorHandler {
     cursor: Rc<RefCell<MouseCursor>>,
 }

@@ -7,24 +7,20 @@ mod text_input;
 mod wayland;
 
 pub mod codec;
-mod platform;
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::env;
 use std::marker::PhantomData;
 use std::path::PathBuf;
-use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
 use calloop::EventLoop;
 use calloop_wayland_source::WaylandSource;
-use raw_window_handle::{HasWindowHandle, RawWindowHandle, WaylandWindowHandle, WindowHandle};
 use tracing::debug;
-use wayland_client::protocol::wl_surface::WlSurface;
-use wayland_client::{Connection, Proxy};
+use wayland_client::Connection;
 
 use crate::compositor::{OpenGLCompositor, ViewSurfaceRegistry};
 use crate::egl::EglDisplay;
@@ -78,24 +74,7 @@ impl FlionApp {
 
         let mut event_loop: EventLoop<'_, AppState> = EventLoop::try_new()?;
 
-        let egl = EglDisplay::for_wayland_connection(&conn)?;
-
-        WaylandSource::new(conn, event_queue).insert(event_loop.handle())?;
-
-        struct SurfaceHandle(WlSurface);
-
-        impl HasWindowHandle for SurfaceHandle {
-            fn window_handle(
-                &self,
-            ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError>
-            {
-                Ok(unsafe {
-                    WindowHandle::borrow_raw(RawWindowHandle::Wayland(WaylandWindowHandle::new(
-                        NonNull::new_unchecked(self.0.id().as_ptr()).cast(),
-                    )))
-                })
-            }
-        }
+        WaylandSource::new(conn.clone(), event_queue).insert(event_loop.handle())?;
 
         let (task_sender, task_receiver) = calloop::channel::channel();
 
@@ -126,7 +105,8 @@ impl FlionApp {
         let aot_library_path = env::var("FLION_AOT_LIBRARY_PATH").map(PathBuf::from).ok();
 
         let view_surfaces = Arc::new(ViewSurfaceRegistry::default());
-        let opengl_compositor = OpenGLCompositor::new(egl.clone(), view_surfaces.clone()).unwrap();
+        let egl = EglDisplay::for_wayland_connection(&conn)?;
+        let opengl_compositor = OpenGLCompositor::new(egl.clone(), view_surfaces.clone())?;
 
         let engine = FlutterEngine::new(FlutterEngineConfig {
             assets_path: &env::var("FLION_ASSETS_PATH").unwrap(),
@@ -152,10 +132,6 @@ impl FlionApp {
         let (create_view_sender, create_view_receiver) = calloop::channel::channel();
         let (add_view_result_sender, add_view_result_receiver) = calloop::channel::channel();
 
-        struct ViewsHandler {
-            sender: calloop::channel::Sender<standard_method_channel::StandardMethodReply>,
-        }
-
         event_loop
             .handle()
             .insert_source(create_view_receiver, move |event, _, app| {
@@ -170,19 +146,6 @@ impl FlionApp {
             })
             .unwrap();
 
-        impl StandardMethodHandler for ViewsHandler {
-            fn handle(
-                &self,
-                method: &str,
-                _args: codec::EncodableValue,
-                reply: standard_method_channel::StandardMethodReply,
-            ) {
-                if method == "addView" {
-                    self.sender.send(reply).unwrap();
-                }
-            }
-        }
-
         engine.set_platform_message_handler(
             "flion/views",
             ViewsHandler {
@@ -190,7 +153,7 @@ impl FlionApp {
             },
         );
 
-        let window_creator = Rc::new(WindowCreator::bind(&globals, &qh)?);
+        let window_creator = WindowCreator::bind(&globals, &qh)?;
 
         event_loop
             .handle()
@@ -199,16 +162,12 @@ impl FlionApp {
                 move |event, _, app| {
                     if let calloop::channel::Event::Msg((view_id, success, reply)) = event {
                         if success {
-                            let window = window_creator.clone().create_window(view_id, &qh);
+                            let window = window_creator.create_window(view_id, &qh).unwrap();
 
                             app.view_surfaces.add(
-                                window.id,
+                                window.id(),
                                 app.egl
-                                    .create_window_surface(
-                                        SurfaceHandle(window.surface.clone()),
-                                        1,
-                                        1,
-                                    )
+                                    .create_window_surface(window.surface(), 1, 1)
                                     .unwrap(),
                             );
 
@@ -255,12 +214,23 @@ impl FlionApp {
             app.task_queue.run_tasks(&app.engine);
         }
 
-        for window in std::mem::take(&mut app.windows).into_values() {
-            app.view_surfaces.remove(window.id);
-        }
-
-        app.mouse_cursor.borrow_mut().set_pointer(None, None);
-
         Ok(())
+    }
+}
+
+struct ViewsHandler {
+    sender: calloop::channel::Sender<standard_method_channel::StandardMethodReply>,
+}
+
+impl StandardMethodHandler for ViewsHandler {
+    fn handle(
+        &self,
+        method: &str,
+        _args: codec::EncodableValue,
+        reply: standard_method_channel::StandardMethodReply,
+    ) {
+        if method == "addView" {
+            self.sender.send(reply).unwrap();
+        }
     }
 }
