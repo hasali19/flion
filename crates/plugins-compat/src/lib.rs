@@ -1,5 +1,3 @@
-#![feature(sync_unsafe_cell)]
-
 use std::ffi::{c_char, c_void};
 
 macro_rules! declare_procs {
@@ -123,8 +121,24 @@ declare_procs! {
 }
 
 #[cfg(cdylib)]
-static PROC_TABLE: std::cell::SyncUnsafeCell<ProcTable> =
-    std::cell::SyncUnsafeCell::new(ProcTable::DEFAULT);
+struct SyncUnsafeCell<T>(std::cell::UnsafeCell<T>);
+
+#[cfg(cdylib)]
+unsafe impl<T: Sync> Sync for SyncUnsafeCell<T> {}
+
+#[cfg(cdylib)]
+impl<T> SyncUnsafeCell<T> {
+    const fn new(value: T) -> Self {
+        Self(std::cell::UnsafeCell::new(value))
+    }
+
+    const fn get(&self) -> *mut T {
+        self.0.get()
+    }
+}
+
+#[cfg(cdylib)]
+static PROC_TABLE: SyncUnsafeCell<ProcTable> = SyncUnsafeCell::new(ProcTable::DEFAULT);
 
 #[cfg(cdylib)]
 #[unsafe(no_mangle)]
