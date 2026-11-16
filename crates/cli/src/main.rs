@@ -1,5 +1,3 @@
-#![feature(let_chains)]
-
 use std::fmt::Write;
 use std::fs::File;
 use std::io::{self, BufWriter, Cursor};
@@ -537,7 +535,7 @@ fn process_plugins(
 
     let flutter_engine_artifacts_link = plugins_build_dir.join("flutter");
     if !flutter_engine_artifacts_link.exists() {
-        std::os::windows::fs::symlink_dir(&engine_artifacts_dir, &flutter_engine_artifacts_link)?;
+        symlink_dir(&engine_artifacts_dir, &flutter_engine_artifacts_link)?;
     }
 
     let mut plugin_names = vec![];
@@ -569,7 +567,7 @@ fn process_plugins(
 
                 let link_path = plugins_build_dir.join(name);
                 if !link_path.exists() {
-                    std::os::windows::fs::symlink_dir(path, &link_path)?;
+                    symlink_dir(path, &link_path)?;
                 }
 
                 plugin_names.push(name);
@@ -657,4 +655,12 @@ fn copy_if_newer(src: &Path, dst: &Path) -> eyre::Result<()> {
         .wrap_err_with(|| eyre!("failed to copy {} to {}", src.display(), dst.display()))?;
 
     Ok(())
+}
+
+fn symlink_dir(original: impl AsRef<Path>, link: impl AsRef<Path>) -> io::Result<()> {
+    #[cfg(windows)]
+    return std::os::windows::fs::symlink_dir(original, link);
+
+    #[cfg(unix)]
+    return std::os::unix::fs::symlink(original, link);
 }
