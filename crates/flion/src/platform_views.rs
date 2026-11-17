@@ -28,7 +28,7 @@ impl PlatformViews {
         self.views.lock().remove(&id)
     }
 
-    pub fn acquire(&self) -> PlatformViewsGuard {
+    pub fn acquire(&self) -> PlatformViewsGuard<'_> {
         PlatformViewsGuard(self.views.lock())
     }
 }

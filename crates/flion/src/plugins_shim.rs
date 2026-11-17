@@ -1,4 +1,4 @@
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::{CStr, c_char, c_void};
 use std::mem;
 use std::rc::Rc;
 
@@ -84,9 +84,9 @@ unsafe extern "C" fn flutter_desktop_messenger_set_callback(
     callback: plugins_compat::FlutterDesktopMessageCallback,
     user_data: *mut c_void,
 ) {
-    let engine = messenger.cast::<FlutterPluginsEngine>().as_ref().unwrap();
+    let engine = unsafe { messenger.cast::<FlutterPluginsEngine>().as_ref().unwrap() };
 
-    let channel = CStr::from_ptr(channel);
+    let channel = unsafe { CStr::from_ptr(channel) };
     let channel = channel.to_str().unwrap();
 
     tracing::debug!("setting callback for platform channel: {channel:?}");
@@ -154,18 +154,18 @@ unsafe extern "C" fn flutter_dsktop_messenger_send_response(
     data: *const u8,
     data_length: usize,
 ) {
-    let engine = messenger.cast::<FlutterPluginsEngine>().as_ref().unwrap();
+    let engine = unsafe { messenger.cast::<FlutterPluginsEngine>().as_ref().unwrap() };
     let response_handle = handle.cast::<FlutterPlatformMessageResponseHandle>();
 
     let reply = BinaryMessageReply::for_engine(&engine.engine, response_handle);
     if data.is_null() {
         reply.not_implemented();
     } else {
-        reply.send(std::slice::from_raw_parts(data, data_length));
+        reply.send(unsafe { std::slice::from_raw_parts(data, data_length) });
     }
 }
 
 unsafe extern "C" fn flutter_desktop_view_get_hwnd(view: *mut c_void) -> *mut c_void {
-    let engine = view.cast::<FlutterPluginsEngine>().as_ref().unwrap();
+    let engine = unsafe { view.cast::<FlutterPluginsEngine>().as_ref().unwrap() };
     engine.child_window_hwnd.0
 }

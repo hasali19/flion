@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::ffi::{c_char, c_void, CStr, CString};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::marker::PhantomData;
 use std::path::Path;
 use std::str::FromStr;
@@ -7,18 +7,18 @@ use std::sync::Arc;
 use std::{mem, ptr};
 
 use bitflags::bitflags;
-use eyre::{bail, Context};
+use eyre::{Context, bail};
 use flutter_embedder::{
-    FlutterBackingStore, FlutterBackingStoreConfig, FlutterCustomTaskRunners, FlutterEngineAOTData,
-    FlutterEngineAOTDataSource,
+    FLUTTER_ENGINE_VERSION, FlutterBackingStore, FlutterBackingStoreConfig,
+    FlutterCustomTaskRunners, FlutterEngineAOTData, FlutterEngineAOTDataSource,
+    FlutterEngineAOTDataSource__bindgen_ty_1,
     FlutterEngineAOTDataSourceType_kFlutterEngineAOTDataSourceTypeElfPath,
-    FlutterEngineAOTDataSource__bindgen_ty_1, FlutterEngineCreateAOTData,
-    FlutterEngineGetCurrentTime, FlutterEngineInitialize, FlutterEngineResult_kSuccess,
-    FlutterEngineRunInitialized, FlutterEngineRunTask, FlutterEngineRunsAOTCompiledDartCode,
-    FlutterEngineScheduleFrame, FlutterEngineSendKeyEvent, FlutterEngineSendPlatformMessage,
-    FlutterEngineSendPlatformMessageResponse, FlutterEngineSendPointerEvent,
-    FlutterEngineSendWindowMetricsEvent, FlutterEngineShutdown, FlutterKeyEvent,
-    FlutterKeyEventDeviceType_kFlutterKeyEventDeviceTypeKeyboard,
+    FlutterEngineCreateAOTData, FlutterEngineGetCurrentTime, FlutterEngineInitialize,
+    FlutterEngineResult_kSuccess, FlutterEngineRunInitialized, FlutterEngineRunTask,
+    FlutterEngineRunsAOTCompiledDartCode, FlutterEngineScheduleFrame, FlutterEngineSendKeyEvent,
+    FlutterEngineSendPlatformMessage, FlutterEngineSendPlatformMessageResponse,
+    FlutterEngineSendPointerEvent, FlutterEngineSendWindowMetricsEvent, FlutterEngineShutdown,
+    FlutterKeyEvent, FlutterKeyEventDeviceType_kFlutterKeyEventDeviceTypeKeyboard,
     FlutterKeyEventType_kFlutterKeyEventTypeDown, FlutterKeyEventType_kFlutterKeyEventTypeRepeat,
     FlutterKeyEventType_kFlutterKeyEventTypeUp, FlutterLayer, FlutterOpenGLRendererConfig,
     FlutterPlatformMessage, FlutterPlatformMessageCreateResponseHandle,
@@ -37,7 +37,6 @@ use flutter_embedder::{
     FlutterPointerSignalKind_kFlutterPointerSignalKindScroll, FlutterPresentViewInfo,
     FlutterProjectArgs, FlutterRendererConfig, FlutterRendererType_kOpenGL, FlutterTask,
     FlutterTaskRunnerDescription, FlutterTransformation, FlutterWindowMetricsEvent,
-    FLUTTER_ENGINE_VERSION,
 };
 use parking_lot::Mutex;
 use smol_str::SmolStr;
@@ -342,7 +341,7 @@ impl FlutterEngine {
             handled: bool,
             user_data: *mut ::std::os::raw::c_void,
         ) {
-            Box::from_raw(user_data.cast::<F>())(handled);
+            unsafe { Box::from_raw(user_data.cast::<F>())(handled) };
         }
 
         // This is freed above when the calback invoked.
@@ -460,11 +459,13 @@ fn create_task_runner<F: Fn(Task) + 'static>(
     runner: FlutterTaskRunner<F>,
 ) -> FlutterTaskRunnerDescription {
     unsafe extern "C" fn runs_tasks_on_current_thread<F>(task_runner: *mut c_void) -> bool {
-        task_runner
-            .cast::<FlutterTaskRunner<F>>()
-            .as_mut()
-            .unwrap()
-            .runs_tasks_on_current_thread()
+        unsafe {
+            task_runner
+                .cast::<FlutterTaskRunner<F>>()
+                .as_mut()
+                .unwrap()
+                .runs_tasks_on_current_thread()
+        }
     }
 
     unsafe extern "C" fn post_task_callback<F: Fn(Task)>(
@@ -473,12 +474,12 @@ fn create_task_runner<F: Fn(Task) + 'static>(
         user_data: *mut c_void,
     ) {
         let runner = user_data.cast::<FlutterTaskRunner<F>>();
-        (*runner).post_task(task, target_time_nanos);
+        unsafe { (*runner).post_task(task, target_time_nanos) };
     }
 
     unsafe extern "C" fn destruction_callback<F: Fn(Task)>(user_data: *mut c_void) {
         tracing::debug!("destroying task runner");
-        drop(Box::from_raw(user_data.cast::<FlutterTaskRunner<F>>()));
+        drop(unsafe { Box::from_raw(user_data.cast::<FlutterTaskRunner<F>>()) });
     }
 
     // This is freed by the above destruction_callback.
@@ -540,11 +541,11 @@ impl BinaryMessenger {
             size: usize,
             user_data: *mut ::std::os::raw::c_void,
         ) {
-            let reply_handler = Box::from_raw(user_data.cast::<F>());
+            let reply_handler = unsafe { Box::from_raw(user_data.cast::<F>()) };
             if data.is_null() {
                 tracing::warn!("null reply from platform message");
             } else {
-                reply_handler(std::slice::from_raw_parts(data, size));
+                reply_handler(unsafe { std::slice::from_raw_parts(data, size) });
             }
         }
 
@@ -664,8 +665,8 @@ unsafe extern "C" fn platform_message_callback(
     message: *const FlutterPlatformMessage,
     user_data: *mut c_void,
 ) {
-    let engine = user_data.cast::<FlutterEngineInner>().as_ref().unwrap();
-    let message = message.as_ref().unwrap();
+    let engine = unsafe { user_data.cast::<FlutterEngineInner>().as_ref().unwrap() };
+    let message = unsafe { message.as_ref().unwrap() };
 
     let reply = BinaryMessageReply::new(
         engine.handle,
@@ -673,7 +674,7 @@ unsafe extern "C" fn platform_message_callback(
         message.response_handle,
     );
 
-    let channel = CStr::from_ptr(message.channel);
+    let channel = unsafe { CStr::from_ptr(message.channel) };
     let Ok(channel) = channel.to_str() else {
         tracing::error!("invalid channel name: {channel:?}");
         reply.not_implemented();
@@ -693,13 +694,13 @@ unsafe extern "C" fn platform_message_callback(
         return;
     }
 
-    let bytes = std::slice::from_raw_parts(message.message, message.message_size);
+    let bytes = unsafe { std::slice::from_raw_parts(message.message, message.message_size) };
 
     handler.handle(bytes, reply);
 }
 
 unsafe extern "C" fn gl_make_current(user_data: *mut c_void) -> bool {
-    let engine = user_data.cast::<FlutterEngineInner>().as_ref().unwrap();
+    let engine = unsafe { user_data.cast::<FlutterEngineInner>().as_ref().unwrap() };
 
     if let Err(e) = engine.egl.make_context_current() {
         tracing::error!("failed to make context current: {e}");
@@ -710,7 +711,7 @@ unsafe extern "C" fn gl_make_current(user_data: *mut c_void) -> bool {
 }
 
 unsafe extern "C" fn gl_make_resource_current(user_data: *mut c_void) -> bool {
-    let engine = user_data.cast::<FlutterEngineInner>().as_ref().unwrap();
+    let engine = unsafe { user_data.cast::<FlutterEngineInner>().as_ref().unwrap() };
 
     if let Err(e) = engine.egl.make_resource_context_current() {
         tracing::error!("failed to make resource context current: {e}");
@@ -721,7 +722,7 @@ unsafe extern "C" fn gl_make_resource_current(user_data: *mut c_void) -> bool {
 }
 
 unsafe extern "C" fn gl_clear_current(user_data: *mut c_void) -> bool {
-    let engine = user_data.cast::<FlutterEngineInner>().as_ref().unwrap();
+    let engine = unsafe { user_data.cast::<FlutterEngineInner>().as_ref().unwrap() };
 
     if let Err(e) = engine.egl.clear_current() {
         tracing::error!("failed to clear context: {e}");
@@ -743,8 +744,8 @@ unsafe extern "C" fn gl_get_proc_address(
     user_data: *mut c_void,
     name: *const c_char,
 ) -> *mut c_void {
-    let engine = user_data.cast::<FlutterEngineInner>().as_ref().unwrap();
-    let name = CStr::from_ptr(name);
+    let engine = unsafe { user_data.cast::<FlutterEngineInner>().as_ref().unwrap() };
+    let name = unsafe { CStr::from_ptr(name) };
     engine
         .egl
         .get_proc_address(name.to_str().unwrap())
@@ -754,8 +755,8 @@ unsafe extern "C" fn gl_get_proc_address(
 unsafe extern "C" fn gl_get_surface_transformation(
     user_data: *mut c_void,
 ) -> FlutterTransformation {
-    let engine = user_data.cast::<FlutterEngineInner>().as_ref().unwrap();
-    let compositor = engine.compositor.as_mut().unwrap();
+    let engine = unsafe { user_data.cast::<FlutterEngineInner>().as_ref().unwrap() };
+    let compositor = unsafe { engine.compositor.as_mut().unwrap() };
     match compositor.get_surface_transformation() {
         Ok(transformation) => transformation,
         Err(e) => {
@@ -775,17 +776,18 @@ pub unsafe extern "C" fn compositor_create_backing_store(
     out: *mut FlutterBackingStore,
     user_data: *mut c_void,
 ) -> bool {
-    let Some(compositor) = user_data.cast::<FlutterCompositor>().as_mut() else {
+    let compositor = unsafe { user_data.cast::<FlutterCompositor>().as_mut() };
+    let Some(compositor) = compositor else {
         tracing::error!("user_data is null");
         return false;
     };
 
-    let Some(config) = config.as_ref() else {
+    let Some(config) = (unsafe { config.as_ref() }) else {
         tracing::error!("config is null");
         return false;
     };
 
-    let Some(backing_store) = out.as_mut() else {
+    let Some(backing_store) = (unsafe { out.as_mut() }) else {
         tracing::error!("out is null");
         return false;
     };
@@ -802,12 +804,12 @@ pub unsafe extern "C" fn compositor_collect_backing_store(
     backing_store: *const FlutterBackingStore,
     user_data: *mut c_void,
 ) -> bool {
-    let Some(compositor) = user_data.cast::<FlutterCompositor>().as_mut() else {
+    let Some(compositor) = (unsafe { user_data.cast::<FlutterCompositor>().as_mut() }) else {
         tracing::error!("user_data is null");
         return false;
     };
 
-    let Some(backing_store) = backing_store.as_ref() else {
+    let Some(backing_store) = (unsafe { backing_store.as_ref() }) else {
         tracing::error!("config is null");
         return false;
     };
@@ -821,12 +823,12 @@ pub unsafe extern "C" fn compositor_collect_backing_store(
 }
 
 pub unsafe extern "C" fn compositor_present_view(info: *const FlutterPresentViewInfo) -> bool {
-    let Some(info) = info.as_ref() else {
+    let Some(info) = (unsafe { info.as_ref() }) else {
         tracing::error!("FlutterPresentViewInfo is invalid");
         return false;
     };
 
-    let Some(compositor) = info.user_data.cast::<FlutterCompositor>().as_mut() else {
+    let Some(compositor) = (unsafe { info.user_data.cast::<FlutterCompositor>().as_mut() }) else {
         tracing::error!("user_data is null");
         return false;
     };
@@ -836,7 +838,9 @@ pub unsafe extern "C" fn compositor_present_view(info: *const FlutterPresentView
         return false;
     }
 
-    let layers = std::slice::from_raw_parts(info.layers.cast::<&FlutterLayer>(), info.layers_count);
+    let layers = unsafe {
+        std::slice::from_raw_parts(info.layers.cast::<&FlutterLayer>(), info.layers_count)
+    };
 
     if let Err(e) = compositor
         .present_view(info.view_id, layers)
@@ -850,7 +854,7 @@ pub unsafe extern "C" fn compositor_present_view(info: *const FlutterPresentView
 }
 
 unsafe extern "C" fn log_message(tag: *const c_char, message: *const c_char, _: *mut c_void) {
-    let tag = CStr::from_ptr(tag).to_string_lossy();
-    let message = CStr::from_ptr(message).to_string_lossy();
+    let tag = unsafe { CStr::from_ptr(tag).to_string_lossy() };
+    let message = unsafe { CStr::from_ptr(message).to_string_lossy() };
     eprintln!("{tag}: {message}");
 }

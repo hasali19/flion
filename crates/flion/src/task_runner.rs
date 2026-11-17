@@ -1,7 +1,7 @@
 use std::mem;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
@@ -11,7 +11,6 @@ use flutter_embedder::{
     FlutterThreadPriority_kDisplay, FlutterThreadPriority_kRaster,
 };
 use parking_lot::Mutex;
-use windows::core::w;
 use windows::Win32::Foundation::{GetLastError, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
@@ -19,10 +18,11 @@ use windows::Win32::System::Threading::{
     THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_NORMAL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetWindowLongPtrW, KillTimer, PostMessageW, RegisterClassW, SetTimer, SetWindowLongPtrW,
-    TranslateMessage, GWLP_USERDATA, HWND_MESSAGE, WM_NULL, WM_TIMER, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetMessageW,
+    GetWindowLongPtrW, HWND_MESSAGE, KillTimer, PostMessageW, RegisterClassW, SetTimer,
+    SetWindowLongPtrW, TranslateMessage, WM_NULL, WM_TIMER, WNDCLASSW,
 };
+use windows::core::w;
 
 use crate::engine::FlutterEngine;
 
@@ -66,7 +66,7 @@ pub unsafe extern "C" fn set_thread_priority(thread_priority: i32) {
         _ => THREAD_PRIORITY_NORMAL,
     };
 
-    if let Err(e) = SetThreadPriority(GetCurrentThread(), priority) {
+    if let Err(e) = unsafe { SetThreadPriority(GetCurrentThread(), priority) } {
         tracing::error!("failed to set thread priority: {e}");
     }
 }
@@ -263,15 +263,16 @@ unsafe extern "system" fn wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    let executor = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut FlutterTaskExecutorState;
-    let executor = executor.as_mut();
+    let executor =
+        unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut FlutterTaskExecutorState;
+    let executor = unsafe { executor.as_mut() };
 
     if let Some(executor) = executor
-        && let WM_NULL | WM_TIMER = msg
+        && (msg == WM_NULL || msg == WM_TIMER)
     {
         executor.process_tasks();
         return LRESULT(0);
     }
 
-    DefWindowProcW(hwnd, msg, wparam, lparam)
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
