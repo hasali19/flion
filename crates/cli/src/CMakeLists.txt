@@ -2,10 +2,13 @@ cmake_minimum_required(VERSION 3.14)
 
 project(FlionFlutterPlugins)
 
+# Use Unicode for all projects, matching the Flutter Windows runner template.
+add_definitions(-DUNICODE -D_UNICODE)
+
 # Compilation settings that should be applied to most targets.
 function(APPLY_STANDARD_SETTINGS TARGET)
     target_compile_features(${TARGET} PUBLIC cxx_std_17)
-    target_compile_options(${TARGET} PRIVATE /W4 /WX /wd"4100")
+    target_compile_options(${TARGET} PRIVATE /W4 /WX /wd4100)
     target_compile_options(${TARGET} PRIVATE /EHsc)
     target_compile_definitions(${TARGET} PRIVATE "_HAS_EXCEPTIONS=0")
     target_compile_definitions(${TARGET} PRIVATE "$<$<CONFIG:Debug>:_DEBUG>")
@@ -29,7 +32,7 @@ target_include_directories(flutter INTERFACE
     "${CMAKE_CURRENT_SOURCE_DIR}/flutter/windows-x64-flutter"
     "${CMAKE_CURRENT_SOURCE_DIR}/flutter/flutter-cpp-client-wrapper/cpp_client_wrapper/include")
 
-target_link_libraries(flutter INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/flion_plugins_shim.dll.lib")
+target_link_libraries(flutter INTERFACE "${FLION_PLUGINS_SHIM_LIB}")
 
 foreach(plugin ${FLUTTER_PLUGINS})
     add_subdirectory("${plugin}/windows" "plugins/${plugin}")

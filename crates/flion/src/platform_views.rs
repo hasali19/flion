@@ -147,10 +147,22 @@ impl StandardMethodHandler for PlatformViewsMessageHandler {
                 composition_device: &self.composition_device,
             };
 
-            // TODO: Return an error instead of unwrapping
-            let platform_view = self.factories[type_]
-                .create(context, id, create_args)
-                .unwrap();
+            let Some(factory) = self.factories.get(type_) else {
+                let message = format!("no platform view factory registered for {type_}");
+                tracing::error!("{message}");
+                reply.error("error", Some(&message), &EncodableValue::Null);
+                return;
+            };
+
+            let platform_view = match factory.create(context, id, create_args) {
+                Ok(platform_view) => platform_view,
+                Err(e) => {
+                    let message = format!("failed to create platform view: {e:?}");
+                    tracing::error!("{message}");
+                    reply.error("error", Some(&message), &EncodableValue::Null);
+                    return;
+                }
+            };
 
             self.platform_views.add(id as u64, platform_view);
 

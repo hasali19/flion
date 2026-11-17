@@ -1,4 +1,3 @@
-import 'package:dynamic_system_colors/dynamic_system_colors.dart';
 import 'package:flion/flion.dart';
 import 'package:flutter/material.dart';
 
@@ -12,21 +11,11 @@ class MyApp extends StatelessWidget {
   // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
-    return DynamicColorBuilder(
-      builder: (lightScheme, darkScheme) {
-        return MaterialApp(
-          title: 'Flutter Demo',
-          theme: ThemeData(
-            brightness: Brightness.light,
-            colorScheme: lightScheme,
-          ),
-          darkTheme: ThemeData(
-            brightness: Brightness.dark,
-            colorScheme: darkScheme,
-          ),
-          home: const MyHomePage(title: 'Flutter Demo Home Page'),
-        );
-      },
+    return MaterialApp(
+      title: 'Flutter Demo',
+      theme: ThemeData(brightness: Brightness.light),
+      darkTheme: ThemeData(brightness: Brightness.dark),
+      home: const MyHomePage(title: 'Flutter Demo Home Page'),
     );
   }
 }
@@ -88,7 +77,7 @@ class _MyHomePageState extends State<MyHomePage> {
     // fast, so that you can just rebuild anything that needs updating rather
     // than having to individually change instances of widgets.
     return Scaffold(
-      backgroundColor: Colors.transparent,
+      // backgroundColor: Colors.transparent,
       appBar: AppBar(
         // Here we take the value from the MyHomePage object that was created by
         // the App.build method, and use it to set our appbar title.

@@ -37,6 +37,17 @@ impl StandardMethodReply {
         self.0.send(&bytes);
     }
 
+    pub fn error(self, code: &str, message: Option<&str>, details: &EncodableValue) {
+        let mut bytes = vec![];
+        let mut cursor = Cursor::new(&mut bytes);
+        cursor.write_all(&[1]).unwrap();
+        codec::write_value(&mut cursor, &EncodableValue::Str(code)).unwrap();
+        let message = message.map_or(EncodableValue::Null, EncodableValue::Str);
+        codec::write_value(&mut cursor, &message).unwrap();
+        codec::write_value(&mut cursor, details).unwrap();
+        self.0.send(&bytes);
+    }
+
     pub fn not_implemented(self) {
         self.0.not_implemented();
     }

@@ -1,15 +1,16 @@
 use std::mem;
 
 use serde_json::json;
+use tracing::warn;
+use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::core::w;
-use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 
 use crate::engine::FlutterEngine;
 
 pub fn send_to_engine(engine: &FlutterEngine) -> eyre::Result<()> {
-    let mut use_light_theme = 0u32;
+    let mut use_light_theme = 1u32;
     let mut use_light_theme_size = mem::size_of_val(&use_light_theme) as u32;
-    unsafe {
+    let result = unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
             w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
@@ -19,7 +20,11 @@ pub fn send_to_engine(engine: &FlutterEngine) -> eyre::Result<()> {
             Some(&mut use_light_theme as *mut _ as _),
             Some(&mut use_light_theme_size),
         )
-        .ok()?;
+        .ok()
+    };
+
+    if result.is_err() {
+        warn!("Failed to read theme preference from registry");
     }
 
     let message = json!({

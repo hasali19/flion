@@ -19,6 +19,7 @@ pub mod standard_method_channel;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::num::NonZeroIsize;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -28,9 +29,11 @@ use std::{env, mem};
 use engine::{PointerButtons, PointerDeviceKind, PointerEvent};
 use eyre::OptionExt;
 use parking_lot::Mutex;
-use platform_views::{PlatformViewFactory, PlatformViewsMessageHandler};
+use platform_views::{PlatformViewFactory, PlatformViews, PlatformViewsMessageHandler};
 use plugins_shim::FlutterPluginsEngine;
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use raw_window_handle::{
+    HandleError, HasWindowHandle, RawWindowHandle, Win32WindowHandle, WindowHandle,
+};
 use task_runner::{FlutterTaskExecutor, FlutterTaskQueue};
 use views::ViewManager;
 use window::{MouseAction, Window, WindowHandler};
@@ -50,8 +53,8 @@ use winit::event_loop::EventLoopBuilder;
 use winit::platform::windows::WindowBuilderExtWindows;
 use winit::window::WindowBuilder;
 
-use crate::compositor::FlutterCompositor;
-use crate::egl::EglDevice;
+use crate::compositor::{DirectCompositionCompositor, OpenGLCompositor, ViewSurfaceRegistry};
+use crate::egl::EglDisplay;
 use crate::engine::{FlutterEngine, FlutterEngineConfig, PointerPhase};
 use crate::error_utils::ResultExt;
 use crate::keyboard::Keyboard;
@@ -75,8 +78,16 @@ macro_rules! include_plugins {
     };
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CompositorKind {
+    #[default]
+    DirectComposition,
+    OpenGL,
+}
+
 pub struct FlionAppBuilder<'a> {
     bundle_path: PathBuf,
+    compositor: CompositorKind,
     platform_message_handlers: Vec<(&'a str, Box<dyn BinaryMessageHandler>)>,
     platform_view_factories: HashMap<String, Box<dyn PlatformViewFactory>>,
 }
@@ -93,6 +104,7 @@ impl<'a> FlionAppBuilder<'a> {
 
         FlionAppBuilder {
             bundle_path,
+            compositor: CompositorKind::default(),
             platform_message_handlers: vec![],
             platform_view_factories: HashMap::new(),
         }
@@ -100,6 +112,11 @@ impl<'a> FlionAppBuilder<'a> {
 
     pub fn with_bundle_path(mut self, path: &'a Path) -> Self {
         self.bundle_path = path.to_owned();
+        self
+    }
+
+    pub fn with_compositor(mut self, compositor: CompositorKind) -> Self {
+        self.compositor = compositor;
         self
     }
 
@@ -144,31 +161,23 @@ impl<'a> FlionAppBuilder<'a> {
         let composition_device: IDCompositionDevice =
             unsafe { DCompositionCreateDevice2(&device.cast::<IDXGIDevice>()?)? };
 
-        let egl = EglDevice::create(&device)?;
-
         let task_executor = Rc::new(FlutterTaskExecutor::new()?);
         let task_queue = task_executor.queue().clone();
 
         let view_manager = Arc::new(Mutex::new(ViewManager::new()));
-        let compositor = FlutterCompositor::new(
-            device.clone(),
-            composition_device.clone(),
-            view_manager.clone(),
-            egl.clone(),
-            Box::new(CompositionHandler {
-                composition_device: composition_device.clone(),
-                view_manager: view_manager.clone(),
-                platform_task_queue: task_queue.clone(),
-            }),
-        )?;
+        let platform_views = Arc::new(PlatformViews::new());
 
-        let platform_views = compositor.platform_views();
+        let composition_handler = Box::new(CompositionHandler {
+            composition_device: composition_device.clone(),
+            view_manager: view_manager.clone(),
+            platform_task_queue: task_queue.clone(),
+        });
 
         let mut platform_message_handlers: Vec<(&str, Box<dyn BinaryMessageHandler>)> = vec![(
             "flion/platform_views",
             Box::new(PlatformViewsMessageHandler::new(
-                platform_views,
-                device,
+                platform_views.clone(),
+                device.clone(),
                 composition_device.clone(),
                 self.platform_view_factories,
             )),
@@ -187,18 +196,44 @@ impl<'a> FlionAppBuilder<'a> {
             .map(PathBuf::from)
             .unwrap_or_else(|_| self.bundle_path.join("app.so"));
 
-        let engine = Rc::new(FlutterEngine::new(FlutterEngineConfig {
+        let engine_config = FlutterEngineConfig {
             assets_path: assets_path.to_str().ok_or_eyre("invalid assets path")?,
             aot_library_path: Some(
                 aot_library_path
                     .to_str()
                     .ok_or_eyre("invalid aot library path")?,
             ),
-            egl: egl.clone(),
-            compositor,
             platform_task_handler: Box::new(move |task| task_queue.enqueue(task)),
             platform_message_handlers,
-        })?);
+        };
+
+        let display = EglDisplay::for_d3d11_device(&device)?;
+
+        let mut opengl = None;
+
+        let engine = match self.compositor {
+            CompositorKind::DirectComposition => FlutterEngine::new(
+                engine_config,
+                DirectCompositionCompositor::new(
+                    device.clone(),
+                    composition_device.clone(),
+                    view_manager.clone(),
+                    display,
+                    platform_views,
+                    composition_handler,
+                )?,
+            )?,
+            CompositorKind::OpenGL => {
+                let surfaces = Arc::new(ViewSurfaceRegistry::default());
+                let compositor = OpenGLCompositor::new(display.clone(), surfaces.clone())?;
+
+                opengl = Some(OpenGLState { display, surfaces });
+
+                FlutterEngine::new(engine_config, compositor)?
+            }
+        };
+
+        let engine = Rc::new(engine);
 
         task_executor.init(engine.clone());
 
@@ -209,6 +244,7 @@ impl<'a> FlionAppBuilder<'a> {
             composition_device,
             view_manager,
             task_executor,
+            opengl,
         })
     }
 }
@@ -218,6 +254,13 @@ pub struct FlionApp {
     composition_device: IDCompositionDevice,
     view_manager: Arc<Mutex<ViewManager>>,
     task_executor: Rc<FlutterTaskExecutor>,
+    opengl: Option<OpenGLState>,
+}
+
+/// State used to provide window surfaces to the [`OpenGLCompositor`].
+struct OpenGLState {
+    display: EglDisplay,
+    surfaces: Arc<ViewSurfaceRegistry>,
 }
 
 impl FlionApp {
@@ -275,6 +318,9 @@ impl FlionApp {
                 engine: self.engine.clone(),
                 task_executor: self.task_executor.clone(),
                 view_manager: self.view_manager.clone(),
+                // The OpenGL compositor presents directly to the window surface, so there is no
+                // resize to wait for.
+                sync_resize: self.opengl.is_none(),
                 keyboard: Keyboard::new(self.engine.clone(), text_input.clone()),
             }),
         )?);
@@ -311,21 +357,45 @@ impl FlionApp {
             }
         }
 
-        // TODO: Composition target should be attached to parent window instead. Use the child window
-        // just for input.
-        let composition_target = unsafe {
-            self.composition_device
-                .CreateTargetForHwnd(window.window_handle(), true)?
-        };
+        let mut _composition_target = None;
+        let mut opengl_surfaces = None;
 
-        unsafe { composition_target.SetRoot(&root_visual)? };
+        if let Some(opengl) = &self.opengl {
+            // ANGLE creates its own composition target for the window surface.
+            let surface = opengl.display.create_window_surface(
+                Win32Window(window.window_handle()),
+                size.width,
+                size.height,
+            )?;
+
+            opengl.surfaces.add(0, surface);
+            opengl_surfaces = Some(opengl.surfaces.clone());
+        } else {
+            // TODO: Composition target should be attached to parent window instead. Use the child
+            // window just for input.
+            let composition_target = unsafe {
+                self.composition_device
+                    .CreateTargetForHwnd(window.window_handle(), true)?
+            };
+
+            unsafe { composition_target.SetRoot(&root_visual)? };
+
+            _composition_target = Some(composition_target);
+        }
 
         event_loop.run(move |event, target| match event {
             winit::event::Event::WindowEvent { window_id, event }
                 if window_id == parent_window.id() =>
             {
                 match event {
-                    winit::event::WindowEvent::CloseRequested => target.exit(),
+                    winit::event::WindowEvent::CloseRequested => {
+                        // Release the window surface before the window is destroyed.
+                        if let Some(surfaces) = &opengl_surfaces {
+                            surfaces.remove(0);
+                        }
+
+                        target.exit()
+                    }
 
                     winit::event::WindowEvent::Focused(true) => window.request_focus(),
 
@@ -348,12 +418,21 @@ struct FlutterWindowHandler {
     engine: Rc<engine::FlutterEngine>,
     task_executor: Rc<FlutterTaskExecutor>,
     view_manager: Arc<Mutex<ViewManager>>,
+    sync_resize: bool,
     keyboard: Keyboard,
 }
 
 impl WindowHandler for FlutterWindowHandler {
     fn on_resize(&self, width: u32, height: u32, scale_factor: f64) {
         // TODO: Consider moving this to WM_NCCALCSIZE on the parent window for smoother resizing.
+
+        if !self.sync_resize {
+            let _ = self
+                .engine
+                .send_window_metrics_event(width as usize, height as usize, scale_factor)
+                .trace_err();
+            return;
+        }
 
         {
             let mut views = self.view_manager.lock();
@@ -450,16 +529,18 @@ struct CompositionHandler {
     platform_task_queue: Arc<FlutterTaskQueue>,
 }
 
+// TODO: Only required as IDCompositionDevice is not Send/Sync. Scope the impls to just that field.
 unsafe impl Send for CompositionHandler {}
+unsafe impl Sync for CompositionHandler {}
 
 impl compositor::CompositionHandler for CompositionHandler {
-    fn get_surface_size(&mut self) -> eyre::Result<(u32, u32)> {
+    fn get_surface_size(&self) -> eyre::Result<(u32, u32)> {
         let views = self.view_manager.lock();
         let surface = views.get(0).ok_or_eyre("View not found")?;
         Ok(surface.size())
     }
 
-    fn present(&mut self) -> eyre::Result<()> {
+    fn present(&self) -> eyre::Result<()> {
         let mut views = self.view_manager.lock();
         let surface = views.get_mut(0).ok_or_eyre("View not found")?;
 
@@ -479,5 +560,19 @@ impl compositor::CompositionHandler for CompositionHandler {
         }
 
         Ok(())
+    }
+}
+
+/// Borrowed handle to a win32 window, used to create EGL window surfaces.
+struct Win32Window(HWND);
+
+unsafe impl Send for Win32Window {}
+unsafe impl Sync for Win32Window {}
+
+impl HasWindowHandle for Win32Window {
+    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+        let hwnd = NonZeroIsize::new(self.0.0 as isize).ok_or(HandleError::Unavailable)?;
+        let handle = Win32WindowHandle::new(hwnd);
+        Ok(unsafe { WindowHandle::borrow_raw(RawWindowHandle::Win32(handle)) })
     }
 }

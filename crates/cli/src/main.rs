@@ -113,12 +113,14 @@ fn main() -> eyre::Result<()> {
         build_mode,
     )?;
 
-    copy_native_libraries(
-        &flutter_program,
-        flutter_project_dir,
-        build_mode,
-        &target_dir,
-    )?;
+    let out_dir = flion_build_dir
+        .join("out")
+        .join("x86_64-pc-windows-msvc")
+        .join(build_mode.name());
+
+    fs::create_dir_all(&out_dir)?;
+
+    copy_native_libraries(&flutter_program, flutter_project_dir, build_mode, &out_dir)?;
 
     let plugins_build_dir = flion_build_dir.join("plugins");
     if !plugins_build_dir.exists() {
@@ -129,7 +131,7 @@ fn main() -> eyre::Result<()> {
 
     PluginsShimCompiler::new(&cargo, plugins_build_dir).compile()?;
 
-    process_plugins(&flutter_program, flutter_project_dir, &target_dir)?;
+    process_plugins(&flutter_program, flutter_project_dir, &out_dir)?;
 
     let embedder_path = engine_artifacts_dir.join(match build_mode {
         BuildMode::Debug => "windows-x64-embedder",
@@ -429,14 +431,14 @@ fn copy_native_libraries(
         BuildMode::Release => "-release",
     };
 
-    copy_if_newer(
+    copy_if_changed(
         &engine_artifacts_dir
             .join(format!("windows-x64-embedder{mode_suffix}"))
             .join("flutter_engine.dll"),
         &out_dir.join("flutter_engine.dll"),
     )?;
 
-    copy_if_newer(
+    copy_if_changed(
         &engine_artifacts_dir.join("artifacts").join("icudtl.dat"),
         &out_dir.join("icudtl.dat"),
     )?;
@@ -477,7 +479,7 @@ fn copy_native_libraries(
     for lib in ["libEGL.dll", "libGLESv2.dll"] {
         let src_path = angle_extract_path.join("bin").join(lib);
         let dst_path = out_dir.join(lib);
-        copy_if_newer(&src_path, &dst_path)?;
+        copy_if_changed(&src_path, &dst_path)?;
     }
 
     Ok(())
@@ -490,6 +492,17 @@ fn process_plugins(
 ) -> eyre::Result<()> {
     let plugins_path = flutter_project_dir.join(".flutter-plugins-dependencies");
     if !plugins_path.exists() {
+        let plugins_list_path = flutter_project_dir
+            .join("build")
+            .join("flion")
+            .join("plugins")
+            .join("plugins.txt");
+
+        if fs::read_to_string(&plugins_list_path).is_ok_and(|list| !list.is_empty()) {
+            tracing::info!("plugins list has changed");
+            fs::write(plugins_list_path, "")?;
+        }
+
         return Ok(());
     }
 
@@ -580,8 +593,30 @@ fn process_plugins(
         fs::write(plugins_build_dir.join("plugins.txt"), plugins_list)?;
     }
 
-    let d_flutter_plugins = format!("-DFLUTTER_PLUGINS={}", plugin_names.join(";"));
-    let d_cmake_install_prefix = format!("-DCMAKE_INSTALL_PREFIX={}", plugins_build_dir.display());
+    let mut cmake_args = vec![
+        plugins_build_dir.display().to_string(),
+        format!("-DFLUTTER_PLUGINS={}", plugin_names.join(";")),
+        format!("-DCMAKE_INSTALL_PREFIX={}", plugins_build_dir.display()),
+        format!(
+            "-DFLION_PLUGINS_SHIM_LIB={}",
+            out_dir.join("flion_plugins_shim.dll.lib").display()
+        ),
+        "-DCMAKE_BUILD_TYPE=Release".to_owned(),
+    ];
+
+    if !cfg!(windows) {
+        let toolchain_path = plugins_build_dir.join("windows-toolchain.cmake");
+        fs::write(&toolchain_path, include_str!("windows-toolchain.cmake"))?;
+
+        let windows_sdk = env::var("FLION_WINDOWS_SDK")
+            .wrap_err("FLION_WINDOWS_SDK must be set when cross compiling for windows")?;
+
+        cmake_args.push(format!(
+            "-DCMAKE_TOOLCHAIN_FILE={}",
+            toolchain_path.display()
+        ));
+        cmake_args.push(format!("-DFLION_WINDOWS_SDK={windows_sdk}"));
+    }
 
     fs::create_dir_all(plugins_build_dir.join("build"))?;
 
@@ -589,17 +624,11 @@ fn process_plugins(
 
     tracing::info!("running cmake gen for plugins");
 
-    cmd!(
-        "cmake",
-        &plugins_build_dir,
-        d_flutter_plugins,
-        d_cmake_install_prefix,
-        "-DCMAKE_BUILD_TYPE=Release",
-    )
-    .dir(&cmake_build_dir)
-    .stdout_file(File::create(plugins_build_dir.join("cmake_gen.txt"))?)
-    .stderr_to_stdout()
-    .run()?;
+    cmd("cmake", cmake_args)
+        .dir(&cmake_build_dir)
+        .stdout_file(File::create(plugins_build_dir.join("cmake_gen.txt"))?)
+        .stderr_to_stdout()
+        .run()?;
 
     tracing::info!("running cmake build for plugins");
 
@@ -622,25 +651,32 @@ fn process_plugins(
         let lib = lib?;
         let src = lib.path();
         let dest = out_dir.join(lib.file_name());
-        copy_if_newer(&src, &dest)?;
+        copy_if_changed(&src, &dest)?;
     }
 
     Ok(())
 }
 
-fn copy_if_newer(src: &Path, dst: &Path) -> eyre::Result<()> {
-    if dst.exists() {
-        let src_metadata = src.metadata()?;
-        let dst_metadata = dst.metadata()?;
-        if src_metadata.modified()? <= dst_metadata.modified()? {
-            return Ok(());
-        }
+fn copy_if_changed(src: &Path, dst: &Path) -> eyre::Result<()> {
+    let src_metadata = src.metadata()?;
+    let src_modified = src_metadata.modified()?;
+
+    if let Ok(dst_metadata) = dst.metadata()
+        && dst_metadata.len() == src_metadata.len()
+        && dst_metadata.modified()? == src_modified
+    {
+        return Ok(());
     }
 
     tracing::info!("copying {} to {}", src.display(), dst.display());
 
     fs::copy(src, dst)
         .wrap_err_with(|| eyre!("failed to copy {} to {}", src.display(), dst.display()))?;
+
+    File::options()
+        .write(true)
+        .open(dst)?
+        .set_modified(src_modified)?;
 
     Ok(())
 }

@@ -41,17 +41,46 @@ use flutter_embedder::{
 use parking_lot::Mutex;
 use smol_str::SmolStr;
 
-use crate::compositor::FlutterCompositor;
-use crate::egl::EglDevice;
 use crate::task_runner::{self, FlutterTaskRunner, Task};
 
 pub struct FlutterEngineConfig<'a> {
     pub assets_path: &'a str,
     pub aot_library_path: Option<&'a str>,
-    pub egl: Arc<EglDevice>,
-    pub compositor: FlutterCompositor,
     pub platform_task_handler: Box<dyn Fn(Task)>,
     pub platform_message_handlers: Vec<(&'a str, Box<dyn BinaryMessageHandler + 'static>)>,
+}
+
+pub trait FlutterCompositor {
+    const AVOID_BACKING_STORE_CACHE: bool;
+}
+
+pub trait FlutterOpenGLCompositor: Send + Sync + 'static {
+    fn make_current(&self) -> eyre::Result<()>;
+
+    fn make_resource_current(&self) -> eyre::Result<()>;
+
+    fn clear_current(&self) -> eyre::Result<()>;
+
+    fn get_proc_address(&self, name: &str) -> Option<extern "system" fn()>;
+
+    fn get_surface_transformation(&self) -> eyre::Result<FlutterTransformation> {
+        Ok(FlutterTransformation {
+            scaleX: 1.0,
+            scaleY: 1.0,
+            pers2: 1.0,
+            ..Default::default()
+        })
+    }
+
+    fn create_backing_store(
+        &self,
+        config: &FlutterBackingStoreConfig,
+        backing_store: &mut FlutterBackingStore,
+    ) -> eyre::Result<()>;
+
+    fn release_backing_store(&self, backing_store: &FlutterBackingStore) -> eyre::Result<()>;
+
+    fn present_view(&self, view_id: i64, layers: &[&FlutterLayer]) -> eyre::Result<()>;
 }
 
 pub struct FlutterEngine {
@@ -65,8 +94,7 @@ pub struct FlutterEngine {
 struct FlutterEngineInner {
     handle: flutter_embedder::FlutterEngine,
     is_running: Arc<Mutex<bool>>,
-    egl: Arc<EglDevice>,
-    compositor: *mut FlutterCompositor,
+    compositor: Box<dyn FlutterOpenGLCompositor>,
     platform_message_handlers: Mutex<BTreeMap<String, Box<dyn BinaryMessageHandler + 'static>>>,
 }
 
@@ -135,7 +163,10 @@ pub struct KeyEvent {
 }
 
 impl FlutterEngine {
-    pub fn new(config: FlutterEngineConfig) -> eyre::Result<FlutterEngine> {
+    pub fn new<C>(config: FlutterEngineConfig, compositor: C) -> eyre::Result<FlutterEngine>
+    where
+        C: FlutterCompositor + FlutterOpenGLCompositor,
+    {
         let platform_task_runner = create_task_runner(
             1,
             FlutterTaskRunner::new(move |task| (config.platform_task_handler)(task)),
@@ -159,11 +190,23 @@ impl FlutterEngine {
             },
         };
 
+        let platform_message_handlers = BTreeMap::from_iter(
+            config
+                .platform_message_handlers
+                .into_iter()
+                .map(|(channel, handler)| (channel.to_owned(), handler)),
+        );
+
         let assets_path = CString::from_str(config.assets_path)?;
         let aot_data = load_aot_data(config.aot_library_path)?.unwrap_or(ptr::null_mut());
 
         // This is freed when the FlutterEngine is dropped.
-        let compositor = Box::into_raw(Box::new(config.compositor));
+        let engine = Box::leak(Box::new(FlutterEngineInner {
+            handle: ptr::null_mut(),
+            is_running: Arc::new(Mutex::new(false)),
+            platform_message_handlers: Mutex::new(platform_message_handlers),
+            compositor: Box::new(compositor),
+        }));
 
         let project_args = FlutterProjectArgs {
             struct_size: mem::size_of::<FlutterProjectArgs>(),
@@ -178,35 +221,19 @@ impl FlutterEngine {
                 thread_priority_setter: Some(task_runner::set_thread_priority),
             },
             compositor: &flutter_embedder::FlutterCompositor {
-                struct_size: mem::size_of::<FlutterCompositor>(),
+                struct_size: mem::size_of::<flutter_embedder::FlutterCompositor>(),
                 create_backing_store_callback: Some(compositor_create_backing_store),
                 collect_backing_store_callback: Some(compositor_collect_backing_store),
                 present_layers_callback: None,
                 present_view_callback: Some(compositor_present_view),
-                user_data: compositor.cast(),
-                avoid_backing_store_cache: false,
+                user_data: engine as *mut FlutterEngineInner as _,
+                avoid_backing_store_cache: C::AVOID_BACKING_STORE_CACHE,
             },
             platform_message_callback: Some(platform_message_callback),
             log_message_callback: Some(log_message),
             // vsync_callback: Some(vsync_callback),
             ..Default::default()
         };
-
-        let platform_message_handlers = BTreeMap::from_iter(
-            config
-                .platform_message_handlers
-                .into_iter()
-                .map(|(channel, handler)| (channel.to_owned(), handler)),
-        );
-
-        // This is freed when the FlutterEngine is dropped.
-        let engine = Box::leak(Box::new(FlutterEngineInner {
-            handle: ptr::null_mut(),
-            is_running: Arc::new(Mutex::new(false)),
-            egl: config.egl,
-            platform_message_handlers: Mutex::new(platform_message_handlers),
-            compositor,
-        }));
 
         let engine_handle = unsafe {
             let mut engine_ptr = ptr::null_mut();
@@ -411,8 +438,6 @@ impl Drop for FlutterEngine {
             *self.inner.is_running.lock() = false;
 
             FlutterEngineShutdown(self.inner.handle);
-
-            drop(Box::from_raw(self.inner.compositor));
 
             drop(Box::from_raw(
                 &raw const *self.inner as *mut FlutterEngineInner,
@@ -702,7 +727,7 @@ unsafe extern "C" fn platform_message_callback(
 unsafe extern "C" fn gl_make_current(user_data: *mut c_void) -> bool {
     let engine = unsafe { user_data.cast::<FlutterEngineInner>().as_ref().unwrap() };
 
-    if let Err(e) = engine.egl.make_context_current() {
+    if let Err(e) = engine.compositor.make_current() {
         tracing::error!("failed to make context current: {e}");
         return false;
     }
@@ -713,7 +738,7 @@ unsafe extern "C" fn gl_make_current(user_data: *mut c_void) -> bool {
 unsafe extern "C" fn gl_make_resource_current(user_data: *mut c_void) -> bool {
     let engine = unsafe { user_data.cast::<FlutterEngineInner>().as_ref().unwrap() };
 
-    if let Err(e) = engine.egl.make_resource_context_current() {
+    if let Err(e) = engine.compositor.make_resource_current() {
         tracing::error!("failed to make resource context current: {e}");
         return false;
     }
@@ -724,7 +749,7 @@ unsafe extern "C" fn gl_make_resource_current(user_data: *mut c_void) -> bool {
 unsafe extern "C" fn gl_clear_current(user_data: *mut c_void) -> bool {
     let engine = unsafe { user_data.cast::<FlutterEngineInner>().as_ref().unwrap() };
 
-    if let Err(e) = engine.egl.clear_current() {
+    if let Err(e) = engine.compositor.clear_current() {
         tracing::error!("failed to clear context: {e}");
         return false;
     }
@@ -746,18 +771,22 @@ unsafe extern "C" fn gl_get_proc_address(
 ) -> *mut c_void {
     let engine = unsafe { user_data.cast::<FlutterEngineInner>().as_ref().unwrap() };
     let name = unsafe { CStr::from_ptr(name) };
+    let Ok(name) = name.to_str() else {
+        tracing::error!("invalid proc name: {name:?}");
+        return ptr::null_mut();
+    };
     engine
-        .egl
-        .get_proc_address(name.to_str().unwrap())
-        .unwrap_or(ptr::null_mut())
+        .compositor
+        .get_proc_address(name)
+        .map(|f| f as *mut c_void)
+        .unwrap_or_else(ptr::null_mut)
 }
 
 unsafe extern "C" fn gl_get_surface_transformation(
     user_data: *mut c_void,
 ) -> FlutterTransformation {
     let engine = unsafe { user_data.cast::<FlutterEngineInner>().as_ref().unwrap() };
-    let compositor = unsafe { engine.compositor.as_mut().unwrap() };
-    match compositor.get_surface_transformation() {
+    match engine.compositor.get_surface_transformation() {
         Ok(transformation) => transformation,
         Err(e) => {
             tracing::error!("failed to get surface transformation: {e:?}");
@@ -776,8 +805,7 @@ pub unsafe extern "C" fn compositor_create_backing_store(
     out: *mut FlutterBackingStore,
     user_data: *mut c_void,
 ) -> bool {
-    let compositor = unsafe { user_data.cast::<FlutterCompositor>().as_mut() };
-    let Some(compositor) = compositor else {
+    let Some(engine) = (unsafe { user_data.cast::<FlutterEngineInner>().as_ref() }) else {
         tracing::error!("user_data is null");
         return false;
     };
@@ -792,7 +820,10 @@ pub unsafe extern "C" fn compositor_create_backing_store(
         return false;
     };
 
-    if let Err(e) = compositor.create_backing_store(config, backing_store) {
+    if let Err(e) = engine
+        .compositor
+        .create_backing_store(config, backing_store)
+    {
         tracing::error!("{e:?}");
         return false;
     }
@@ -804,7 +835,7 @@ pub unsafe extern "C" fn compositor_collect_backing_store(
     backing_store: *const FlutterBackingStore,
     user_data: *mut c_void,
 ) -> bool {
-    let Some(compositor) = (unsafe { user_data.cast::<FlutterCompositor>().as_mut() }) else {
+    let Some(engine) = (unsafe { user_data.cast::<FlutterEngineInner>().as_ref() }) else {
         tracing::error!("user_data is null");
         return false;
     };
@@ -814,7 +845,7 @@ pub unsafe extern "C" fn compositor_collect_backing_store(
         return false;
     };
 
-    if let Err(e) = compositor.collect_backing_store(backing_store) {
+    if let Err(e) = engine.compositor.release_backing_store(backing_store) {
         tracing::error!("{e:?}");
         return false;
     }
@@ -828,7 +859,7 @@ pub unsafe extern "C" fn compositor_present_view(info: *const FlutterPresentView
         return false;
     };
 
-    let Some(compositor) = (unsafe { info.user_data.cast::<FlutterCompositor>().as_mut() }) else {
+    let Some(engine) = (unsafe { info.user_data.cast::<FlutterEngineInner>().as_ref() }) else {
         tracing::error!("user_data is null");
         return false;
     };
@@ -842,7 +873,8 @@ pub unsafe extern "C" fn compositor_present_view(info: *const FlutterPresentView
         std::slice::from_raw_parts(info.layers.cast::<&FlutterLayer>(), info.layers_count)
     };
 
-    if let Err(e) = compositor
+    if let Err(e) = engine
+        .compositor
         .present_view(info.view_id, layers)
         .wrap_err("Failed to present view")
     {
