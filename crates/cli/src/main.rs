@@ -1,3 +1,6 @@
+mod cargo;
+mod plugins;
+
 use std::fmt::Write;
 use std::fs::File;
 use std::io::{self, BufWriter, Cursor};
@@ -11,7 +14,8 @@ use saphyr::Yaml;
 use which::which;
 use zip::ZipArchive;
 
-static PLUGINS_SHIM_SOURCE: &str = include_str!("../../plugins-compat/src/lib.rs");
+use crate::cargo::{BuildOptions, Cargo};
+use crate::plugins::PluginsShimCompiler;
 
 #[derive(clap::Parser)]
 enum Command {
@@ -92,6 +96,7 @@ fn main() -> eyre::Result<()> {
     let target_dir = cargo_metadata
         .target_directory
         .as_std_path()
+        .join("x86_64-pc-windows-msvc")
         .join(build_mode.name());
 
     if !target_dir.exists() {
@@ -115,7 +120,14 @@ fn main() -> eyre::Result<()> {
         &target_dir,
     )?;
 
-    compile_plugins_shim(&flion_build_dir.join("plugins"), &target_dir)?;
+    let plugins_build_dir = flion_build_dir.join("plugins");
+    if !plugins_build_dir.exists() {
+        fs::create_dir_all(&plugins_build_dir)?;
+    }
+
+    let cargo = Cargo::new(build_mode, flion_build_dir.join("out"));
+
+    PluginsShimCompiler::new(&cargo, plugins_build_dir).compile()?;
 
     process_plugins(&flutter_program, flutter_project_dir, &target_dir)?;
 
@@ -128,7 +140,13 @@ fn main() -> eyre::Result<()> {
 
     let cargo_cmd = if run { "run" } else { "build" };
 
-    let out = cmd!("cargo", cargo_cmd, "--profile", build_mode.cargo_profile())
+    let out = cargo
+        .build(
+            &env::current_dir()?,
+            &flion_build_dir.join("build"),
+            cargo_cmd,
+            BuildOptions::default(),
+        )
         .env("FLUTTER_EMBEDDER_PATH", embedder_path)
         .env("ANGLE_PATH", angle_path)
         .env(
@@ -461,36 +479,6 @@ fn copy_native_libraries(
         let dst_path = out_dir.join(lib);
         copy_if_newer(&src_path, &dst_path)?;
     }
-
-    Ok(())
-}
-
-fn compile_plugins_shim(build_dir: &Path, out_dir: &Path) -> eyre::Result<()> {
-    fs::create_dir_all(build_dir)?;
-
-    let lib_path = build_dir.join("flion_plugins_shim.dll");
-
-    if !lib_path.exists() {
-        cmd!(
-            "rustc",
-            "-",
-            "--crate-name",
-            "flion_plugins_shim",
-            "--crate-type",
-            "cdylib",
-            "--edition=2024",
-            "--cfg",
-            "cdylib",
-            "-C",
-            "target-feature=+crt-static",
-            "-o",
-            &lib_path,
-        )
-        .stdin_bytes(PLUGINS_SHIM_SOURCE)
-        .run()?;
-    }
-
-    copy_if_newer(&lib_path, &out_dir.join("flion_plugins_shim.dll"))?;
 
     Ok(())
 }

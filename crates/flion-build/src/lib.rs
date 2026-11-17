@@ -10,7 +10,6 @@ pub fn generate_plugins_registrant(project_dir: &Path) -> Result<(), Box<dyn Err
     let plugins_dir = build_dir.join("plugins");
     let plugins_lib_dir = plugins_dir.join("lib");
 
-    println!("cargo::rustc-link-search=native={}", plugins_dir.display());
     println!(
         "cargo::rustc-link-search=native={}",
         plugins_lib_dir.display()
@@ -24,26 +23,28 @@ pub fn generate_plugins_registrant(project_dir: &Path) -> Result<(), Box<dyn Err
     let mut externs = String::new();
     let mut statics = String::new();
 
-    let plugins_file = BufReader::new(File::open(plugins_file)?);
-    for line in plugins_file.lines().map_while(Result::ok) {
-        let Some((name, class_name)) = line.split_once(',') else {
-            continue;
-        };
+    if plugins_file.exists() {
+        let plugins_file = BufReader::new(File::open(plugins_file)?);
+        for line in plugins_file.lines().map_while(Result::ok) {
+            let Some((name, class_name)) = line.split_once(',') else {
+                continue;
+            };
 
-        writeln!(
-            externs,
-            "\
+            writeln!(
+                externs,
+                "\
 #[link(name = \"{name}_plugin\")]
 unsafe extern \"C\" {{
     fn {class_name}RegisterWithRegistrar(registrar: *mut std::ffi::c_void);
 }}"
-        )?;
+            )?;
 
-        writeln!(statics, "#[allow(non_upper_case_globals)]")?;
-        writeln!(
-            statics,
-            "#[flion::linkme::distributed_slice(flion::PLUGINS)] #[linkme(crate = flion::linkme)] static {class_name}RegisterWithRegistrarPtr: unsafe extern \"C\" fn(*mut std::ffi::c_void) = {class_name}RegisterWithRegistrar;"
-        )?;
+            writeln!(statics, "#[allow(non_upper_case_globals)]")?;
+            writeln!(
+                statics,
+                "#[flion::linkme::distributed_slice(flion::PLUGINS)] #[linkme(crate = flion::linkme)] static {class_name}RegisterWithRegistrarPtr: unsafe extern \"C\" fn(*mut std::ffi::c_void) = {class_name}RegisterWithRegistrar;"
+            )?;
+        }
     }
 
     let mut plugin_registrant = File::create(out_dir.join("plugin_registrant.rs"))?;

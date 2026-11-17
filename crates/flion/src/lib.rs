@@ -1,5 +1,3 @@
-#![feature(default_field_values, let_chains)]
-
 mod compositor;
 mod egl;
 mod engine;
@@ -36,17 +34,17 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use task_runner::{FlutterTaskExecutor, FlutterTaskQueue};
 use views::ViewManager;
 use window::{MouseAction, Window, WindowHandler};
-use windows::core::Interface;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION,
+    D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION, D3D11CreateDevice,
 };
 use windows::Win32::Graphics::DirectComposition::{DCompositionCreateDevice2, IDCompositionDevice};
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWM_SYSTEMBACKDROP_TYPE,
+    DWM_SYSTEMBACKDROP_TYPE, DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows::core::Interface;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event_loop::EventLoopBuilder;
 use winit::platform::windows::WindowBuilderExtWindows;

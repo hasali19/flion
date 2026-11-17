@@ -4,8 +4,8 @@ use std::sync::Arc;
 use egl::ClientBuffer;
 use eyre::bail;
 use khronos_egl as egl;
-use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
+use windows::core::Interface;
 
 const EGL_PLATFORM_DEVICE_EXT: egl::Enum = 0x313F;
 
@@ -162,7 +162,7 @@ impl Drop for EglDevice {
     }
 }
 
-extern "C" {
+unsafe extern "C" {
     // fn eglDebugMessageControlKHR(
     //     callback: extern "C" fn(
     //         error: egl::Enum,
