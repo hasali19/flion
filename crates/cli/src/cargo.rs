@@ -43,13 +43,13 @@ impl Cargo {
         .env("CARGO_BUILD_BUILD_DIR", build_dir)
         .env("CARGO_TARGET_DIR", &self.target_dir);
 
-        if !cfg!(windows) {
-            let mut linker_search_paths = vec![
-                self.target_dir
-                    .join("x86_64-pc-windows-msvc")
-                    .join(self.build_mode.name()),
-            ];
+        let mut linker_search_paths = vec![
+            self.target_dir
+                .join("x86_64-pc-windows-msvc")
+                .join(self.build_mode.name()),
+        ];
 
+        if !cfg!(windows) {
             if let Ok(win_sdk) = env::var("FLION_WINDOWS_SDK") {
                 let win_sdk = Path::new(&win_sdk);
                 linker_search_paths.extend([
@@ -59,19 +59,19 @@ impl Cargo {
                 ]);
             }
 
-            let mut rustflags = String::new();
-            for path in linker_search_paths {
-                rustflags += &format!("-Lnative={} ", path.display());
-            }
-
-            rustflags += options.rustflags;
-
-            info!("RUSTFLAGS={rustflags}");
-
-            cmd = cmd
-                .env("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER", "lld-link")
-                .env("RUSTFLAGS", rustflags);
+            cmd = cmd.env("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER", "lld-link");
         }
+
+        let mut rustflags = String::new();
+        for path in linker_search_paths {
+            rustflags += &format!("-Lnative={} ", path.display());
+        }
+
+        rustflags += options.rustflags;
+
+        info!("RUSTFLAGS={rustflags}");
+
+        cmd = cmd.env("RUSTFLAGS", rustflags);
 
         cmd
     }

@@ -1,7 +1,7 @@
 use std::rc::Weak;
 
 use windows::Win32::UI::WindowsAndMessaging::{
-    LoadCursorW, HCURSOR, IDC_ARROW, IDC_HAND, IDC_IBEAM,
+    HCURSOR, IDC_ARROW, IDC_HAND, IDC_IBEAM, LoadCursorW,
 };
 
 use crate::codec::EncodableValue;

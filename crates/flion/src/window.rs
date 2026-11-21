@@ -8,32 +8,32 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use bitflags::bitflags;
 use eyre::bail;
 use smol_str::SmolStr;
-use windows::core::w;
 use windows::Win32::Foundation::{HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VIRTUAL_KEY,
+    ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY,
     VK_CONTROL, VK_LCONTROL, VK_LSHIFT, VK_RCONTROL, VK_RSHIFT, VK_SHIFT,
 };
 use windows::Win32::UI::Input::Touch::{
-    CloseTouchInputHandle, GetTouchInputInfo, RegisterTouchWindow, HTOUCHINPUT, TOUCHEVENTF_DOWN,
+    CloseTouchInputHandle, GetTouchInputInfo, HTOUCHINPUT, RegisterTouchWindow, TOUCHEVENTF_DOWN,
     TOUCHEVENTF_MOVE, TOUCHEVENTF_UP, TOUCHINPUT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetMessageExtraInfo,
-    GetWindowLongPtrW, LoadCursorW, MoveWindow, PeekMessageW, RegisterClassExW, SetCursor,
-    SetParent, SetWindowLongPtrW, ShowWindow, SystemParametersInfoW, CREATESTRUCTW, GWLP_USERDATA,
-    HCURSOR, HTCLIENT, HWND_MESSAGE, IDC_ARROW, PM_NOREMOVE, SPI_GETWHEELSCROLLLINES, SW_SHOW,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA, WM_CHAR, WM_CLOSE, WM_CREATE, WM_DEADCHAR,
+    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetCursorPos,
+    GetMessageExtraInfo, GetWindowLongPtrW, HCURSOR, HTCLIENT, HWND_MESSAGE, IDC_ARROW,
+    LoadCursorW, MoveWindow, PM_NOREMOVE, PeekMessageW, RegisterClassExW, SPI_GETWHEELSCROLLLINES,
+    SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetCursor, SetParent, SetWindowLongPtrW,
+    ShowWindow, SystemParametersInfoW, WHEEL_DELTA, WM_CHAR, WM_CLOSE, WM_CREATE, WM_DEADCHAR,
     WM_DPICHANGED_BEFOREPARENT, WM_KEYDOWN, WM_KEYFIRST, WM_KEYLAST, WM_KEYUP, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_TOUCH,
     WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_CHILD, WS_EX_NOREDIRECTIONBITMAP, XBUTTON1,
     XBUTTON2,
 };
+use windows::core::w;
 
 use crate::error_utils::ResultExt;
 
